@@ -119,24 +119,25 @@ async def get_or_create_player(
     try:
 
         player = await connection.fetchrow(
-            """
-            INSERT INTO players (
-                server_id,
-                discord_id,
-                username
-            )
-            VALUES ($1, $2, $3)
+    """
+    INSERT INTO players (
+        server_id,
+        user_id,
+        discord_id,
+        username
+    )
+    VALUES ($1, $2, $2, $3)
 
-            ON CONFLICT (server_id, discord_id)
-            DO UPDATE SET
-                username = EXCLUDED.username,
-                updated_at = NOW()
+    ON CONFLICT (server_id, discord_id)
+    DO UPDATE SET
+        username = EXCLUDED.username,
+        updated_at = NOW()
 
-            RETURNING *
-            """,
-            str(guild.id),
-            str(user.id),
-            user.name
+    RETURNING *
+    """,
+    str(guild.id),
+    str(user.id),
+    user.name
         )
 
         return player
