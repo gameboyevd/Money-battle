@@ -119,25 +119,25 @@ async def get_or_create_player(
     try:
 
         player = await connection.fetchrow(
-    """
-    INSERT INTO players (
-        server_id,
-        user_id,
-        discord_id,
-        username
-    )
-    VALUES ($1, $2, $2, $3)
+            """
+            INSERT INTO players (
+                server_id,
+                user_id,
+                discord_id,
+                username
+            )
+            VALUES ($1, $2, $2, $3)
 
-    ON CONFLICT (server_id, discord_id)
-    DO UPDATE SET
-        username = EXCLUDED.username,
-        updated_at = NOW()
+            ON CONFLICT (server_id, discord_id)
+            DO UPDATE SET
+                username = EXCLUDED.username,
+                updated_at = NOW()
 
-    RETURNING *
-    """,
-    str(guild.id),
-    str(user.id),
-    user.name
+            RETURNING *
+            """,
+            str(guild.id),
+            str(user.id),
+            user.name
         )
 
         return player
@@ -145,6 +145,7 @@ async def get_or_create_player(
     finally:
 
         await connection.close()
+
 
 # ==========================================
 # 게임 참가
@@ -206,6 +207,109 @@ async def join_game_player(
     finally:
 
         await connection.close()
+
+
+# ==========================================
+# 게임 참가 취소
+# ==========================================
+
+async def leave_game_player(
+    user: discord.User,
+    guild: discord.Guild
+):
+
+    database_url = os.environ.get(
+        "DATABASE_URL"
+    )
+
+    if not database_url:
+        raise RuntimeError(
+            "DATABASE_URL이 설정되지 않았습니다."
+        )
+
+    if guild is None:
+        raise RuntimeError(
+            "디스코드 서버에서만 사용할 수 있습니다."
+        )
+
+    connection = await asyncpg.connect(
+        database_url
+    )
+
+    try:
+
+        deleted = await connection.fetchrow(
+            """
+            DELETE FROM game_players
+            WHERE server_id = $1
+            AND user_id = $2
+            RETURNING *
+            """,
+            str(guild.id),
+            str(user.id)
+        )
+
+        count = await connection.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM game_players
+            WHERE server_id = $1
+            """,
+            str(guild.id)
+        )
+
+        return deleted, count
+
+    finally:
+
+        await connection.close()
+
+
+# ==========================================
+# 현재 참가자 목록
+# ==========================================
+
+async def get_game_players(
+    guild: discord.Guild
+):
+
+    database_url = os.environ.get(
+        "DATABASE_URL"
+    )
+
+    if not database_url:
+        raise RuntimeError(
+            "DATABASE_URL이 설정되지 않았습니다."
+        )
+
+    if guild is None:
+        raise RuntimeError(
+            "디스코드 서버에서만 사용할 수 있습니다."
+        )
+
+    connection = await asyncpg.connect(
+        database_url
+    )
+
+    try:
+
+        players = await connection.fetch(
+            """
+            SELECT user_id, joined_at
+            FROM game_players
+            WHERE server_id = $1
+            ORDER BY joined_at ASC
+            """,
+            str(guild.id)
+        )
+
+        return players
+
+    finally:
+
+        await connection.close()
+
+
 # ==========================================
 # 메인 메뉴
 # ==========================================
@@ -213,7 +317,10 @@ async def join_game_player(
 class MainView(discord.ui.View):
 
     def __init__(self):
-        super().__init__(timeout=300)
+
+        super().__init__(
+            timeout=300
+        )
 
 
     # ======================================
@@ -255,7 +362,9 @@ class MainView(discord.ui.View):
             print(str(e))
 
             await interaction.response.send_message(
-                "🔴 정보를 불러오는 중 오류가 발생했습니다.",
+                f"🔴 정보를 불러오는 중 오류가 발생했습니다.\n"
+                f"오류: `{type(e).__name__}`\n"
+                f"내용: `{str(e)[:500]}`",
                 ephemeral=True
             )
 
@@ -294,7 +403,7 @@ class MainView(discord.ui.View):
 
         embed.add_field(
             name="💀 탈락",
-            value="설정된 탈락 주기에 따라 진행",
+            value="게임 진행에 따라 결정됩니다.",
             inline=True
         )
 
@@ -333,10 +442,40 @@ class MainView(discord.ui.View):
                 interaction.guild
             )
 
-            await interaction.response.send_message(
-                "🎮 게임 참가 기능은 다음 단계에서 연결합니다!",
-                ephemeral=True
+            result, count = await join_game_player(
+                interaction.user,
+                interaction.guild
             )
+
+            if result is None:
+
+                await interaction.response.send_message(
+                    f"🎮 이미 게임에 참가해 있습니다!\n\n"
+                    f"👥 현재 참가자: **{count}명**",
+                    ephemeral=True
+                )
+
+                return
+
+
+            if count < 3:
+
+                await interaction.response.send_message(
+                    f"🟢 게임 참가 완료!\n\n"
+                    f"👥 현재 참가자: **{count}명**\n"
+                    f"⚠️ 최소 3명이 필요합니다.\n"
+                    f"아직 게임을 시작할 수 없습니다.",
+                    ephemeral=True
+                )
+
+            else:
+
+                await interaction.response.send_message(
+                    f"🟢 게임 참가 완료!\n\n"
+                    f"👥 현재 참가자: **{count}명**\n"
+                    f"🎮 게임을 시작할 수 있습니다!",
+                    ephemeral=True
+                )
 
         except Exception as e:
 
@@ -345,7 +484,138 @@ class MainView(discord.ui.View):
             print(str(e))
 
             await interaction.response.send_message(
-                "🔴 게임 참가 중 오류가 발생했습니다.",
+                f"🔴 게임 참가 중 오류가 발생했습니다.\n"
+                f"오류: `{type(e).__name__}`\n"
+                f"내용: `{str(e)[:500]}`",
+                ephemeral=True
+            )
+
+
+    # ======================================
+    # 참가 취소
+    # ======================================
+
+    @discord.ui.button(
+        label="참가 취소",
+        emoji="🚪",
+        style=discord.ButtonStyle.danger,
+        row=2
+    )
+    async def leave_game(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        try:
+
+            deleted, count = await leave_game_player(
+                interaction.user,
+                interaction.guild
+            )
+
+            if deleted is None:
+
+                await interaction.response.send_message(
+                    "⚠️ 현재 참가 중인 게임이 없습니다.",
+                    ephemeral=True
+                )
+
+                return
+
+
+            await interaction.response.send_message(
+                f"🚪 **게임 참가를 취소했습니다.**\n\n"
+                f"👥 현재 참가자: **{count}명}",
+                ephemeral=True
+            )
+
+        except Exception as e:
+
+            print("Leave game error:")
+            print(type(e).__name__)
+            print(str(e))
+
+            await interaction.response.send_message(
+                f"🔴 참가 취소 중 오류가 발생했습니다.\n"
+                f"오류: `{type(e).__name__}`\n"
+                f"내용: `{str(e)[:500]}`",
+                ephemeral=True
+            )
+
+
+    # ======================================
+    # 참가자 목록
+    # ======================================
+
+    @discord.ui.button(
+        label="참가자 목록",
+        emoji="👥",
+        style=discord.ButtonStyle.secondary,
+        row=2
+    )
+    async def player_list(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        try:
+
+            players = await get_game_players(
+                interaction.guild
+            )
+
+            if not players:
+
+                await interaction.response.send_message(
+                    "👥 현재 참가자가 없습니다.",
+                    ephemeral=True
+                )
+
+                return
+
+
+            lines = []
+
+            for index, player in enumerate(
+                players,
+                start=1
+            ):
+
+                user = interaction.guild.get_member(
+                    int(player["user_id"])
+                )
+
+                if user:
+
+                    name = user.display_name
+
+                else:
+
+                    name = f"알 수 없는 사용자 ({player['user_id']})"
+
+                lines.append(
+                    f"**{index}.** {name}"
+                )
+
+
+            await interaction.response.send_message(
+                "👥 **현재 게임 참가자**\n\n"
+                + "\n".join(lines)
+                + f"\n\n총 **{len(players)}명**",
+                ephemeral=True
+            )
+
+        except Exception as e:
+
+            print("Player list error:")
+            print(type(e).__name__)
+            print(str(e))
+
+            await interaction.response.send_message(
+                f"🔴 참가자 목록을 불러오는 중 오류가 발생했습니다.\n"
+                f"오류: `{type(e).__name__}`",
                 ephemeral=True
             )
 
@@ -358,7 +628,7 @@ class MainView(discord.ui.View):
         label="닫기",
         emoji="❌",
         style=discord.ButtonStyle.danger,
-        row=1
+        row=3
     )
     async def close_menu(
         self,
@@ -370,7 +640,7 @@ class MainView(discord.ui.View):
             content="메인 메뉴를 닫았습니다.",
             embed=None,
             view=None
-    )
+        )
 
 
 # ==========================================
@@ -409,17 +679,19 @@ async def main_menu(
 
 
     embed = discord.Embed(
-    title="💰 머니 배틀로얄",
-    description=(
-        "━━━━━━━━━━━━━━━━━━\n"
-        "💰 **MONEY BATTLE ROYALE**\n"
-        "━━━━━━━━━━━━━━━━━━\n\n"
-        "돈을 벌고, 아이템을 사용하고,\n"
-        "마지막까지 살아남으세요!\n\n"
-        "🎮 게임 참가를 눌러 다음 게임에 참가할 수 있습니다.\n"
-        "📖 게임 설명에서 기본 규칙을 확인할 수 있습니다.\n"
-        "👤 내 정보에서 현재 자산을 확인할 수 있습니다."
-    )
+        title="💰 머니 배틀로얄",
+        description=(
+            "━━━━━━━━━━━━━━━━━━\n"
+            "💰 **MONEY BATTLE ROYALE**\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            "돈을 벌고, 아이템을 사용하고,\n"
+            "마지막까지 살아남으세요!\n\n"
+            "🎮 **게임 참가** — 다음 게임에 참가합니다.\n"
+            "🚪 **참가 취소** — 참가를 취소합니다.\n"
+            "👥 **참가자 목록** — 현재 참가자를 확인합니다.\n"
+            "📖 **게임 설명** — 게임 규칙을 확인합니다.\n"
+            "👤 **내 정보** — 현재 자산을 확인합니다."
+        )
     )
 
 
