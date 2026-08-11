@@ -704,7 +704,107 @@ async def main_menu(
         view=MainView(),
         ephemeral=True
     )
+    
 
+# ==========================================
+# /게임테스트
+# ==========================================
+
+@bot.tree.command(
+    name="게임테스트",
+    description="혼자서 머니 배틀로얄 게임 시작을 테스트합니다."
+)
+async def game_test(
+    interaction: discord.Interaction
+):
+
+    try:
+
+        # 플레이어 등록
+        player = await get_or_create_player(
+            interaction.user,
+            interaction.guild
+        )
+
+        # 테스트용 게임 생성
+        connection = await get_db()
+
+        try:
+
+            game = await connection.fetchrow(
+                """
+                INSERT INTO games (
+                    game_type,
+                    status,
+                    host_id,
+                    channel_id,
+                    current_phase
+                )
+                VALUES (
+                    'money_battle_royale_test',
+                    'playing',
+                    $1,
+                    $2,
+                    'test'
+                )
+                RETURNING *
+                """,
+                str(interaction.user.id),
+                str(interaction.channel.id)
+            )
+
+            # 테스트 플레이어 참가
+            await connection.execute(
+                """
+                INSERT INTO game_players (
+                    game_id,
+                    user_id
+                )
+                VALUES ($1, $2)
+                """,
+                game["id"],
+                str(interaction.user.id)
+            )
+
+        finally:
+
+            await connection.close()
+
+
+        embed = discord.Embed(
+            title="🧪 게임 테스트 시작!",
+            description=(
+                "테스트용 게임이 정상적으로 생성되었습니다.\n\n"
+                f"🎮 게임 ID: **{game['id']}**\n"
+                f"👤 테스트 플레이어: **{interaction.user.display_name}**\n"
+                "👥 참가자 수: **1명**\n\n"
+                "⚠️ 이 게임은 실제 게임이 아닙니다.\n"
+                "실제 게임은 **3명 이상**이 필요합니다."
+            )
+        )
+
+        await interaction.response.send_message(
+            embed=embed,
+            ephemeral=True
+        )
+
+        print(
+            f"[GAME TEST] game_id={game['id']} "
+            f"user_id={interaction.user.id}"
+        )
+
+    except Exception as e:
+
+        print("Game test error:")
+        print(type(e).__name__)
+        print(str(e))
+
+        await interaction.response.send_message(
+            f"🔴 게임 테스트 실패\n"
+            f"오류: `{type(e).__name__}`\n"
+            f"내용: `{str(e)[:500]}`",
+            ephemeral=True
+        )
 
 # ==========================================
 # /dbtest
