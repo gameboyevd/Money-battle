@@ -154,20 +154,18 @@ async def get_or_create_player(
 class MainView(discord.ui.View):
 
     def __init__(self):
-
-        super().__init__(
-            timeout=180
-        )
+        super().__init__(timeout=300)
 
 
-    # --------------------------------------
+    # ======================================
     # 내 정보
-    # --------------------------------------
+    # ======================================
 
     @discord.ui.button(
         label="내 정보",
         emoji="👤",
-        style=discord.ButtonStyle.primary
+        style=discord.ButtonStyle.primary,
+        row=0
     )
     async def my_info(
         self,
@@ -183,13 +181,11 @@ class MainView(discord.ui.View):
             )
 
             await interaction.response.send_message(
-
                 f"👤 **{interaction.user.display_name}님의 정보**\n\n"
                 f"💰 게임머니: **{player['money']:,}**\n"
                 f"💎 다이아: **{player['diamonds']:,}**\n"
                 f"⭐ 포인트: **{player['points']:,}**\n"
                 f"😇 선행 포인트: **{player['good_deed']:,}**",
-
                 ephemeral=True
             )
 
@@ -200,11 +196,122 @@ class MainView(discord.ui.View):
             print(str(e))
 
             await interaction.response.send_message(
-                f"🔴 정보를 불러오는 중 오류가 발생했습니다.\n"
-                f"오류: `{type(e).__name__}`\n"
-                f"내용: `{str(e)[:500]}`",
+                "🔴 정보를 불러오는 중 오류가 발생했습니다.",
                 ephemeral=True
             )
+
+
+    # ======================================
+    # 게임 설명
+    # ======================================
+
+    @discord.ui.button(
+        label="게임 설명",
+        emoji="📖",
+        style=discord.ButtonStyle.secondary,
+        row=0
+    )
+    async def game_info(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        embed = discord.Embed(
+            title="📖 머니 배틀로얄",
+            description=(
+                "💰 돈을 벌고\n"
+                "🎒 아이템을 사용하고\n"
+                "🎮 여러 게임에서 경쟁하며\n"
+                "🏆 마지막까지 살아남는 게임입니다."
+            )
+        )
+
+        embed.add_field(
+            name="👥 최소 인원",
+            value="3명",
+            inline=True
+        )
+
+        embed.add_field(
+            name="💀 탈락",
+            value="설정된 탈락 주기에 따라 진행",
+            inline=True
+        )
+
+        embed.add_field(
+            name="🏆 목표",
+            value="최후의 1인이 되는 것",
+            inline=False
+        )
+
+        await interaction.response.send_message(
+            embed=embed,
+            ephemeral=True
+        )
+
+
+    # ======================================
+    # 게임 참가
+    # ======================================
+
+    @discord.ui.button(
+        label="게임 참가",
+        emoji="🎮",
+        style=discord.ButtonStyle.success,
+        row=1
+    )
+    async def join_game(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        try:
+
+            await get_or_create_player(
+                interaction.user,
+                interaction.guild
+            )
+
+            await interaction.response.send_message(
+                "🎮 게임 참가 기능은 다음 단계에서 연결합니다!",
+                ephemeral=True
+            )
+
+        except Exception as e:
+
+            print("Join game error:")
+            print(type(e).__name__)
+            print(str(e))
+
+            await interaction.response.send_message(
+                "🔴 게임 참가 중 오류가 발생했습니다.",
+                ephemeral=True
+            )
+
+
+    # ======================================
+    # 닫기
+    # ======================================
+
+    @discord.ui.button(
+        label="닫기",
+        emoji="❌",
+        style=discord.ButtonStyle.danger,
+        row=1
+    )
+    async def close_menu(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        await interaction.response.edit_message(
+            content="메인 메뉴를 닫았습니다.",
+            embed=None,
+            view=None
+    )
 
 
 # ==========================================
@@ -243,12 +350,17 @@ async def main_menu(
 
 
     embed = discord.Embed(
-        title="💰 머니 배틀로얄",
-        description=(
-            "돈을 벌고, 아이템을 사고,\n"
-            "마지막까지 살아남으세요!\n\n"
-            "아래 버튼에서 내 정보를 확인할 수 있습니다."
-        )
+    title="💰 머니 배틀로얄",
+    description=(
+        "━━━━━━━━━━━━━━━━━━\n"
+        "💰 **MONEY BATTLE ROYALE**\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        "돈을 벌고, 아이템을 사용하고,\n"
+        "마지막까지 살아남으세요!\n\n"
+        "🎮 게임 참가를 눌러 다음 게임에 참가할 수 있습니다.\n"
+        "📖 게임 설명에서 기본 규칙을 확인할 수 있습니다.\n"
+        "👤 내 정보에서 현재 자산을 확인할 수 있습니다."
+    )
     )
 
 
