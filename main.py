@@ -146,7 +146,66 @@ async def get_or_create_player(
 
         await connection.close()
 
+# ==========================================
+# 게임 참가
+# ==========================================
 
+async def join_game_player(
+    user: discord.User,
+    guild: discord.Guild
+):
+
+    database_url = os.environ.get(
+        "DATABASE_URL"
+    )
+
+    if not database_url:
+        raise RuntimeError(
+            "DATABASE_URL이 설정되지 않았습니다."
+        )
+
+    if guild is None:
+        raise RuntimeError(
+            "디스코드 서버에서만 사용할 수 있습니다."
+        )
+
+    connection = await asyncpg.connect(
+        database_url
+    )
+
+    try:
+
+        result = await connection.fetchrow(
+            """
+            INSERT INTO game_players (
+                server_id,
+                user_id
+            )
+            VALUES ($1, $2)
+
+            ON CONFLICT (server_id, user_id)
+            DO NOTHING
+
+            RETURNING *
+            """,
+            str(guild.id),
+            str(user.id)
+        )
+
+        count = await connection.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM game_players
+            WHERE server_id = $1
+            """,
+            str(guild.id)
+        )
+
+        return result, count
+
+    finally:
+
+        await connection.close()
 # ==========================================
 # 메인 메뉴
 # ==========================================
