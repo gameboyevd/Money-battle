@@ -68,6 +68,7 @@ async def test_database():
         return
 
     try:
+
         connection = await asyncpg.connect(
             database_url
         )
@@ -82,6 +83,7 @@ async def test_database():
             print("Database connected successfully!")
 
     except Exception as e:
+
         print("Database connection failed:")
         print(type(e).__name__)
         print(str(e))
@@ -91,13 +93,23 @@ async def test_database():
 # 플레이어 등록
 # ==========================================
 
-async def get_or_create_player(user: discord.User):
+async def get_or_create_player(
+    user: discord.User,
+    guild: discord.Guild
+):
 
-    database_url = os.environ.get("DATABASE_URL")
+    database_url = os.environ.get(
+        "DATABASE_URL"
+    )
 
     if not database_url:
         raise RuntimeError(
             "DATABASE_URL이 설정되지 않았습니다."
+        )
+
+    if guild is None:
+        raise RuntimeError(
+            "이 명령어는 디스코드 서버에서 사용해야 합니다."
         )
 
     connection = await asyncpg.connect(
@@ -109,10 +121,11 @@ async def get_or_create_player(user: discord.User):
         player = await connection.fetchrow(
             """
             INSERT INTO players (
+                server_id,
                 discord_id,
                 username
             )
-            VALUES ($1, $2)
+            VALUES ($1, $2, $3)
 
             ON CONFLICT (discord_id)
             DO UPDATE SET
@@ -121,6 +134,7 @@ async def get_or_create_player(user: discord.User):
 
             RETURNING *
             """,
+            str(guild.id),
             str(user.id),
             user.name
         )
@@ -163,7 +177,8 @@ class MainView(discord.ui.View):
         try:
 
             player = await get_or_create_player(
-                interaction.user
+                interaction.user,
+                interaction.guild
             )
 
             await interaction.response.send_message(
@@ -184,12 +199,13 @@ class MainView(discord.ui.View):
             print(str(e))
 
             await interaction.response.send_message(
-                "🔴 정보를 불러오는 중 오류가 발생했습니다.",
+                f"🔴 정보를 불러오는 중 오류가 발생했습니다.\n"
+                f"오류: `{type(e).__name__}`\n"
+                f"내용: `{str(e)[:500]}`",
                 ephemeral=True
             )
 
 
-# ==========================================
 # ==========================================
 # /메인
 # ==========================================
@@ -205,7 +221,8 @@ async def main_menu(
     try:
 
         await get_or_create_player(
-            interaction.user
+            interaction.user,
+            interaction.guild
         )
 
     except Exception as e:
@@ -244,6 +261,7 @@ async def main_menu(
 # ==========================================
 # /dbtest
 # ==========================================
+
 @bot.tree.command(
     name="dbtest",
     description="Supabase 데이터베이스 연결을 테스트합니다."
