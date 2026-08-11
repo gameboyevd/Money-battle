@@ -127,7 +127,7 @@ async def get_or_create_player(
             )
             VALUES ($1, $2, $3)
 
-            ON CONFLICT (discord_id)
+            ON CONFLICT (server_id, discord_id)
             DO UPDATE SET
                 username = EXCLUDED.username,
                 updated_at = NOW()
