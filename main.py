@@ -94,16 +94,57 @@ async def test_database():
 
 @bot.event
 async def on_ready():
-
     print(f"Logged in as {bot.user}")
     print("Money Battle Royale Bot is ready!")
 
+    try:
+        await bot.tree.sync()
+        print("Slash commands synced!")
+    except Exception as e:
+        print("Slash command sync failed:", e)
     await test_database()
 
 
 # ==========================================
 # 실행
 # ==========================================
+@bot.tree.command(
+    name="dbtest",
+    description="Supabase 데이터베이스 연결을 테스트합니다."
+)
+async def dbtest(interaction: discord.Interaction):
+
+    database_url = os.environ.get("DATABASE_URL")
+
+    if not database_url:
+        await interaction.response.send_message(
+            "🔴 DATABASE_URL이 설정되어 있지 않습니다.",
+            ephemeral=True
+        )
+        return
+
+    try:
+        connection = await asyncpg.connect(database_url)
+
+        result = await connection.fetchval("SELECT 1;")
+
+        await connection.close()
+
+        if result == 1:
+            await interaction.response.send_message(
+                "🟢 Supabase 데이터베이스 연결 성공!",
+                ephemeral=True
+            )
+
+    except Exception as e:
+        print("Database test failed:")
+        print(type(e).__name__)
+        print(str(e))
+
+        await interaction.response.send_message(
+            "🔴 데이터베이스 연결 실패! Render 로그를 확인해주세요.",
+            ephemeral=True
+        )
 
 if __name__ == "__main__":
 
