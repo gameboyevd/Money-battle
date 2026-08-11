@@ -137,17 +137,16 @@ async def dbtest(interaction: discord.Interaction):
             )
 
     except Exception as e:
-    print("Database test failed:")
-    print(type(e).__name__)
-    print(str(e))
+        print("Database test failed:")
+        print(type(e).__name__)
+        print(str(e))
 
-    await interaction.response.send_message(
-        f"🔴 DB 연결 실패\n"
-        f"오류: `{type(e).__name__}`\n"
-        f"내용: `{str(e)[:500]}`",
-        ephemeral=True
-    )
-
+        await interaction.response.send_message(
+            f"🔴 DB 연결 실패\n"
+            f"오류: `{type(e).__name__}`\n"
+            f"내용: `{str(e)[:500]}`",
+            ephemeral=True
+        )
 if __name__ == "__main__":
 
     web_thread = threading.Thread(
