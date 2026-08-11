@@ -691,7 +691,7 @@ class MainView(discord.ui.View):
 
                 await interaction.response.send_message(
                     f"⚠️ 이미 게임에 참가되어 있습니다!\n\n"
-                    f"👥 현재 참가자: **{count}명}",
+                    f"👥 현재 참가자: **{count}명**",
                     ephemeral=True
                 )
 
@@ -776,7 +776,7 @@ class MainView(discord.ui.View):
 
             await interaction.response.send_message(
                 f"❌ 게임 참가를 취소했습니다.\n\n"
-                f"👥 현재 참가자: **{count}명}",
+                f"👥 현재 참가자: **{count}명**",
                 ephemeral=True
             )
 
