@@ -30,14 +30,22 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 
 def start_web_server():
-    port = int(os.environ.get("PORT", 10000))
+
+    port = int(
+        os.environ.get(
+            "PORT",
+            10000
+        )
+    )
 
     server = HTTPServer(
         ("0.0.0.0", port),
         HealthHandler
     )
 
-    print(f"HTTP server started on port {port}")
+    print(
+        f"HTTP server started on port {port}"
+    )
 
     server.serve_forever()
 
@@ -47,6 +55,7 @@ def start_web_server():
 # ==========================================
 
 intents = discord.Intents.default()
+
 intents.message_content = True
 
 bot = commands.Bot(
@@ -61,14 +70,19 @@ bot = commands.Bot(
 
 async def get_db():
 
-    database_url = os.environ.get("DATABASE_URL")
+    database_url = os.environ.get(
+        "DATABASE_URL"
+    )
 
     if not database_url:
+
         raise RuntimeError(
             "DATABASE_URL이 설정되지 않았습니다."
         )
 
-    return await asyncpg.connect(database_url)
+    return await asyncpg.connect(
+        database_url
+    )
 
 
 # ==========================================
@@ -88,13 +102,24 @@ async def test_database():
         await connection.close()
 
         if result == 1:
-            print("Database connected successfully!")
+
+            print(
+                "Database connected successfully!"
+            )
 
     except Exception as e:
 
-        print("Database connection failed:")
-        print(type(e).__name__)
-        print(str(e))
+        print(
+            "Database connection failed:"
+        )
+
+        print(
+            type(e).__name__
+        )
+
+        print(
+            str(e)
+        )
 
 
 # ==========================================
@@ -107,6 +132,7 @@ async def get_or_create_player(
 ):
 
     if guild is None:
+
         raise RuntimeError(
             "디스코드 서버에서만 사용할 수 있습니다."
         )
@@ -145,19 +171,20 @@ async def get_or_create_player(
 
 
 # ==========================================
-# 현재 대기 게임 찾기 / 생성
+# 대기 게임 찾기 / 생성
 # ==========================================
 
 async def get_or_create_waiting_game(
     guild: discord.Guild,
-    channel: discord.abc.GuildChannel
+    channel: discord.abc.GuildChannel,
+    user: discord.User
 ):
 
     connection = await get_db()
 
     try:
 
-        # 현재 채널에 대기 중인 게임이 있는지 확인
+        # 현재 채널의 대기 게임 찾기
         game = await connection.fetchrow(
             """
             SELECT *
@@ -171,9 +198,11 @@ async def get_or_create_waiting_game(
         )
 
         if game:
+
             return game
 
-        # 없으면 새 게임 생성
+        # 대기 게임이 없으면
+        # 처음 참가한 사람이 방장이 됨
         game = await connection.fetchrow(
             """
             INSERT INTO games (
@@ -192,11 +221,39 @@ async def get_or_create_waiting_game(
             )
             RETURNING *
             """,
-            str(guild.owner_id),
+            str(user.id),
             str(channel.id)
         )
 
         return game
+
+    finally:
+
+        await connection.close()
+
+
+# ==========================================
+# 현재 참가자 수
+# ==========================================
+
+async def get_game_player_count(
+    game_id
+):
+
+    connection = await get_db()
+
+    try:
+
+        count = await connection.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM game_players
+            WHERE game_id = $1
+            """,
+            game_id
+        )
+
+        return count
 
     finally:
 
@@ -214,11 +271,12 @@ async def join_game_player(
 ):
 
     if guild is None:
+
         raise RuntimeError(
             "디스코드 서버에서만 사용할 수 있습니다."
         )
 
-    # 플레이어 먼저 등록
+    # 플레이어 등록
     await get_or_create_player(
         user,
         guild
@@ -227,8 +285,16 @@ async def join_game_player(
     # 대기 게임 가져오기
     game = await get_or_create_waiting_game(
         guild,
-        channel
+        channel,
+        user
     )
+
+    # 안전하게 상태 확인
+    if game["status"] != "waiting":
+
+        raise RuntimeError(
+            "이미 시작된 게임입니다."
+        )
 
     connection = await get_db()
 
@@ -272,7 +338,7 @@ async def join_game_player(
             str(user.id)
         )
 
-        # 현재 참가자 수
+        # 참가자 수
         count = await connection.fetchval(
             """
             SELECT COUNT(*)
@@ -300,6 +366,7 @@ async def cancel_game_player(
 ):
 
     if guild is None:
+
         raise RuntimeError(
             "디스코드 서버에서만 사용할 수 있습니다."
         )
@@ -308,7 +375,6 @@ async def cancel_game_player(
 
     try:
 
-        # 현재 채널의 대기 게임 찾기
         game = await connection.fetchrow(
             """
             SELECT *
@@ -322,9 +388,9 @@ async def cancel_game_player(
         )
 
         if not game:
+
             return None, False, 0
 
-        # 참가 여부 확인
         existing = await connection.fetchrow(
             """
             SELECT *
@@ -360,7 +426,6 @@ async def cancel_game_player(
             str(user.id)
         )
 
-        # 남은 참가자 수
         count = await connection.fetchval(
             """
             SELECT COUNT(*)
@@ -370,7 +435,115 @@ async def cancel_game_player(
             game["id"]
         )
 
+        # 방장이 나갔다면
+        # 남은 사람 중 첫 번째 사람을 새 방장으로 지정
+        if str(game["host_id"]) == str(user.id):
+
+            new_host = await connection.fetchrow(
+                """
+                SELECT user_id
+                FROM game_players
+                WHERE game_id = $1
+                ORDER BY joined_at ASC
+                LIMIT 1
+                """,
+                game["id"]
+            )
+
+            if new_host:
+
+                await connection.execute(
+                    """
+                    UPDATE games
+                    SET host_id = $1
+                    WHERE id = $2
+                    """,
+                    str(new_host["user_id"]),
+                    game["id"]
+                )
+
         return game, True, count
+
+    finally:
+
+        await connection.close()
+
+
+# ==========================================
+# 게임 시작
+# ==========================================
+
+async def start_game(
+    user: discord.User,
+    guild: discord.Guild,
+    channel: discord.abc.GuildChannel
+):
+
+    if guild is None:
+
+        raise RuntimeError(
+            "디스코드 서버에서만 사용할 수 있습니다."
+        )
+
+    connection = await get_db()
+
+    try:
+
+        # 현재 대기 게임
+        game = await connection.fetchrow(
+            """
+            SELECT *
+            FROM games
+            WHERE channel_id = $1
+              AND status = 'waiting'
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            str(channel.id)
+        )
+
+        if not game:
+
+            return None, 0
+
+        # 방장 확인
+        if str(game["host_id"]) != str(user.id):
+
+            raise PermissionError(
+                "게임 방장만 게임을 시작할 수 있습니다."
+            )
+
+        # 참가자 수
+        count = await connection.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM game_players
+            WHERE game_id = $1
+            """,
+            game["id"]
+        )
+
+        # 최소 인원
+        if count < 3:
+
+            return game, count
+
+        # 게임 시작
+        updated_game = await connection.fetchrow(
+            """
+            UPDATE games
+            SET
+                status = 'playing',
+                current_phase = 'started',
+                started_at = NOW()
+            WHERE id = $1
+              AND status = 'waiting'
+            RETURNING *
+            """,
+            game["id"]
+        )
+
+        return updated_game, count
 
     finally:
 
@@ -467,6 +640,12 @@ class MainView(discord.ui.View):
         )
 
         embed.add_field(
+            name="🎮 게임 시작",
+            value="3명 이상 모이면 방장이 직접 시작합니다.",
+            inline=False
+        )
+
+        embed.add_field(
             name="💀 탈락",
             value="게임 규칙에 따라 진행",
             inline=True
@@ -533,7 +712,8 @@ class MainView(discord.ui.View):
                 await interaction.response.send_message(
                     f"🎉 게임 참가 완료!\n\n"
                     f"👥 현재 참가자: **{count}명**\n"
-                    f"🟢 게임을 시작할 수 있습니다!",
+                    f"🟢 참가자가 3명 이상입니다!\n"
+                    f"👑 방장이 **게임 시작** 버튼을 누르면 시작됩니다.",
                     ephemeral=True
                 )
 
@@ -594,22 +774,11 @@ class MainView(discord.ui.View):
 
                 return
 
-            if count < 3:
-
-                await interaction.response.send_message(
-                    f"❌ 게임 참가를 취소했습니다.\n\n"
-                    f"👥 현재 참가자: **{count}명**\n"
-                    f"⚠️ 인원이 부족해 게임을 시작할 수 없어요!",
-                    ephemeral=True
-                )
-
-            else:
-
-                await interaction.response.send_message(
-                    f"❌ 게임 참가를 취소했습니다.\n\n"
-                    f"👥 현재 참가자: **{count}명**",
-                    ephemeral=True
-                )
+            await interaction.response.send_message(
+                f"❌ 게임 참가를 취소했습니다.\n\n"
+                f"👥 현재 참가자: **{count}명}",
+                ephemeral=True
+            )
 
         except Exception as e:
 
@@ -619,6 +788,79 @@ class MainView(discord.ui.View):
 
             await interaction.response.send_message(
                 f"🔴 참가 취소 중 오류가 발생했습니다.\n"
+                f"오류: `{type(e).__name__}`\n"
+                f"내용: `{str(e)[:300]}`",
+                ephemeral=True
+            )
+
+
+    # ======================================
+    # 게임 시작
+    # ======================================
+
+    @discord.ui.button(
+        label="게임 시작",
+        emoji="▶️",
+        style=discord.ButtonStyle.success,
+        row=2
+    )
+    async def start_game_button(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        try:
+
+            game, count = await start_game(
+                interaction.user,
+                interaction.guild,
+                interaction.channel
+            )
+
+            if game is None:
+
+                await interaction.response.send_message(
+                    "⚠️ 현재 시작할 대기 게임이 없습니다.",
+                    ephemeral=True
+                )
+
+                return
+
+            if count < 3:
+
+                await interaction.response.send_message(
+                    f"⚠️ 인원이 부족해 게임을 시작할 수 없어요!\n\n"
+                    f"👥 현재 참가자: **{count}명**\n"
+                    f"최소 **3명**이 필요합니다.",
+                    ephemeral=True
+                )
+
+                return
+
+            await interaction.response.send_message(
+                f"🎉 **게임이 시작되었습니다!**\n\n"
+                f"🎮 게임 ID: **{game['id']}**\n"
+                f"👥 참가자: **{count}명**\n\n"
+                f"🏆 머니 배틀로얄을 시작합니다!",
+                ephemeral=False
+            )
+
+        except PermissionError:
+
+            await interaction.response.send_message(
+                "🔴 **게임 방장만 게임을 시작할 수 있습니다.**",
+                ephemeral=True
+            )
+
+        except Exception as e:
+
+            print("Start game error:")
+            print(type(e).__name__)
+            print(str(e))
+
+            await interaction.response.send_message(
+                f"🔴 게임 시작 중 오류가 발생했습니다.\n"
                 f"오류: `{type(e).__name__}`\n"
                 f"내용: `{str(e)[:300]}`",
                 ephemeral=True
@@ -693,6 +935,7 @@ async def main_menu(
             "마지막까지 살아남으세요!\n\n"
             "🎮 **게임 참가** — 게임에 참가합니다.\n"
             "❌ **참가 취소** — 참가를 취소합니다.\n"
+            "▶️ **게임 시작** — 방장이 3명 이상일 때 시작합니다.\n"
             "📖 **게임 설명** — 기본 규칙을 확인합니다.\n"
             "👤 **내 정보** — 현재 자산을 확인합니다."
         )
@@ -704,7 +947,7 @@ async def main_menu(
         view=MainView(),
         ephemeral=True
     )
-    
+
 
 # ==========================================
 # /게임테스트
@@ -720,13 +963,11 @@ async def game_test(
 
     try:
 
-        # 플레이어 등록
         player = await get_or_create_player(
             interaction.user,
             interaction.guild
         )
 
-        # 테스트용 게임 생성
         connection = await get_db()
 
         try:
@@ -753,7 +994,6 @@ async def game_test(
                 str(interaction.channel.id)
             )
 
-            # 테스트 플레이어 참가
             await connection.execute(
                 """
                 INSERT INTO game_players (
@@ -806,6 +1046,7 @@ async def game_test(
             ephemeral=True
         )
 
+
 # ==========================================
 # /dbtest
 # ==========================================
@@ -830,6 +1071,7 @@ async def dbtest(
         )
 
         return
+
 
     try:
 
