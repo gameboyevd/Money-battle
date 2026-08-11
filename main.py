@@ -190,6 +190,7 @@ class MainView(discord.ui.View):
 
 
 # ==========================================
+# ==========================================
 # /메인
 # ==========================================
 
@@ -207,20 +208,20 @@ async def main_menu(
             interaction.user
         )
 
-except Exception as e:
+    except Exception as e:
 
-    print("Player registration error:")
-    print(type(e).__name__)
-    print(str(e))
+        print("Player registration error:")
+        print(type(e).__name__)
+        print(str(e))
 
-    await interaction.response.send_message(
-        f"🔴 플레이어 생성 실패\n"
-        f"오류: `{type(e).__name__}`\n"
-        f"내용: `{str(e)[:500]}`",
-        ephemeral=True
-    )
+        await interaction.response.send_message(
+            f"🔴 플레이어 생성 실패\n"
+            f"오류: `{type(e).__name__}`\n"
+            f"내용: `{str(e)[:500]}`",
+            ephemeral=True
+        )
 
-    return
+        return
 
 
     embed = discord.Embed(
@@ -243,7 +244,6 @@ except Exception as e:
 # ==========================================
 # /dbtest
 # ==========================================
-
 @bot.tree.command(
     name="dbtest",
     description="Supabase 데이터베이스 연결을 테스트합니다."
