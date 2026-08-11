@@ -108,6 +108,42 @@ async def on_ready():
 # ==========================================
 # 실행
 # ==========================================
+# ==========================================
+# 플레이어 등록
+# ==========================================
+
+async def get_or_create_player(user: discord.User):
+
+    database_url = os.environ.get("DATABASE_URL")
+
+    if not database_url:
+        raise RuntimeError("DATABASE_URL이 설정되지 않았습니다.")
+
+    connection = await asyncpg.connect(database_url)
+
+    try:
+        player = await connection.fetchrow(
+            """
+            INSERT INTO players (
+                discord_id,
+                username
+            )
+            VALUES ($1, $2)
+            ON CONFLICT (discord_id)
+            DO UPDATE SET
+                username = EXCLUDED.username,
+                updated_at = NOW()
+            RETURNING *
+            """,
+            str(user.id),
+            user.name
+        )
+
+        return player
+
+    finally:
+        await connection.close()
+
 @bot.tree.command(
     name="dbtest",
     description="Supabase 데이터베이스 연결을 테스트합니다."
