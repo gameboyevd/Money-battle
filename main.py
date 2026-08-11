@@ -207,18 +207,20 @@ async def main_menu(
             interaction.user
         )
 
-    except Exception as e:
+except Exception as e:
 
-        print("Player registration error:")
-        print(type(e).__name__)
-        print(str(e))
+    print("Player registration error:")
+    print(type(e).__name__)
+    print(str(e))
 
-        await interaction.response.send_message(
-            "🔴 플레이어 정보를 생성하는 중 오류가 발생했습니다.",
-            ephemeral=True
-        )
+    await interaction.response.send_message(
+        f"🔴 플레이어 생성 실패\n"
+        f"오류: `{type(e).__name__}`\n"
+        f"내용: `{str(e)[:500]}`",
+        ephemeral=True
+    )
 
-        return
+    return
 
 
     embed = discord.Embed(
