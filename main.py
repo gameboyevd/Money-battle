@@ -113,6 +113,91 @@ async def on_ready():
 # ==========================================
 
 async def get_or_create_player(user: discord.User):
+    # ==========================================
+# 메인 메뉴
+# ==========================================
+
+class MainView(discord.ui.View):
+
+    def __init__(self):
+        super().__init__(timeout=180)
+
+    @discord.ui.button(
+        label="내 정보",
+        emoji="👤",
+        style=discord.ButtonStyle.primary
+    )
+    async def my_info(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        try:
+            player = await get_or_create_player(
+                interaction.user
+            )
+
+            await interaction.response.send_message(
+                f"👤 **{interaction.user.display_name}님의 정보**\n\n"
+                f"💰 게임머니: **{player['money']:,}**\n"
+                f"💎 다이아: **{player['diamonds']:,}**\n"
+                f"⭐ 포인트: **{player['points']:,}**\n"
+                f"😇 선행 포인트: **{player['good_deed']:,}**\n",
+                ephemeral=True
+            )
+
+        except Exception as e:
+
+            print("My info error:")
+            print(type(e).__name__)
+            print(str(e))
+
+            await interaction.response.send_message(
+                "🔴 정보를 불러오는 중 오류가 발생했습니다.",
+                ephemeral=True
+            )
+
+
+@bot.tree.command(
+    name="메인",
+    description="머니 배틀로얄 메인 메뉴를 엽니다."
+)
+async def main_menu(interaction: discord.Interaction):
+
+    # 명령어를 사용한 사람 자동 등록
+    try:
+        await get_or_create_player(
+            interaction.user
+        )
+
+    except Exception as e:
+
+        print("Player registration error:")
+        print(type(e).__name__)
+        print(str(e))
+
+        await interaction.response.send_message(
+            "🔴 플레이어 정보를 생성하는 중 오류가 발생했습니다.",
+            ephemeral=True
+        )
+
+        return
+
+    embed = discord.Embed(
+        title="💰 머니 배틀로얄",
+        description=(
+            "돈을 벌고, 아이템을 사고,\n"
+            "마지막까지 살아남으세요!\n\n"
+            "아래 버튼에서 내 정보를 확인할 수 있습니다."
+        )
+    )
+
+    await interaction.response.send_message(
+        embed=embed,
+        view=MainView(),
+        ephemeral=True
+    )
 
     database_url = os.environ.get("DATABASE_URL")
 
