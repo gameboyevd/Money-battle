@@ -887,6 +887,246 @@ class WaitingView(discord.ui.View):
                     ephemeral=True
                 )
 
+# ============================================================
+# 알바 시스템
+# ============================================================
+
+class JobView(discord.ui.View):
+
+    def __init__(self, game_id):
+
+        super().__init__(
+            timeout=300
+        )
+
+        self.game_id = game_id
+
+    # --------------------------------------------------------
+    # 청소
+    # --------------------------------------------------------
+
+    @discord.ui.button(
+        label="청소",
+        emoji="🧹",
+        style=discord.ButtonStyle.primary,
+        row=0
+    )
+    async def cleaning(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        await self.do_job(
+            interaction,
+            "청소",
+            20_000
+        )
+
+    # --------------------------------------------------------
+    # 택배
+    # --------------------------------------------------------
+
+    @discord.ui.button(
+        label="택배",
+        emoji="📦",
+        style=discord.ButtonStyle.primary,
+        row=0
+    )
+    async def delivery_box(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        await self.do_job(
+            interaction,
+            "택배",
+            22_000
+        )
+
+    # --------------------------------------------------------
+    # 과녁
+    # --------------------------------------------------------
+
+    @discord.ui.button(
+        label="과녁",
+        emoji="🎯",
+        style=discord.ButtonStyle.primary,
+        row=0
+    )
+    async def target(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        await self.do_job(
+            interaction,
+            "과녁",
+            22_000
+        )
+
+    # --------------------------------------------------------
+    # 패스트푸드
+    # --------------------------------------------------------
+
+    @discord.ui.button(
+        label="패스트푸드",
+        emoji="🍔",
+        style=discord.ButtonStyle.primary,
+        row=1
+    )
+    async def fast_food(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        await self.do_job(
+            interaction,
+            "패스트푸드",
+            25_000
+        )
+
+    # --------------------------------------------------------
+    # 배달
+    # --------------------------------------------------------
+
+    @discord.ui.button(
+        label="배달",
+        emoji="🏃",
+        style=discord.ButtonStyle.primary,
+        row=1
+    )
+    async def delivery(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        await self.do_job(
+            interaction,
+            "배달",
+            25_000
+        )
+
+    # --------------------------------------------------------
+    # 주방
+    # --------------------------------------------------------
+
+    @discord.ui.button(
+        label="주방",
+        emoji="🍳",
+        style=discord.ButtonStyle.primary,
+        row=1
+    )
+    async def kitchen(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        await self.do_job(
+            interaction,
+            "주방",
+            28_000
+        )
+
+    # --------------------------------------------------------
+    # 데이터 입력
+    # --------------------------------------------------------
+
+    @discord.ui.button(
+        label="데이터 입력",
+        emoji="🧠",
+        style=discord.ButtonStyle.primary,
+        row=2
+    )
+    async def data_input(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        await self.do_job(
+            interaction,
+            "데이터 입력",
+            30_000
+        )
+
+    # --------------------------------------------------------
+    # 낚시
+    # --------------------------------------------------------
+
+    @discord.ui.button(
+        label="낚시",
+        emoji="🎣",
+        style=discord.ButtonStyle.primary,
+        row=2
+    )
+    async def fishing(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        await self.do_job(
+            interaction,
+            "낚시",
+            30_000
+        )
+
+    # --------------------------------------------------------
+    # 실제 알바 처리
+    # --------------------------------------------------------
+
+    async def do_job(
+        self,
+        interaction: discord.Interaction,
+        job_name: str,
+        reward: int
+    ):
+
+        try:
+
+            player = await get_or_create_player(
+                interaction.user,
+                interaction.guild
+            )
+
+            await interaction.response.send_message(
+                f"🧑‍💼 **{job_name}** 알바를 시작했습니다!\n\n"
+                f"💰 보상: **{reward:,} 코인**\n\n"
+                "⏳ 실제 보상 처리는 다음 단계에서 연결됩니다.",
+                ephemeral=True
+            )
+
+        except Exception as e:
+
+            print(
+                "Job execution error:",
+                type(e).__name__,
+                str(e)
+            )
+
+            if interaction.response.is_done():
+
+                await interaction.followup.send(
+                    f"🔴 알바 처리 오류\n"
+                    f"`{type(e).__name__}`\n"
+                    f"{str(e)[:300]}",
+                    ephemeral=True
+                )
+
+            else:
+
+                await interaction.response.send_message(
+                    f"🔴 알바 처리 오류\n"
+                    f"`{type(e).__name__}`\n"
+                    f"{str(e)[:300]}",
+                    ephemeral=True
+                )
 
 # ============================================================
 # 실제 게임 화면
