@@ -929,6 +929,10 @@ class SurvivalGameView(discord.ui.View):
             ephemeral=True
         )
 
+    # ========================================================
+    # 알바
+    # ========================================================
+
     @discord.ui.button(
         label="알바",
         emoji="🧑‍💼",
@@ -937,22 +941,98 @@ class SurvivalGameView(discord.ui.View):
     )
     async def jobs(
         self,
-        interaction,
-        button
+        interaction: discord.Interaction,
+        button: discord.ui.Button
     ):
 
-        await interaction.response.send_message(
-            "🧑‍💼 **알바 메뉴**\n\n"
-            "🧹 청소 — 20,000 코인\n"
-            "📦 택배 — 22,000 코인\n"
-            "🎯 과녁 — 22,000 코인\n"
-            "🍔 패스트푸드 — 25,000 코인\n"
-            "🏃 배달 — 25,000 코인\n"
-            "🍳 주방 — 28,000 코인\n"
-            "🧠 데이터 입력 — 30,000 코인\n"
-            "🎣 낚시 — 30,000 코인",
-            ephemeral=True
-        )
+        try:
+
+            player = await get_or_create_player(
+                interaction.user,
+                interaction.guild
+            )
+
+            embed = discord.Embed(
+                title="🧑‍💼 알바",
+                description=(
+                    "알바를 해서 코인을 벌 수 있습니다.\n\n"
+                    "⏱️ 한 번 일을 하면 **5분 동안 다시 일할 수 없습니다.**"
+                )
+            )
+
+            embed.add_field(
+                name="🧹 청소",
+                value="20,000 코인",
+                inline=True
+            )
+
+            embed.add_field(
+                name="📦 택배",
+                value="22,000 코인",
+                inline=True
+            )
+
+            embed.add_field(
+                name="🎯 과녁",
+                value="22,000 코인",
+                inline=True
+            )
+
+            embed.add_field(
+                name="🍔 패스트푸드",
+                value="25,000 코인",
+                inline=True
+            )
+
+            embed.add_field(
+                name="🏃 배달",
+                value="25,000 코인",
+                inline=True
+            )
+
+            embed.add_field(
+                name="🍳 주방",
+                value="28,000 코인",
+                inline=True
+            )
+
+            embed.add_field(
+                name="🧠 데이터 입력",
+                value="30,000 코인",
+                inline=True
+            )
+
+            embed.add_field(
+                name="🎣 낚시",
+                value="30,000 코인",
+                inline=True
+            )
+
+            # ⚠️ 3번 단계에서 JobView 클래스를 추가해야 합니다.
+            view = JobView(
+                self.game_id
+            )
+
+            await interaction.response.send_message(
+                embed=embed,
+                view=view,
+                ephemeral=True
+            )
+
+        except Exception as e:
+
+            print(
+                "Job menu error:",
+                type(e).__name__,
+                str(e)
+            )
+
+            await interaction.response.send_message(
+                f"🔴 알바 메뉴 오류\n"
+                f"`{type(e).__name__}`\n"
+                f"{str(e)[:300]}",
+                ephemeral=True
+            )
 
     @discord.ui.button(
         label="상점",
@@ -1056,6 +1136,7 @@ class SurvivalGameView(discord.ui.View):
                 ephemeral=True
             )
 
+
 # ============================================================
 # 게임 강제종료
 # ============================================================
@@ -1065,10 +1146,6 @@ async def force_end_game(game_id: int):
     connection = await get_db()
 
     try:
-
-        # ----------------------------------------------------
-        # 1. 게임 확인
-        # ----------------------------------------------------
 
         game = await connection.fetchrow(
             """
@@ -1084,13 +1161,8 @@ async def force_end_game(game_id: int):
                 "게임을 찾을 수 없습니다."
             )
 
-        # 이미 종료된 게임
         if game["status"] == "ended":
             return False, "이미 종료된 게임입니다."
-
-        # ----------------------------------------------------
-        # 2. 게임 종료
-        # ----------------------------------------------------
 
         await connection.execute(
             """
@@ -1110,10 +1182,6 @@ async def force_end_game(game_id: int):
             game_id
         )
 
-        # ----------------------------------------------------
-        # 3. 참가자 상태 정리
-        # ----------------------------------------------------
-
         await connection.execute(
             """
             UPDATE game_players
@@ -1125,10 +1193,6 @@ async def force_end_game(game_id: int):
             """,
             game_id
         )
-
-        # ----------------------------------------------------
-        # 4. 해당 게임 참가자 생존 상태 정리
-        # ----------------------------------------------------
 
         await connection.execute(
             """
@@ -1151,6 +1215,8 @@ async def force_end_game(game_id: int):
     finally:
 
         await connection.close()
+
+
 # ============================================================
 # /게임종료
 # ============================================================
@@ -1173,10 +1239,6 @@ async def force_end_game_command(
 
     try:
 
-        # ----------------------------------------------------
-        # 현재 채널에서 실제 진행 중인 게임만 검색
-        # ----------------------------------------------------
-
         connection = await get_db()
 
         try:
@@ -1197,10 +1259,6 @@ async def force_end_game_command(
 
             await connection.close()
 
-        # ----------------------------------------------------
-        # 진행 중인 게임 없음
-        # ----------------------------------------------------
-
         if not game:
 
             await interaction.response.send_message(
@@ -1209,10 +1267,6 @@ async def force_end_game_command(
                 ephemeral=True
             )
             return
-
-        # ----------------------------------------------------
-        # 방장 확인
-        # ----------------------------------------------------
 
         if str(game["host_id"]) != str(
             interaction.user.id
@@ -1223,10 +1277,6 @@ async def force_end_game_command(
                 ephemeral=True
             )
             return
-
-        # ----------------------------------------------------
-        # 확인 버튼
-        # ----------------------------------------------------
 
         view = ForceEndConfirmView(
             game["id"]
@@ -1290,11 +1340,8 @@ class ForceEndConfirmView(discord.ui.View):
         interaction: discord.Interaction,
         button: discord.ui.Button
     ):
-        try:
 
-            # ------------------------------------------------
-            # 1. 게임 확인
-            # ------------------------------------------------
+        try:
 
             connection = await get_db()
 
@@ -1313,10 +1360,6 @@ class ForceEndConfirmView(discord.ui.View):
 
                 await connection.close()
 
-            # ------------------------------------------------
-            # 2. 게임 존재 여부
-            # ------------------------------------------------
-
             if not game:
 
                 await interaction.response.edit_message(
@@ -1325,10 +1368,6 @@ class ForceEndConfirmView(discord.ui.View):
                 )
                 return
 
-            # ------------------------------------------------
-            # 3. 게임 상태 확인
-            # ------------------------------------------------
-
             if game["status"] != "playing":
 
                 await interaction.response.edit_message(
@@ -1336,10 +1375,6 @@ class ForceEndConfirmView(discord.ui.View):
                     view=None
                 )
                 return
-
-            # ------------------------------------------------
-            # 4. 방장 확인
-            # ------------------------------------------------
 
             if str(game["host_id"]) != str(
                 interaction.user.id
@@ -1350,10 +1385,6 @@ class ForceEndConfirmView(discord.ui.View):
                     view=None
                 )
                 return
-
-            # ------------------------------------------------
-            # 5. 실제 게임 강제종료
-            # ------------------------------------------------
 
             success, message = await force_end_game(
                 self.game_id
@@ -1366,10 +1397,6 @@ class ForceEndConfirmView(discord.ui.View):
                     view=None
                 )
                 return
-
-            # ------------------------------------------------
-            # 6. 종료 완료
-            # ------------------------------------------------
 
             await interaction.response.edit_message(
                 content=(
@@ -1425,10 +1452,6 @@ class ForceEndConfirmView(discord.ui.View):
             view=None
         )
 
-
-# ============================================================
-# 메인 메뉴
-# ============================================================
 
 # ============================================================
 # 메인 메뉴
