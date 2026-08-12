@@ -1056,6 +1056,276 @@ class SurvivalGameView(discord.ui.View):
                 ephemeral=True
             )
 
+# ============================================================
+# 게임 강제종료
+# ============================================================
+
+async def force_end_game(
+    game_id: int
+):
+    connection = await get_db()
+
+    try:
+        game = await connection.fetchrow(
+            """
+            SELECT *
+            FROM games
+            WHERE id = $1
+            """,
+            game_id
+        )
+
+        if not game:
+            raise RuntimeError("게임을 찾을 수 없습니다.")
+
+        if game["status"] == "ended":
+            return False, "이미 종료된 게임입니다."
+
+        await connection.execute(
+            """
+            UPDATE games
+            SET
+                status = 'ended',
+                current_phase = 'ended',
+                ended_at = NOW(),
+                game_data = jsonb_set(
+                    COALESCE(game_data, '{}'::jsonb),
+                    '{force_ended}',
+                    'true'::jsonb,
+                    TRUE
+                )
+            WHERE id = $1
+            """,
+            game_id
+        )
+
+        return True, "게임이 강제 종료되었습니다."
+
+    finally:
+        await connection.close()
+
+
+# ============================================================
+# /게임종료
+# ============================================================
+
+@bot.tree.command(
+    name="게임종료",
+    description="현재 게임을 강제로 종료합니다."
+)
+async def force_end_game_command(
+    interaction: discord.Interaction
+):
+
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "🔴 디스코드 서버에서 사용해주세요.",
+            ephemeral=True
+        )
+        return
+
+    try:
+
+        game = await get_waiting_game(
+            interaction.channel.id
+        )
+
+        # waiting 게임이 없으면 playing 게임 검색
+        if not game:
+
+            connection = await get_db()
+
+            try:
+                game = await connection.fetchrow(
+                    """
+                    SELECT *
+                    FROM games
+                    WHERE channel_id = $1
+                      AND status = 'playing'
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    str(interaction.channel.id)
+                )
+
+            finally:
+                await connection.close()
+
+        if not game:
+
+            await interaction.response.send_message(
+                "⚠️ 현재 이 채널에서 진행 중인 게임이 없습니다.",
+                ephemeral=True
+            )
+            return
+
+        # 방장 확인
+        if str(game["host_id"]) != str(
+            interaction.user.id
+        ):
+
+            await interaction.response.send_message(
+                "🔒 게임 강제종료는 **방장만** 사용할 수 있습니다.",
+                ephemeral=True
+            )
+            return
+
+        # 확인 버튼
+        view = ForceEndConfirmView(
+            game["id"]
+        )
+
+        await interaction.response.send_message(
+            "⚠️ **게임 강제종료**\n\n"
+            "정말 현재 게임을 종료하시겠습니까?\n\n"
+            "⚠️ 종료된 게임은 다시 시작할 수 없습니다.",
+            view=view,
+            ephemeral=True
+        )
+
+    except Exception as e:
+
+        print("Force end command error:")
+        print(type(e).__name__)
+        print(str(e))
+
+        if interaction.response.is_done():
+
+            await interaction.followup.send(
+                f"🔴 게임 종료 중 오류가 발생했습니다.\n"
+                f"`{type(e).__name__}`\n"
+                f"{str(e)[:500]}",
+                ephemeral=True
+            )
+
+        else:
+
+            await interaction.response.send_message(
+                f"🔴 게임 종료 중 오류가 발생했습니다.\n"
+                f"`{type(e).__name__}`\n"
+                f"{str(e)[:500]}",
+                ephemeral=True
+            )
+
+
+# ============================================================
+# 강제종료 확인 UI
+# ============================================================
+
+class ForceEndConfirmView(discord.ui.View):
+
+    def __init__(
+        self,
+        game_id: int
+    ):
+
+        super().__init__(
+            timeout=30
+        )
+
+        self.game_id = game_id
+
+
+    @discord.ui.button(
+        label="게임 종료",
+        emoji="🛑",
+        style=discord.ButtonStyle.danger
+    )
+    async def confirm(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        try:
+
+            connection = await get_db()
+
+            try:
+
+                game = await connection.fetchrow(
+                    """
+                    SELECT *
+                    FROM games
+                    WHERE id = $1
+                    """,
+                    self.game_id
+                )
+
+            finally:
+
+                await connection.close()
+
+            if not game:
+
+                await interaction.response.edit_message(
+                    content="⚠️ 게임을 찾을 수 없습니다.",
+                    view=None
+                )
+                return
+
+            # 다시 방장 확인
+            if str(game["host_id"]) != str(
+                interaction.user.id
+            ):
+
+                await interaction.response.edit_message(
+                    content="🔒 게임 종료 권한이 없습니다.",
+                    view=None
+                )
+                return
+
+            success, message = await force_end_game(
+                self.game_id
+            )
+
+            if not success:
+
+                await interaction.response.edit_message(
+                    content=f"⚠️ {message}",
+                    view=None
+                )
+                return
+
+            await interaction.response.edit_message(
+                content=(
+                    "🛑 **게임이 강제 종료되었습니다.**\n\n"
+                    f"🎮 Game ID: **{self.game_id}**\n"
+                    "📌 상태: **ENDED**"
+                ),
+                view=None
+            )
+
+        except Exception as e:
+
+            print("Force end confirmation error:")
+            print(type(e).__name__)
+            print(str(e))
+
+            await interaction.response.edit_message(
+                content=(
+                    "🔴 게임 강제종료 중 오류가 발생했습니다.\n"
+                    f"`{type(e).__name__}`"
+                ),
+                view=None
+            )
+
+
+    @discord.ui.button(
+        label="취소",
+        emoji="❌",
+        style=discord.ButtonStyle.secondary
+    )
+    async def cancel(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        await interaction.response.edit_message(
+            content="✅ 게임 강제종료를 취소했습니다.",
+            view=None
+        )
 
 # ============================================================
 # 메인 메뉴
