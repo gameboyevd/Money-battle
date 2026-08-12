@@ -1,4 +1,5 @@
 import os
+import asyncio
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -7,9 +8,9 @@ from discord.ext import commands
 import asyncpg
 
 
-# ==========================================
+# ============================================================
 # Render HTTP 서버
-# ==========================================
+# ============================================================
 
 class HealthHandler(BaseHTTPRequestHandler):
 
@@ -30,32 +31,23 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 
 def start_web_server():
-
-    port = int(
-        os.environ.get(
-            "PORT",
-            10000
-        )
-    )
+    port = int(os.environ.get("PORT", 10000))
 
     server = HTTPServer(
         ("0.0.0.0", port),
         HealthHandler
     )
 
-    print(
-        f"HTTP server started on port {port}"
-    )
+    print(f"HTTP server started on port {port}")
 
     server.serve_forever()
 
 
-# ==========================================
+# ============================================================
 # Discord Bot
-# ==========================================
+# ============================================================
 
 intents = discord.Intents.default()
-
 intents.message_content = True
 
 bot = commands.Bot(
@@ -64,67 +56,33 @@ bot = commands.Bot(
 )
 
 
-# ==========================================
-# DB 연결
-# ==========================================
+# ============================================================
+# 기본 설정
+# ============================================================
+
+MIN_PLAYERS = 4
+STARTING_MONEY = 10_000
+
+
+# ============================================================
+# DB
+# ============================================================
 
 async def get_db():
 
-    database_url = os.environ.get(
-        "DATABASE_URL"
-    )
+    database_url = os.environ.get("DATABASE_URL")
 
     if not database_url:
-
         raise RuntimeError(
             "DATABASE_URL이 설정되지 않았습니다."
         )
 
-    return await asyncpg.connect(
-        database_url
-    )
+    return await asyncpg.connect(database_url)
 
 
-# ==========================================
-# DB 테스트
-# ==========================================
-
-async def test_database():
-
-    try:
-
-        connection = await get_db()
-
-        result = await connection.fetchval(
-            "SELECT 1;"
-        )
-
-        await connection.close()
-
-        if result == 1:
-
-            print(
-                "Database connected successfully!"
-            )
-
-    except Exception as e:
-
-        print(
-            "Database connection failed:"
-        )
-
-        print(
-            type(e).__name__
-        )
-
-        print(
-            str(e)
-        )
-
-
-# ==========================================
+# ============================================================
 # 플레이어 등록
-# ==========================================
+# ============================================================
 
 async def get_or_create_player(
     user: discord.User,
@@ -132,7 +90,6 @@ async def get_or_create_player(
 ):
 
     if guild is None:
-
         raise RuntimeError(
             "디스코드 서버에서만 사용할 수 있습니다."
         )
@@ -147,9 +104,26 @@ async def get_or_create_player(
                 server_id,
                 user_id,
                 discord_id,
-                username
+                username,
+                money,
+                diamonds,
+                points,
+                good_deed,
+                alive,
+                eliminated
             )
-            VALUES ($1, $2, $2, $3)
+            VALUES (
+                $1,
+                $2,
+                $2,
+                $3,
+                10000,
+                0,
+                0,
+                0,
+                TRUE,
+                FALSE
+            )
 
             ON CONFLICT (server_id, discord_id)
             DO UPDATE SET
@@ -166,26 +140,22 @@ async def get_or_create_player(
         return player
 
     finally:
-
         await connection.close()
 
 
-# ==========================================
-# 대기 게임 찾기 / 생성
-# ==========================================
+# ============================================================
+# 대기 게임 찾기
+# ============================================================
 
-async def get_or_create_waiting_game(
-    guild: discord.Guild,
-    channel: discord.abc.GuildChannel,
-    user: discord.User
+async def get_waiting_game(
+    channel_id: int
 ):
 
     connection = await get_db()
 
     try:
 
-        # 현재 채널의 대기 게임 찾기
-        game = await connection.fetchrow(
+        return await connection.fetchrow(
             """
             SELECT *
             FROM games
@@ -194,15 +164,27 @@ async def get_or_create_waiting_game(
             ORDER BY id DESC
             LIMIT 1
             """,
-            str(channel.id)
+            str(channel_id)
         )
 
-        if game:
+    finally:
+        await connection.close()
 
-            return game
 
-        # 대기 게임이 없으면
-        # 처음 참가한 사람이 방장이 됨
+# ============================================================
+# 대기 게임 생성
+# ============================================================
+
+async def create_waiting_game(
+    guild: discord.Guild,
+    channel: discord.abc.GuildChannel,
+    host_id: int
+):
+
+    connection = await get_db()
+
+    try:
+
         game = await connection.fetchrow(
             """
             INSERT INTO games (
@@ -210,41 +192,67 @@ async def get_or_create_waiting_game(
                 status,
                 host_id,
                 channel_id,
-                current_phase
+                current_phase,
+                game_data
             )
             VALUES (
                 'money_battle_royale',
                 'waiting',
                 $1,
                 $2,
-                'waiting'
+                'waiting',
+                $3::jsonb
             )
             RETURNING *
             """,
-            str(user.id),
-            str(channel.id)
+            str(host_id),
+            str(channel.id),
+            '{"starting_money":10000,"min_players":4}'
         )
 
         return game
 
     finally:
-
         await connection.close()
 
 
-# ==========================================
-# 현재 참가자 수
-# ==========================================
+# ============================================================
+# 대기 게임 가져오기 / 생성
+# ============================================================
 
-async def get_game_player_count(
-    game_id
+async def get_or_create_waiting_game(
+    guild: discord.Guild,
+    channel: discord.abc.GuildChannel,
+    user_id: int
+):
+
+    game = await get_waiting_game(
+        channel.id
+    )
+
+    if game:
+        return game
+
+    return await create_waiting_game(
+        guild,
+        channel,
+        user_id
+    )
+
+
+# ============================================================
+# 참가자 수
+# ============================================================
+
+async def get_player_count(
+    game_id: int
 ):
 
     connection = await get_db()
 
     try:
 
-        count = await connection.fetchval(
+        return await connection.fetchval(
             """
             SELECT COUNT(*)
             FROM game_players
@@ -253,16 +261,39 @@ async def get_game_player_count(
             game_id
         )
 
-        return count
-
     finally:
-
         await connection.close()
 
 
-# ==========================================
+# ============================================================
+# 참가자 목록
+# ============================================================
+
+async def get_game_players(
+    game_id: int
+):
+
+    connection = await get_db()
+
+    try:
+
+        return await connection.fetch(
+            """
+            SELECT *
+            FROM game_players
+            WHERE game_id = $1
+            ORDER BY joined_at ASC
+            """,
+            game_id
+        )
+
+    finally:
+        await connection.close()
+
+
+# ============================================================
 # 게임 참가
-# ==========================================
+# ============================================================
 
 async def join_game_player(
     user: discord.User,
@@ -270,37 +301,21 @@ async def join_game_player(
     channel: discord.abc.GuildChannel
 ):
 
-    if guild is None:
-
-        raise RuntimeError(
-            "디스코드 서버에서만 사용할 수 있습니다."
-        )
-
-    # 플레이어 등록
     await get_or_create_player(
         user,
         guild
     )
 
-    # 대기 게임 가져오기
     game = await get_or_create_waiting_game(
         guild,
         channel,
-        user
+        user.id
     )
-
-    # 안전하게 상태 확인
-    if game["status"] != "waiting":
-
-        raise RuntimeError(
-            "이미 시작된 게임입니다."
-        )
 
     connection = await get_db()
 
     try:
 
-        # 이미 참가했는지 확인
         existing = await connection.fetchrow(
             """
             SELECT *
@@ -325,20 +340,27 @@ async def join_game_player(
 
             return game, False, count
 
-        # 참가 등록
         await connection.execute(
             """
             INSERT INTO game_players (
                 game_id,
-                user_id
+                user_id,
+                bet_amount,
+                result,
+                profit
             )
-            VALUES ($1, $2)
+            VALUES (
+                $1,
+                $2,
+                0,
+                NULL,
+                0
+            )
             """,
             game["id"],
             str(user.id)
         )
 
-        # 참가자 수
         count = await connection.fetchval(
             """
             SELECT COUNT(*)
@@ -351,13 +373,12 @@ async def join_game_player(
         return game, True, count
 
     finally:
-
         await connection.close()
 
 
-# ==========================================
-# 게임 참가 취소
-# ==========================================
+# ============================================================
+# 참가 취소
+# ============================================================
 
 async def cancel_game_player(
     user: discord.User,
@@ -365,31 +386,16 @@ async def cancel_game_player(
     channel: discord.abc.GuildChannel
 ):
 
-    if guild is None:
+    game = await get_waiting_game(
+        channel.id
+    )
 
-        raise RuntimeError(
-            "디스코드 서버에서만 사용할 수 있습니다."
-        )
+    if not game:
+        return None, False, 0
 
     connection = await get_db()
 
     try:
-
-        game = await connection.fetchrow(
-            """
-            SELECT *
-            FROM games
-            WHERE channel_id = $1
-              AND status = 'waiting'
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            str(channel.id)
-        )
-
-        if not game:
-
-            return None, False, 0
 
         existing = await connection.fetchrow(
             """
@@ -415,7 +421,6 @@ async def cancel_game_player(
 
             return game, False, count
 
-        # 참가 취소
         await connection.execute(
             """
             DELETE FROM game_players
@@ -435,82 +440,43 @@ async def cancel_game_player(
             game["id"]
         )
 
-        # 방장이 나갔다면
-        # 남은 사람 중 첫 번째 사람을 새 방장으로 지정
-        if str(game["host_id"]) == str(user.id):
-
-            new_host = await connection.fetchrow(
-                """
-                SELECT user_id
-                FROM game_players
-                WHERE game_id = $1
-                ORDER BY joined_at ASC
-                LIMIT 1
-                """,
-                game["id"]
-            )
-
-            if new_host:
-
-                await connection.execute(
-                    """
-                    UPDATE games
-                    SET host_id = $1
-                    WHERE id = $2
-                    """,
-                    str(new_host["user_id"]),
-                    game["id"]
-                )
-
         return game, True, count
 
     finally:
-
         await connection.close()
 
 
-# ==========================================
+# ============================================================
 # 게임 시작
-# ==========================================
+# ============================================================
 
-async def start_game(
-    user: discord.User,
-    guild: discord.Guild,
-    channel: discord.abc.GuildChannel
+async def start_survival_game(
+    game_id: int
 ):
-
-    if guild is None:
-
-        raise RuntimeError(
-            "디스코드 서버에서만 사용할 수 있습니다."
-        )
 
     connection = await get_db()
 
     try:
 
-        # 현재 대기 게임
+        # 현재 게임 상태 확인
         game = await connection.fetchrow(
             """
             SELECT *
             FROM games
-            WHERE channel_id = $1
-              AND status = 'waiting'
-            ORDER BY id DESC
-            LIMIT 1
+            WHERE id = $1
+            FOR UPDATE
             """,
-            str(channel.id)
+            game_id
         )
 
         if not game:
+            raise RuntimeError(
+                "게임을 찾을 수 없습니다."
+            )
 
-            return None, 0
-
-        # 방장 확인
-        if str(game["host_id"]) != str(user.id):
-
-            raise PermissionError(
-                "게임 방장만 게임을 시작할 수 있습니다."
+        if game["status"] != "waiting":
+            raise RuntimeError(
+                "이미 시작되었거나 종료된 게임입니다."
             )
 
         # 참가자 수
@@ -520,39 +486,408 @@ async def start_game(
             FROM game_players
             WHERE game_id = $1
             """,
-            game["id"]
+            game_id
         )
 
-        # 최소 인원
-        if count < 3:
-
-            return game, count
+        if count < MIN_PLAYERS:
+            raise RuntimeError(
+                f"최소 {MIN_PLAYERS}명이 필요합니다."
+            )
 
         # 게임 시작
-        updated_game = await connection.fetchrow(
+        await connection.execute(
             """
             UPDATE games
             SET
                 status = 'playing',
-                current_phase = 'started',
-                started_at = NOW()
+                current_phase = 'survival',
+                started_at = NOW(),
+                game_data = jsonb_set(
+                    COALESCE(game_data, '{}'::jsonb),
+                    '{starting_money}',
+                    '10000'::jsonb,
+                    TRUE
+                )
             WHERE id = $1
-              AND status = 'waiting'
-            RETURNING *
             """,
-            game["id"]
+            game_id
         )
 
-        return updated_game, count
+        # 참가자 생존 상태 초기화
+        players = await connection.fetch(
+            """
+            SELECT user_id
+            FROM game_players
+            WHERE game_id = $1
+            """,
+            game_id
+        )
+
+        for player in players:
+
+            await connection.execute(
+                """
+                UPDATE players
+                SET
+                    money = $1,
+                    alive = TRUE,
+                    eliminated = FALSE,
+                    good_deed = 0,
+                    updated_at = NOW()
+                WHERE user_id = $2
+                """,
+                STARTING_MONEY,
+                str(player["user_id"])
+            )
+
+        return count
 
     finally:
-
         await connection.close()
 
 
-# ==========================================
+# ============================================================
+# 테스트 게임 시작
+# ============================================================
+
+async def create_test_game(
+    interaction: discord.Interaction
+):
+
+    await get_or_create_player(
+        interaction.user,
+        interaction.guild
+    )
+
+    connection = await get_db()
+
+    try:
+
+        game = await connection.fetchrow(
+            """
+            INSERT INTO games (
+                game_type,
+                status,
+                host_id,
+                channel_id,
+                current_phase,
+                started_at,
+                game_data
+            )
+            VALUES (
+                'money_battle_royale_test',
+                'playing',
+                $1,
+                $2,
+                'survival_test',
+                NOW(),
+                $3::jsonb
+            )
+            RETURNING *
+            """,
+            str(interaction.user.id),
+            str(interaction.channel.id),
+            '{"test":true,"starting_money":10000,"min_players":1}'
+        )
+
+        await connection.execute(
+            """
+            INSERT INTO game_players (
+                game_id,
+                user_id,
+                bet_amount,
+                result,
+                profit
+            )
+            VALUES (
+                $1,
+                $2,
+                0,
+                NULL,
+                0
+            )
+            """,
+            game["id"],
+            str(interaction.user.id)
+        )
+
+        await connection.execute(
+            """
+            UPDATE players
+            SET
+                money = $1,
+                alive = TRUE,
+                eliminated = FALSE,
+                good_deed = 0,
+                updated_at = NOW()
+            WHERE user_id = $2
+            """,
+            STARTING_MONEY,
+            str(interaction.user.id)
+        )
+
+        return game
+
+    finally:
+        await connection.close()
+
+
+# ============================================================
+# 대기방 UI
+# ============================================================
+
+class WaitingView(discord.ui.View):
+
+    def __init__(
+        self,
+        game_id: int
+    ):
+
+        super().__init__(
+            timeout=None
+        )
+
+        self.game_id = game_id
+
+
+    # ========================================================
+    # 참가
+    # ========================================================
+
+    @discord.ui.button(
+        label="게임 참가",
+        emoji="🎮",
+        style=discord.ButtonStyle.success
+    )
+    async def join(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        try:
+
+            game, joined, count = await join_game_player(
+                interaction.user,
+                interaction.guild,
+                interaction.channel
+            )
+
+            if not joined:
+
+                await interaction.response.send_message(
+                    f"⚠️ 이미 참가 중입니다.\n\n"
+                    f"👥 현재 참가자: **{count}명**",
+                    ephemeral=True
+                )
+
+                return
+
+            await interaction.response.send_message(
+                f"🎉 게임 참가 완료!\n\n"
+                f"👥 현재 참가자: **{count}명}\n"
+                f"🎯 최소 참가 인원: **{MIN_PLAYERS}명**",
+                ephemeral=True
+            )
+
+        except Exception as e:
+
+            print("Waiting join error:")
+            print(type(e).__name__)
+            print(str(e))
+
+            await interaction.response.send_message(
+                f"🔴 참가 실패\n"
+                f"`{type(e).__name__}`\n"
+                f"{str(e)[:300]}",
+                ephemeral=True
+            )
+
+
+    # ========================================================
+    # 참가 취소
+    # ========================================================
+
+    @discord.ui.button(
+        label="참가 취소",
+        emoji="❌",
+        style=discord.ButtonStyle.danger
+    )
+    async def cancel(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        try:
+
+            game, cancelled, count = await cancel_game_player(
+                interaction.user,
+                interaction.guild,
+                interaction.channel
+            )
+
+            if game is None:
+
+                await interaction.response.send_message(
+                    "⚠️ 현재 대기 중인 게임이 없습니다.",
+                    ephemeral=True
+                )
+
+                return
+
+            if not cancelled:
+
+                await interaction.response.send_message(
+                    f"⚠️ 참가 중이 아닙니다.\n\n"
+                    f"👥 현재 참가자: **{count}명**",
+                    ephemeral=True
+                )
+
+                return
+
+            await interaction.response.send_message(
+                f"❌ 참가를 취소했습니다.\n\n"
+                f"👥 현재 참가자: **{count}명**",
+                ephemeral=True
+            )
+
+        except Exception as e:
+
+            print("Cancel error:")
+            print(type(e).__name__)
+            print(str(e))
+
+            await interaction.response.send_message(
+                "🔴 참가 취소 중 오류가 발생했습니다.",
+                ephemeral=True
+            )
+
+
+    # ========================================================
+    # 게임 시작
+    # ========================================================
+
+    @discord.ui.button(
+        label="게임 시작",
+        emoji="▶️",
+        style=discord.ButtonStyle.primary
+    )
+    async def start(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        try:
+
+            game = await get_waiting_game(
+                interaction.channel.id
+            )
+
+            if not game:
+
+                await interaction.response.send_message(
+                    "⚠️ 대기 중인 게임이 없습니다.",
+                    ephemeral=True
+                )
+
+                return
+
+            # 방장 확인
+            if str(game["host_id"]) != str(
+                interaction.user.id
+            ):
+
+                await interaction.response.send_message(
+                    "🔒 게임 시작은 방장만 할 수 있습니다.",
+                    ephemeral=True
+                )
+
+                return
+
+            count = await get_player_count(
+                game["id"]
+            )
+
+            if count < MIN_PLAYERS:
+
+                await interaction.response.send_message(
+                    f"⚠️ 아직 게임을 시작할 수 없습니다.\n\n"
+                    f"👥 현재 참가자: **{count}명**\n"
+                    f"👥 최소 참가자: **{MIN_PLAYERS}명**",
+                    ephemeral=True
+                )
+
+                return
+
+            await interaction.response.send_message(
+                "🎮 게임 시작 준비!\n\n"
+                "⏳ **3초 후 게임이 시작됩니다!**"
+            )
+
+            for number in [3, 2, 1]:
+
+                await asyncio.sleep(1)
+
+                try:
+                    await interaction.edit_original_response(
+                        content=(
+                            "🎮 **MONEY BATTLE ROYALE**\n\n"
+                            f"🔥 게임 시작까지 **{number}초**!"
+                        )
+                    )
+                except Exception:
+                    pass
+
+            await start_survival_game(
+                game["id"]
+            )
+
+            await interaction.edit_original_response(
+                content=(
+                    "💰 **MONEY BATTLE ROYALE**\n\n"
+                    "🎉 **게임이 시작되었습니다!**\n\n"
+                    f"👥 참가자: **{count}명**\n"
+                    f"🪙 시작 자금: **{STARTING_MONEY:,} 코인**\n\n"
+                    "☠️ 이제 서바이벌이 시작됩니다."
+                ),
+                view=None
+            )
+
+        except Exception as e:
+
+            print("Game start error:")
+            print(type(e).__name__)
+            print(str(e))
+
+            try:
+
+                if interaction.response.is_done():
+
+                    await interaction.followup.send(
+                        f"🔴 게임 시작 실패\n"
+                        f"오류: `{type(e).__name__}`\n"
+                        f"내용: `{str(e)[:500]}`",
+                        ephemeral=True
+                    )
+
+                else:
+
+                    await interaction.response.send_message(
+                        f"🔴 게임 시작 실패\n"
+                        f"오류: `{type(e).__name__}`\n"
+                        f"내용: `{str(e)[:500]}`",
+                        ephemeral=True
+                    )
+
+            except Exception:
+                pass
+
+
+# ============================================================
 # 메인 메뉴
-# ==========================================
+# ============================================================
 
 class MainView(discord.ui.View):
 
@@ -563,9 +898,9 @@ class MainView(discord.ui.View):
         )
 
 
-    # ======================================
+    # ========================================================
     # 내 정보
-    # ======================================
+    # ========================================================
 
     @discord.ui.button(
         label="내 정보",
@@ -588,7 +923,7 @@ class MainView(discord.ui.View):
 
             await interaction.response.send_message(
                 f"👤 **{interaction.user.display_name}님의 정보**\n\n"
-                f"💰 게임머니: **{player['money']:,}**\n"
+                f"🪙 코인: **{player['money']:,}**\n"
                 f"💎 다이아: **{player['diamonds']:,}**\n"
                 f"⭐ 포인트: **{player['points']:,}**\n"
                 f"😇 선행 포인트: **{player['good_deed']:,}**",
@@ -607,65 +942,9 @@ class MainView(discord.ui.View):
             )
 
 
-    # ======================================
-    # 게임 설명
-    # ======================================
-
-    @discord.ui.button(
-        label="게임 설명",
-        emoji="📖",
-        style=discord.ButtonStyle.secondary,
-        row=0
-    )
-    async def game_info(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
-
-        embed = discord.Embed(
-            title="📖 머니 배틀로얄",
-            description=(
-                "💰 돈을 벌고\n"
-                "🎒 아이템을 사용하고\n"
-                "🎮 여러 게임에서 경쟁하며\n"
-                "🏆 마지막까지 살아남는 게임입니다."
-            )
-        )
-
-        embed.add_field(
-            name="👥 최소 인원",
-            value="3명",
-            inline=True
-        )
-
-        embed.add_field(
-            name="🎮 게임 시작",
-            value="3명 이상 모이면 방장이 직접 시작합니다.",
-            inline=False
-        )
-
-        embed.add_field(
-            name="💀 탈락",
-            value="게임 규칙에 따라 진행",
-            inline=True
-        )
-
-        embed.add_field(
-            name="🏆 목표",
-            value="최후의 1인이 되는 것",
-            inline=False
-        )
-
-        await interaction.response.send_message(
-            embed=embed,
-            ephemeral=True
-        )
-
-
-    # ======================================
+    # ========================================================
     # 게임 참가
-    # ======================================
+    # ========================================================
 
     @discord.ui.button(
         label="게임 참가",
@@ -687,197 +966,129 @@ class MainView(discord.ui.View):
                 interaction.channel
             )
 
-            if not joined:
+            players = await get_game_players(
+                game["id"]
+            )
 
-                await interaction.response.send_message(
-                    f"⚠️ 이미 게임에 참가되어 있습니다!\n\n"
-                    f"👥 현재 참가자: **{count}명**",
-                    ephemeral=True
+            names = []
+
+            for player in players:
+
+                member = interaction.guild.get_member(
+                    int(player["user_id"])
                 )
 
-                return
+                if member:
+                    names.append(
+                        f"• {member.display_name}"
+                    )
 
-            if count < 3:
+            player_list = "\n".join(names)
 
-                await interaction.response.send_message(
-                    f"🎮 게임 참가 완료!\n\n"
-                    f"👥 현재 참가자: **{count}명**\n"
-                    f"⚠️ 인원이 부족해 게임을 시작할 수 없어요!\n"
-                    f"최소 **3명**이 필요합니다.",
-                    ephemeral=True
+            if not player_list:
+                player_list = "없음"
+
+            embed = discord.Embed(
+                title="🎮 MONEY BATTLE ROYALE",
+                description=(
+                    "게임 참가 대기 중입니다.\n\n"
+                    f"👥 참가자: **{count}명**\n"
+                    f"🎯 최소 인원: **{MIN_PLAYERS}명**\n\n"
+                    f"**참가자 목록**\n"
+                    f"{player_list}"
+                )
+            )
+
+            host_name = interaction.guild.get_member(
+                int(game["host_id"])
+            )
+
+            if host_name:
+
+                embed.add_field(
+                    name="👑 방장",
+                    value=host_name.mention,
+                    inline=False
                 )
 
-            else:
-
-                await interaction.response.send_message(
-                    f"🎉 게임 참가 완료!\n\n"
-                    f"👥 현재 참가자: **{count}명**\n"
-                    f"🟢 참가자가 3명 이상입니다!\n"
-                    f"👑 방장이 **게임 시작** 버튼을 누르면 시작됩니다.",
-                    ephemeral=True
-                )
+            await interaction.response.send_message(
+                embed=embed,
+                view=WaitingView(game["id"])
+            )
 
         except Exception as e:
 
-            print("Join game error:")
+            print("Join main error:")
             print(type(e).__name__)
             print(str(e))
 
             await interaction.response.send_message(
                 f"🔴 게임 참가 중 오류가 발생했습니다.\n"
-                f"오류: `{type(e).__name__}`\n"
-                f"내용: `{str(e)[:300]}`",
+                f"`{type(e).__name__}`\n"
+                f"{str(e)[:300]}",
                 ephemeral=True
             )
 
 
-    # ======================================
-    # 참가 취소
-    # ======================================
+    # ========================================================
+    # 게임 설명
+    # ========================================================
 
     @discord.ui.button(
-        label="참가 취소",
-        emoji="❌",
-        style=discord.ButtonStyle.danger,
-        row=1
+        label="게임 설명",
+        emoji="📖",
+        style=discord.ButtonStyle.secondary,
+        row=0
     )
-    async def cancel_game(
+    async def game_info(
         self,
         interaction: discord.Interaction,
         button: discord.ui.Button
     ):
 
-        try:
-
-            game, cancelled, count = await cancel_game_player(
-                interaction.user,
-                interaction.guild,
-                interaction.channel
+        embed = discord.Embed(
+            title="📖 머니 배틀로얄",
+            description=(
+                "돈을 벌고 게임을 플레이하며\n"
+                "최후의 1인이 되는 서바이벌 게임입니다."
             )
+        )
 
-            if game is None:
+        embed.add_field(
+            name="👥 최소 인원",
+            value=f"{MIN_PLAYERS}명",
+            inline=True
+        )
 
-                await interaction.response.send_message(
-                    "⚠️ 현재 참가할 수 있는 대기 게임이 없습니다.",
-                    ephemeral=True
-                )
+        embed.add_field(
+            name="🪙 시작 자금",
+            value=f"{STARTING_MONEY:,} 코인",
+            inline=True
+        )
 
-                return
+        embed.add_field(
+            name="🏆 목표",
+            value="최후의 1인이 되기",
+            inline=False
+        )
 
-            if not cancelled:
-
-                await interaction.response.send_message(
-                    f"⚠️ 현재 게임에 참가하고 있지 않습니다.\n\n"
-                    f"👥 현재 참가자: **{count}명**",
-                    ephemeral=True
-                )
-
-                return
-
-            await interaction.response.send_message(
-                f"❌ 게임 참가를 취소했습니다.\n\n"
-                f"👥 현재 참가자: **{count}명**",
-                ephemeral=True
-            )
-
-        except Exception as e:
-
-            print("Cancel game error:")
-            print(type(e).__name__)
-            print(str(e))
-
-            await interaction.response.send_message(
-                f"🔴 참가 취소 중 오류가 발생했습니다.\n"
-                f"오류: `{type(e).__name__}`\n"
-                f"내용: `{str(e)[:300]}`",
-                ephemeral=True
-            )
+        await interaction.response.send_message(
+            embed=embed,
+            ephemeral=True
+        )
 
 
-    # ======================================
-    # 게임 시작
-    # ======================================
-
-    @discord.ui.button(
-        label="게임 시작",
-        emoji="▶️",
-        style=discord.ButtonStyle.success,
-        row=2
-    )
-    async def start_game_button(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
-
-        try:
-
-            game, count = await start_game(
-                interaction.user,
-                interaction.guild,
-                interaction.channel
-            )
-
-            if game is None:
-
-                await interaction.response.send_message(
-                    "⚠️ 현재 시작할 대기 게임이 없습니다.",
-                    ephemeral=True
-                )
-
-                return
-
-            if count < 3:
-
-                await interaction.response.send_message(
-                    f"⚠️ 인원이 부족해 게임을 시작할 수 없어요!\n\n"
-                    f"👥 현재 참가자: **{count}명**\n"
-                    f"최소 **3명**이 필요합니다.",
-                    ephemeral=True
-                )
-
-                return
-
-            await interaction.response.send_message(
-                f"🎉 **게임이 시작되었습니다!**\n\n"
-                f"🎮 게임 ID: **{game['id']}**\n"
-                f"👥 참가자: **{count}명**\n\n"
-                f"🏆 머니 배틀로얄을 시작합니다!",
-                ephemeral=False
-            )
-
-        except PermissionError:
-
-            await interaction.response.send_message(
-                "🔴 **게임 방장만 게임을 시작할 수 있습니다.**",
-                ephemeral=True
-            )
-
-        except Exception as e:
-
-            print("Start game error:")
-            print(type(e).__name__)
-            print(str(e))
-
-            await interaction.response.send_message(
-                f"🔴 게임 시작 중 오류가 발생했습니다.\n"
-                f"오류: `{type(e).__name__}`\n"
-                f"내용: `{str(e)[:300]}`",
-                ephemeral=True
-            )
-
-
-    # ======================================
+    # ========================================================
     # 닫기
-    # ======================================
+    # ========================================================
 
     @discord.ui.button(
         label="닫기",
         emoji="🔒",
         style=discord.ButtonStyle.secondary,
-        row=2
+        row=1
     )
-    async def close_menu(
+    async def close(
         self,
         interaction: discord.Interaction,
         button: discord.ui.Button
@@ -890,9 +1101,9 @@ class MainView(discord.ui.View):
         )
 
 
-# ==========================================
+# ============================================================
 # /메인
-# ==========================================
+# ============================================================
 
 @bot.tree.command(
     name="메인",
@@ -902,64 +1113,14 @@ async def main_menu(
     interaction: discord.Interaction
 ):
 
-    try:
-
-        await get_or_create_player(
-            interaction.user,
-            interaction.guild
-        )
-
-    except Exception as e:
-
-        print("Player registration error:")
-        print(type(e).__name__)
-        print(str(e))
+    if interaction.guild is None:
 
         await interaction.response.send_message(
-            f"🔴 플레이어 생성 실패\n"
-            f"오류: `{type(e).__name__}`\n"
-            f"내용: `{str(e)[:500]}`",
+            "🔴 디스코드 서버에서 사용해주세요.",
             ephemeral=True
         )
 
         return
-
-
-    embed = discord.Embed(
-        title="💰 머니 배틀로얄",
-        description=(
-            "━━━━━━━━━━━━━━━━━━\n"
-            "💰 **MONEY BATTLE ROYALE**\n"
-            "━━━━━━━━━━━━━━━━━━\n\n"
-            "돈을 벌고, 아이템을 사용하고,\n"
-            "마지막까지 살아남으세요!\n\n"
-            "🎮 **게임 참가** — 게임에 참가합니다.\n"
-            "❌ **참가 취소** — 참가를 취소합니다.\n"
-            "▶️ **게임 시작** — 방장이 3명 이상일 때 시작합니다.\n"
-            "📖 **게임 설명** — 기본 규칙을 확인합니다.\n"
-            "👤 **내 정보** — 현재 자산을 확인합니다."
-        )
-    )
-
-
-    await interaction.response.send_message(
-        embed=embed,
-        view=MainView(),
-        ephemeral=True
-    )
-
-
-# ==========================================
-# /게임테스트
-# ==========================================
-
-@bot.tree.command(
-    name="게임테스트",
-    description="혼자서 머니 배틀로얄 게임 시작을 테스트합니다."
-)
-async def game_test(
-    interaction: discord.Interaction
-):
 
     try:
 
@@ -968,64 +1129,92 @@ async def game_test(
             interaction.guild
         )
 
-        connection = await get_db()
-
-        try:
-
-            game = await connection.fetchrow(
-                """
-                INSERT INTO games (
-                    game_type,
-                    status,
-                    host_id,
-                    channel_id,
-                    current_phase
-                )
-                VALUES (
-                    'money_battle_royale_test',
-                    'playing',
-                    $1,
-                    $2,
-                    'test'
-                )
-                RETURNING *
-                """,
-                str(interaction.user.id),
-                str(interaction.channel.id)
-            )
-
-            await connection.execute(
-                """
-                INSERT INTO game_players (
-                    game_id,
-                    user_id
-                )
-                VALUES ($1, $2)
-                """,
-                game["id"],
-                str(interaction.user.id)
-            )
-
-        finally:
-
-            await connection.close()
-
-
         embed = discord.Embed(
-            title="🧪 게임 테스트 시작!",
+            title="💰 MONEY BATTLE ROYALE",
             description=(
-                "테스트용 게임이 정상적으로 생성되었습니다.\n\n"
-                f"🎮 게임 ID: **{game['id']}**\n"
-                f"👤 테스트 플레이어: **{interaction.user.display_name}**\n"
-                "👥 참가자 수: **1명**\n\n"
-                "⚠️ 이 게임은 실제 게임이 아닙니다.\n"
-                "실제 게임은 **3명 이상**이 필요합니다."
+                "━━━━━━━━━━━━━━━━━━\n"
+                "💰 **MONEY BATTLE ROYALE**\n"
+                "━━━━━━━━━━━━━━━━━━\n\n"
+                "돈을 벌고,\n"
+                "게임을 플레이하고,\n"
+                "마지막까지 살아남으세요!\n\n"
+                f"🪙 코인: **{player['money']:,}**\n"
+                f"💎 다이아: **{player['diamonds']:,}**\n"
+                f"😇 선행 포인트: **{player['good_deed']:,}**"
             )
         )
 
         await interaction.response.send_message(
             embed=embed,
+            view=MainView(),
             ephemeral=True
+        )
+
+    except Exception as e:
+
+        print("Main menu error:")
+        print(type(e).__name__)
+        print(str(e))
+
+        await interaction.response.send_message(
+            f"🔴 메인 메뉴 오류\n"
+            f"`{type(e).__name__}`\n"
+            f"{str(e)[:500]}",
+            ephemeral=True
+        )
+
+
+# ============================================================
+# /게임테스트
+# ============================================================
+
+@bot.tree.command(
+    name="게임테스트",
+    description="1인으로 실제 게임 시작 화면을 테스트합니다."
+)
+async def game_test(
+    interaction: discord.Interaction
+):
+
+    if interaction.guild is None:
+
+        await interaction.response.send_message(
+            "🔴 디스코드 서버에서 사용해주세요.",
+            ephemeral=True
+        )
+
+        return
+
+    try:
+
+        await interaction.response.send_message(
+            "🧪 **테스트 게임 준비 중...**"
+        )
+
+        for number in [3, 2, 1]:
+
+            await asyncio.sleep(1)
+
+            await interaction.edit_original_response(
+                content=(
+                    "🧪 **MONEY BATTLE ROYALE TEST**\n\n"
+                    f"🔥 게임 시작까지 **{number}초**!"
+                )
+            )
+
+        game = await create_test_game(
+            interaction
+        )
+
+        await interaction.edit_original_response(
+            content=(
+                "🧪 **MONEY BATTLE ROYALE TEST**\n\n"
+                "🎉 **테스트 게임이 시작되었습니다!**\n\n"
+                "👥 참가자: **1명**\n"
+                f"🪙 시작 자금: **{STARTING_MONEY:,} 코인**\n\n"
+                f"🎮 Game ID: **{game['id']}**\n"
+                "☠️ 현재 단계: **SURVIVAL TEST**"
+            )
         )
 
         print(
@@ -1039,17 +1228,28 @@ async def game_test(
         print(type(e).__name__)
         print(str(e))
 
-        await interaction.response.send_message(
-            f"🔴 게임 테스트 실패\n"
-            f"오류: `{type(e).__name__}`\n"
-            f"내용: `{str(e)[:500]}`",
-            ephemeral=True
-        )
+        if interaction.response.is_done():
+
+            await interaction.followup.send(
+                f"🔴 게임 테스트 실패\n"
+                f"`{type(e).__name__}`\n"
+                f"{str(e)[:500]}",
+                ephemeral=True
+            )
+
+        else:
+
+            await interaction.response.send_message(
+                f"🔴 게임 테스트 실패\n"
+                f"`{type(e).__name__}`\n"
+                f"{str(e)[:500]}",
+                ephemeral=True
+            )
 
 
-# ==========================================
+# ============================================================
 # /dbtest
-# ==========================================
+# ============================================================
 
 @bot.tree.command(
     name="dbtest",
@@ -1059,25 +1259,9 @@ async def dbtest(
     interaction: discord.Interaction
 ):
 
-    database_url = os.environ.get(
-        "DATABASE_URL"
-    )
-
-    if not database_url:
-
-        await interaction.response.send_message(
-            "🔴 DATABASE_URL이 설정되어 있지 않습니다.",
-            ephemeral=True
-        )
-
-        return
-
-
     try:
 
-        connection = await asyncpg.connect(
-            database_url
-        )
+        connection = await get_db()
 
         result = await connection.fetchval(
             "SELECT 1;"
@@ -1094,21 +1278,21 @@ async def dbtest(
 
     except Exception as e:
 
-        print("Database test failed:")
+        print("DB test error:")
         print(type(e).__name__)
         print(str(e))
 
         await interaction.response.send_message(
             f"🔴 DB 연결 실패\n"
-            f"오류: `{type(e).__name__}`\n"
-            f"내용: `{str(e)[:500]}`",
+            f"`{type(e).__name__}`\n"
+            f"{str(e)[:500]}",
             ephemeral=True
         )
 
 
-# ==========================================
-# Discord 이벤트
-# ==========================================
+# ============================================================
+# on_ready
+# ============================================================
 
 @bot.event
 async def on_ready():
@@ -1143,12 +1327,39 @@ async def on_ready():
             str(e)
         )
 
-    await test_database()
+    try:
+
+        connection = await get_db()
+
+        result = await connection.fetchval(
+            "SELECT 1;"
+        )
+
+        await connection.close()
+
+        if result == 1:
+            print(
+                "Database connected successfully!"
+            )
+
+    except Exception as e:
+
+        print(
+            "Database connection failed:"
+        )
+
+        print(
+            type(e).__name__
+        )
+
+        print(
+            str(e)
+        )
 
 
-# ==========================================
+# ============================================================
 # 실행
-# ==========================================
+# ============================================================
 
 if __name__ == "__main__":
 
