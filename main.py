@@ -1157,13 +1157,14 @@ async def force_end_game(game_id: int):
 
 @bot.tree.command(
     name="게임종료",
-    description="현재 게임을 강제로 종료합니다."
+    description="현재 진행 중인 게임을 강제로 종료합니다."
 )
 async def force_end_game_command(
     interaction: discord.Interaction
 ):
 
     if interaction.guild is None:
+
         await interaction.response.send_message(
             "🔴 디스코드 서버에서 사용해주세요.",
             ephemeral=True
@@ -1172,40 +1173,47 @@ async def force_end_game_command(
 
     try:
 
-        game = await get_waiting_game(
-            interaction.channel.id
-        )
+        # ----------------------------------------------------
+        # 현재 채널에서 실제 진행 중인 게임만 검색
+        # ----------------------------------------------------
 
-        # waiting 게임이 없으면 playing 게임 검색
-        if not game:
+        connection = await get_db()
 
-            connection = await get_db()
+        try:
 
-            try:
-                game = await connection.fetchrow(
-                    """
-                    SELECT *
-                    FROM games
-                    WHERE channel_id = $1
-                      AND status = 'playing'
-                    ORDER BY id DESC
-                    LIMIT 1
-                    """,
-                    str(interaction.channel.id)
-                )
+            game = await connection.fetchrow(
+                """
+                SELECT *
+                FROM games
+                WHERE channel_id = $1
+                  AND status = 'playing'
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                str(interaction.channel.id)
+            )
 
-            finally:
-                await connection.close()
+        finally:
+
+            await connection.close()
+
+        # ----------------------------------------------------
+        # 진행 중인 게임 없음
+        # ----------------------------------------------------
 
         if not game:
 
             await interaction.response.send_message(
-                "⚠️ 현재 이 채널에서 진행 중인 게임이 없습니다.",
+                "⚠️ 현재 이 채널에서 **진행 중인 게임**이 없습니다.\n\n"
+                "💡 대기 중인 게임은 `/게임종료`로 종료되지 않습니다.",
                 ephemeral=True
             )
             return
 
+        # ----------------------------------------------------
         # 방장 확인
+        # ----------------------------------------------------
+
         if str(game["host_id"]) != str(
             interaction.user.id
         ):
@@ -1216,24 +1224,32 @@ async def force_end_game_command(
             )
             return
 
+        # ----------------------------------------------------
         # 확인 버튼
+        # ----------------------------------------------------
+
         view = ForceEndConfirmView(
             game["id"]
         )
 
         await interaction.response.send_message(
             "⚠️ **게임 강제종료**\n\n"
-            "정말 현재 게임을 종료하시겠습니까?\n\n"
-            "⚠️ 종료된 게임은 다시 시작할 수 없습니다.",
+            f"🎮 Game ID: **{game['id']}**\n"
+            "📌 현재 상태: **PLAYING**\n\n"
+            "정말 현재 게임을 강제로 종료하시겠습니까?\n\n"
+            "⚠️ 종료된 게임은 다시 시작할 수 없습니다.\n"
+            "⚠️ 모든 참가자는 해당 게임에서 탈락 처리됩니다.",
             view=view,
             ephemeral=True
         )
 
     except Exception as e:
 
-        print("Force end command error:")
-        print(type(e).__name__)
-        print(str(e))
+        print(
+            "Force end command error:",
+            type(e).__name__,
+            str(e)
+        )
 
         if interaction.response.is_done():
 
