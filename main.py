@@ -685,7 +685,7 @@ class WaitingView(discord.ui.View):
 
             await interaction.response.send_message(
                 f"🎉 게임 참가 완료!\n\n"
-                f"👥 현재 참가자: **{count}명}\n"
+                f"👥 현재 참가자: **{count}명**\n"
                 f"🎯 최소 참가 인원: **{MIN_PLAYERS}명**",
                 ephemeral=True
             )
