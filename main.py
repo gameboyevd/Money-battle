@@ -1131,6 +1131,189 @@ class JobView(discord.ui.View):
 # ============================================================
 # 실제 게임 화면
 # ============================================================
+# ============================================================
+# 알바 메뉴 View
+# ============================================================
+
+class JobView(discord.ui.View):
+
+    def __init__(self, game_id):
+
+        super().__init__(
+            timeout=300
+        )
+
+        self.game_id = game_id
+
+    @discord.ui.button(
+        label="청소",
+        emoji="🧹",
+        style=discord.ButtonStyle.primary,
+        row=0
+    )
+    async def cleaning(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        await interaction.response.send_message(
+            "🧹 **청소 알바**\n\n"
+            "💰 보상: **20,000 코인**\n\n"
+            "⏳ 실제 보상 기능은 다음 단계에서 연결됩니다.",
+            ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="택배",
+        emoji="📦",
+        style=discord.ButtonStyle.primary,
+        row=0
+    )
+    async def delivery_package(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        await interaction.response.send_message(
+            "📦 **택배 알바**\n\n"
+            "💰 보상: **22,000 코인**\n\n"
+            "⏳ 실제 보상 기능은 다음 단계에서 연결됩니다.",
+            ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="과녁",
+        emoji="🎯",
+        style=discord.ButtonStyle.primary,
+        row=0
+    )
+    async def target(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        await interaction.response.send_message(
+            "🎯 **과녁 알바**\n\n"
+            "💰 보상: **22,000 코인**\n\n"
+            "⏳ 실제 보상 기능은 다음 단계에서 연결됩니다.",
+            ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="패스트푸드",
+        emoji="🍔",
+        style=discord.ButtonStyle.primary,
+        row=1
+    )
+    async def fast_food(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        await interaction.response.send_message(
+            "🍔 **패스트푸드 알바**\n\n"
+            "💰 보상: **25,000 코인**\n\n"
+            "⏳ 실제 보상 기능은 다음 단계에서 연결됩니다.",
+            ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="배달",
+        emoji="🏃",
+        style=discord.ButtonStyle.primary,
+        row=1
+    )
+    async def delivery(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        await interaction.response.send_message(
+            "🏃 **배달 알바**\n\n"
+            "💰 보상: **25,000 코인**\n\n"
+            "⏳ 실제 보상 기능은 다음 단계에서 연결됩니다.",
+            ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="주방",
+        emoji="🍳",
+        style=discord.ButtonStyle.primary,
+        row=1
+    )
+    async def kitchen(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        await interaction.response.send_message(
+            "🍳 **주방 알바**\n\n"
+            "💰 보상: **28,000 코인**\n\n"
+            "⏳ 실제 보상 기능은 다음 단계에서 연결됩니다.",
+            ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="데이터 입력",
+        emoji="🧠",
+        style=discord.ButtonStyle.primary,
+        row=2
+    )
+    async def data_entry(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        await interaction.response.send_message(
+            "🧠 **데이터 입력 알바**\n\n"
+            "💰 보상: **30,000 코인**\n\n"
+            "⏳ 실제 보상 기능은 다음 단계에서 연결됩니다.",
+            ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="낚시",
+        emoji="🎣",
+        style=discord.ButtonStyle.primary,
+        row=2
+    )
+    async def fishing(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        await interaction.response.send_message(
+            "🎣 **낚시 알바**\n\n"
+            "💰 보상: **30,000 코인**\n\n"
+            "⏳ 실제 보상 기능은 다음 단계에서 연결됩니다.",
+            ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="닫기",
+        emoji="❌",
+        style=discord.ButtonStyle.secondary,
+        row=3
+    )
+    async def close(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+
+        await interaction.response.edit_message(
+            content="🧑‍💼 알바 메뉴를 닫았습니다.",
+            embed=None,
+            view=None
+        )
 
 class SurvivalGameView(discord.ui.View):
 
