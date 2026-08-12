@@ -1082,22 +1082,33 @@ async def force_end_game(
             return False, "이미 종료된 게임입니다."
 
         await connection.execute(
-            """
-            UPDATE games
-            SET
-                status = 'ended',
-                current_phase = 'ended',
-                ended_at = NOW(),
-                game_data = jsonb_set(
-                    COALESCE(game_data, '{}'::jsonb),
-                    '{force_ended}',
-                    'true'::jsonb,
-                    TRUE
-                )
-            WHERE id = $1
-            """,
-            game_id
+    """
+    UPDATE games
+    SET
+        status = 'ended',
+        current_phase = 'ended',
+        ended_at = NOW(),
+        game_data = jsonb_set(
+            COALESCE(game_data, '{}'::jsonb),
+            '{force_ended}',
+            'true'::jsonb,
+            TRUE
         )
+    WHERE id = $1
+    """,
+    game_id
+)
+
+await connection.execute(
+    """
+    UPDATE game_players
+    SET
+        ended_reason = 'force_ended',
+        profit = 0
+    WHERE game_id = $1
+    """,
+    game_id
+)
 
         return True, "게임이 강제 종료되었습니다."
 
