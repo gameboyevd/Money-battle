@@ -1060,12 +1060,16 @@ class SurvivalGameView(discord.ui.View):
 # 게임 강제종료
 # ============================================================
 
-async def force_end_game(
-    game_id: int
-):
+async def force_end_game(game_id: int):
+
     connection = await get_db()
 
     try:
+
+        # ----------------------------------------------------
+        # 1. 게임 확인
+        # ----------------------------------------------------
+
         game = await connection.fetchrow(
             """
             SELECT *
@@ -1076,46 +1080,77 @@ async def force_end_game(
         )
 
         if not game:
-            raise RuntimeError("게임을 찾을 수 없습니다.")
+            raise RuntimeError(
+                "게임을 찾을 수 없습니다."
+            )
 
+        # 이미 종료된 게임
         if game["status"] == "ended":
             return False, "이미 종료된 게임입니다."
 
-        await connection.execute(
-    """
-    UPDATE games
-    SET
-        status = 'ended',
-        current_phase = 'ended',
-        ended_at = NOW(),
-        game_data = jsonb_set(
-            COALESCE(game_data, '{}'::jsonb),
-            '{force_ended}',
-            'true'::jsonb,
-            TRUE
-        )
-    WHERE id = $1
-    """,
-    game_id
-)
+        # ----------------------------------------------------
+        # 2. 게임 종료
+        # ----------------------------------------------------
 
-await connection.execute(
-    """
-    UPDATE game_players
-    SET
-        ended_reason = 'force_ended',
-        profit = 0
-    WHERE game_id = $1
-    """,
-    game_id
-)
+        await connection.execute(
+            """
+            UPDATE games
+            SET
+                status = 'ended',
+                current_phase = 'ended',
+                ended_at = NOW(),
+                game_data = jsonb_set(
+                    COALESCE(game_data, '{}'::jsonb),
+                    '{force_ended}',
+                    'true'::jsonb,
+                    TRUE
+                )
+            WHERE id = $1
+            """,
+            game_id
+        )
+
+        # ----------------------------------------------------
+        # 3. 참가자 상태 정리
+        # ----------------------------------------------------
+
+        await connection.execute(
+            """
+            UPDATE game_players
+            SET
+                ended_reason = 'force_ended',
+                result = NULL,
+                profit = 0
+            WHERE game_id = $1
+            """,
+            game_id
+        )
+
+        # ----------------------------------------------------
+        # 4. 해당 게임 참가자 생존 상태 정리
+        # ----------------------------------------------------
+
+        await connection.execute(
+            """
+            UPDATE players
+            SET
+                alive = FALSE,
+                eliminated = TRUE,
+                updated_at = NOW()
+            WHERE user_id IN (
+                SELECT user_id
+                FROM game_players
+                WHERE game_id = $1
+            )
+            """,
+            game_id
+        )
 
         return True, "게임이 강제 종료되었습니다."
 
     finally:
+
         await connection.close()
-
-
 # ============================================================
 # /게임종료
 # ============================================================
