@@ -883,7 +883,213 @@ class WaitingView(discord.ui.View):
 
             except Exception:
                 pass
+# ============================================================
+# 실제 게임 화면
+# ============================================================
 
+class SurvivalGameView(discord.ui.View):
+
+    def __init__(self, game_id: int):
+        super().__init__(timeout=None)
+        self.game_id = game_id
+
+    @discord.ui.button(
+        label="게임",
+        emoji="🎮",
+        style=discord.ButtonStyle.success,
+        row=0
+    )
+    async def games(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        await interaction.response.send_message(
+            "🎮 **게임 메뉴**\n\n"
+            "🃏 블랙잭\n"
+            "🃏 에이스 브레이커\n"
+            "🎲 미니 친치로\n"
+            "🧠 인디언 포커\n"
+            "🎡 룰렛\n"
+            "💣 폭탄 룰렛\n"
+            "🔢 홀짝\n"
+            "🎭 야바위\n"
+            "🏇 경마\n\n"
+            "⚠️ 게임 기능은 순차적으로 연결됩니다.",
+            ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="알바",
+        emoji="🧑‍💼",
+        style=discord.ButtonStyle.primary,
+        row=0
+    )
+    async def jobs(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        await interaction.response.send_message(
+            "🧑‍💼 **알바 메뉴**\n\n"
+            "🧹 청소 — 20,000 코인\n"
+            "📦 택배 — 22,000 코인\n"
+            "🎯 과녁 — 22,000 코인\n"
+            "🍔 패스트푸드 — 25,000 코인\n"
+            "🏃 배달 — 25,000 코인\n"
+            "🍳 주방 — 28,000 코인\n"
+            "🧠 데이터 입력 — 30,000 코인\n"
+            "🎣 낚시 — 30,000 코인",
+            ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="상점",
+        emoji="🏪",
+        style=discord.ButtonStyle.secondary,
+        row=0
+    )
+    async def shop(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        await interaction.response.send_message(
+            "🏪 **일반 상점**\n\n"
+            "👁️ 정찰권 — 300,000 코인\n"
+            "🪣 빨대 쪼옵 — 600,000 코인\n"
+            "🎟️ 이벤트 참가권 — 500,000 코인\n"
+            "⏳ 시간 연장권 — 1,000,000 코인\n"
+            "🎁 랜덤박스 — 400,000 코인~\n"
+            "🎭 밑장빼기권 — 800,000 코인",
+            ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="기부",
+        emoji="😇",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def donate(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        await interaction.response.send_message(
+            "😇 **기부 시스템**\n\n"
+            "현재 꼴등에게 코인을 기부할 수 있습니다.\n"
+            "기부 기능은 다음 단계에서 연결합니다.",
+            ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="아이템",
+        emoji="🎒",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def items(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        await interaction.response.send_message(
+            "🎒 **보유 아이템**\n\n"
+            "현재 보유한 아이템을 표시합니다.\n"
+            "게임 시작 전 10초 동안 사용할 아이템을 선택합니다.",
+            ephemeral=True
+        )
+
+    @discord.ui.button(
+        label="내 정보",
+        emoji="👤",
+        style=discord.ButtonStyle.secondary,
+        row=1
+    )
+    async def info(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button
+    ):
+        try:
+            player = await get_or_create_player(
+                interaction.user,
+                interaction.guild
+            )
+
+            await interaction.response.send_message(
+                f"👤 **내 정보**\n\n"
+                f"🪙 코인: **{player['money']:,}**\n"
+                f"💎 다이아: **{player['diamonds']:,}**\n"
+                f"😇 선행 포인트: **{player['good_deed']:,}**",
+                ephemeral=True
+            )
+
+        except Exception as e:
+            print("Game info error:", type(e).__name__, str(e))
+
+            await interaction.response.send_message(
+                "🔴 정보를 불러오지 못했습니다.",
+                ephemeral=True
+        )
+            async def get_test_game_screen(
+    game_id: int,
+    user_id: int
+):
+
+    connection = await get_db()
+
+    try:
+        game = await connection.fetchrow(
+            """
+            SELECT *
+            FROM games
+            WHERE id = $1
+            """,
+            game_id
+        )
+
+        if not game:
+            raise RuntimeError("게임을 찾을 수 없습니다.")
+
+        player = await connection.fetchrow(
+            """
+            SELECT *
+            FROM players
+            WHERE user_id = $1
+            """,
+            str(user_id)
+        )
+
+        if not player:
+            raise RuntimeError("플레이어를 찾을 수 없습니다.")
+
+        count = await connection.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM game_players
+            WHERE game_id = $1
+            """,
+            game_id
+        )
+
+        alive_count = await connection.fetchval(
+            """
+            SELECT COUNT(*)
+            FROM game_players gp
+            JOIN players p
+              ON p.user_id = gp.user_id
+            WHERE gp.game_id = $1
+              AND p.alive = TRUE
+            """,
+            game_id
+        )
+
+        return game, player, count, alive_count
+
+    finally:
+        await connection.close()
 
 # ============================================================
 # 메인 메뉴
@@ -1206,16 +1412,38 @@ async def game_test(
             interaction
         )
 
-        await interaction.edit_original_response(
-            content=(
-                "🧪 **MONEY BATTLE ROYALE TEST**\n\n"
-                "🎉 **테스트 게임이 시작되었습니다!**\n\n"
-                "👥 참가자: **1명**\n"
-                f"🪙 시작 자금: **{STARTING_MONEY:,} 코인**\n\n"
-                f"🎮 Game ID: **{game['id']}**\n"
-                "☠️ 현재 단계: **SURVIVAL TEST**"
-            )
-        )
+        game_data = await get_test_game_screen(
+    game["id"],
+    interaction.user.id
+)
+
+game_row, player, count, alive_count = game_data
+
+embed = discord.Embed(
+    title="💰 MONEY BATTLE ROYALE",
+    description=(
+        "━━━━━━━━━━━━━━━━━━\n"
+        "🔥 **SURVIVAL GAME**\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"👥 생존자: **{alive_count}명**\n"
+        f"🏆 현재 순위: **1위**\n"
+        f"🪙 보유 코인: **{player['money']:,}**\n"
+        f"😇 선행 포인트: **{player['good_deed']:,}**\n\n"
+        "☠️ 다음 탈락 판정까지 준비 중...\n\n"
+        "게임에서 돈을 벌고\n"
+        "최후의 1인이 되어보세요!"
+    )
+)
+
+embed.set_footer(
+    text=f"Game ID: {game_row['id']} • TEST MODE"
+)
+
+await interaction.edit_original_response(
+    content=None,
+    embed=embed,
+    view=SurvivalGameView(game_row["id"])
+)
 
         print(
             f"[GAME TEST] game_id={game['id']} "
