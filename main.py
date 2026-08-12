@@ -1325,6 +1325,14 @@ class ForceEndConfirmView(discord.ui.View):
                     view=None
                 )
                 return
+                
+             if game["status"] != "playing":
+
+    await interaction.response.edit_message(
+        content="⚠️ 이 게임은 더 이상 진행 중이 아닙니다.",
+        view=None
+    )
+    return
 
             # 다시 방장 확인
             if str(game["host_id"]) != str(
