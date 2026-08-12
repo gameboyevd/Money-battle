@@ -1,6 +1,7 @@
 import os
 import asyncio
 import threading
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import discord
@@ -14,6 +15,13 @@ import asyncpg
 
 MIN_PLAYERS = 4
 STARTING_MONEY = 10_000
+
+# 알바 쿨타임
+JOB_COOLDOWN_SECONDS = 5 * 60
+
+# 현재 실행 중인 Render 인스턴스의 알바 쿨타임
+# {user_id: datetime}
+job_cooldowns = {}
 
 
 # ============================================================
@@ -39,14 +47,22 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 
 def start_web_server():
-    port = int(os.environ.get("PORT", 10000))
+
+    port = int(
+        os.environ.get(
+            "PORT",
+            10000
+        )
+    )
 
     server = HTTPServer(
         ("0.0.0.0", port),
         HealthHandler
     )
 
-    print(f"HTTP server started on port {port}")
+    print(
+        f"HTTP server started on port {port}"
+    )
 
     server.serve_forever()
 
@@ -56,6 +72,7 @@ def start_web_server():
 # ============================================================
 
 intents = discord.Intents.default()
+
 intents.message_content = True
 
 bot = commands.Bot(
@@ -70,14 +87,19 @@ bot = commands.Bot(
 
 async def get_db():
 
-    database_url = os.environ.get("DATABASE_URL")
+    database_url = os.environ.get(
+        "DATABASE_URL"
+    )
 
     if not database_url:
+
         raise RuntimeError(
             "DATABASE_URL이 설정되지 않았습니다."
         )
 
-    return await asyncpg.connect(database_url)
+    return await asyncpg.connect(
+        database_url
+    )
 
 
 # ============================================================
@@ -90,6 +112,7 @@ async def get_or_create_player(
 ):
 
     if guild is None:
+
         raise RuntimeError(
             "디스코드 서버에서만 사용할 수 있습니다."
         )
@@ -139,6 +162,7 @@ async def get_or_create_player(
         )
 
     finally:
+
         await connection.close()
 
 
@@ -146,7 +170,9 @@ async def get_or_create_player(
 # 대기 게임 조회
 # ============================================================
 
-async def get_waiting_game(channel_id: int):
+async def get_waiting_game(
+    channel_id: int
+):
 
     connection = await get_db()
 
@@ -165,6 +191,7 @@ async def get_waiting_game(channel_id: int):
         )
 
     finally:
+
         await connection.close()
 
 
@@ -204,10 +231,14 @@ async def create_waiting_game(
             """,
             str(host_id),
             str(channel.id),
-            '{"starting_money":10000,"min_players":4}'
+            (
+                '{"starting_money":10000,'
+                '"min_players":4}'
+            )
         )
 
     finally:
+
         await connection.close()
 
 
@@ -221,9 +252,12 @@ async def get_or_create_waiting_game(
     user_id
 ):
 
-    game = await get_waiting_game(channel.id)
+    game = await get_waiting_game(
+        channel.id
+    )
 
     if game:
+
         return game
 
     return await create_waiting_game(
@@ -237,7 +271,9 @@ async def get_or_create_waiting_game(
 # 참가자 수
 # ============================================================
 
-async def get_player_count(game_id):
+async def get_player_count(
+    game_id
+):
 
     connection = await get_db()
 
@@ -253,6 +289,7 @@ async def get_player_count(game_id):
         )
 
     finally:
+
         await connection.close()
 
 
@@ -260,7 +297,9 @@ async def get_player_count(game_id):
 # 참가자 목록
 # ============================================================
 
-async def get_game_players(game_id):
+async def get_game_players(
+    game_id
+):
 
     connection = await get_db()
 
@@ -277,6 +316,7 @@ async def get_game_players(game_id):
         )
 
     finally:
+
         await connection.close()
 
 
@@ -322,7 +362,11 @@ async def join_game_player(
                 game["id"]
             )
 
-            return game, False, count
+            return (
+                game,
+                False,
+                count
+            )
 
         await connection.execute(
             """
@@ -349,9 +393,14 @@ async def join_game_player(
             game["id"]
         )
 
-        return game, True, count
+        return (
+            game,
+            True,
+            count
+        )
 
     finally:
+
         await connection.close()
 
 
@@ -370,7 +419,12 @@ async def cancel_game_player(
     )
 
     if not game:
-        return None, False, 0
+
+        return (
+            None,
+            False,
+            0
+        )
 
     connection = await get_db()
 
@@ -393,7 +447,11 @@ async def cancel_game_player(
                 game["id"]
             )
 
-            return game, False, count
+            return (
+                game,
+                False,
+                count
+            )
 
         await connection.execute(
             """
@@ -409,9 +467,14 @@ async def cancel_game_player(
             game["id"]
         )
 
-        return game, True, count
+        return (
+            game,
+            True,
+            count
+        )
 
     finally:
+
         await connection.close()
 
 
@@ -419,7 +482,9 @@ async def cancel_game_player(
 # 게임 시작
 # ============================================================
 
-async def start_survival_game(game_id):
+async def start_survival_game(
+    game_id
+):
 
     connection = await get_db()
 
@@ -436,11 +501,13 @@ async def start_survival_game(game_id):
         )
 
         if not game:
+
             raise RuntimeError(
                 "게임을 찾을 수 없습니다."
             )
 
         if game["status"] != "waiting":
+
             raise RuntimeError(
                 "이미 시작되었거나 종료된 게임입니다."
             )
@@ -455,6 +522,7 @@ async def start_survival_game(game_id):
         )
 
         if count < MIN_PLAYERS:
+
             raise RuntimeError(
                 f"최소 {MIN_PLAYERS}명이 필요합니다."
             )
@@ -467,7 +535,10 @@ async def start_survival_game(game_id):
                 current_phase = 'survival',
                 started_at = NOW(),
                 game_data = jsonb_set(
-                    COALESCE(game_data, '{}'::jsonb),
+                    COALESCE(
+                        game_data,
+                        '{}'::jsonb
+                    ),
                     '{starting_money}',
                     '10000'::jsonb,
                     TRUE
@@ -506,14 +577,17 @@ async def start_survival_game(game_id):
         return count
 
     finally:
+
         await connection.close()
 
 
 # ============================================================
-# 테스트 게임
+# 테스트 게임 생성
 # ============================================================
 
-async def create_test_game(interaction):
+async def create_test_game(
+    interaction
+):
 
     await get_or_create_player(
         interaction.user,
@@ -548,7 +622,11 @@ async def create_test_game(interaction):
             """,
             str(interaction.user.id),
             str(interaction.channel.id),
-            '{"test":true,"starting_money":10000,"min_players":1}'
+            (
+                '{"test":true,'
+                '"starting_money":10000,'
+                '"min_players":1}'
+            )
         )
 
         await connection.execute(
@@ -590,6 +668,7 @@ async def create_test_game(interaction):
         return game
 
     finally:
+
         await connection.close()
 
 
@@ -616,6 +695,7 @@ async def get_test_game_screen(
         )
 
         if not game:
+
             raise RuntimeError(
                 "게임을 찾을 수 없습니다."
             )
@@ -631,6 +711,7 @@ async def get_test_game_screen(
         )
 
         if not player:
+
             raise RuntimeError(
                 "플레이어를 찾을 수 없습니다."
             )
@@ -656,9 +737,15 @@ async def get_test_game_screen(
             game_id
         )
 
-        return game, player, count, alive_count
+        return (
+            game,
+            player,
+            count,
+            alive_count
+        )
 
     finally:
+
         await connection.close()
 
 
@@ -666,15 +753,24 @@ async def get_test_game_screen(
 # 대기방 View
 # ============================================================
 
-class WaitingView(discord.ui.View):
+class WaitingView(
+    discord.ui.View
+):
 
-    def __init__(self, game_id):
+    def __init__(
+        self,
+        game_id
+    ):
 
         super().__init__(
             timeout=None
         )
 
         self.game_id = game_id
+
+    # --------------------------------------------------------
+    # 게임 참가
+    # --------------------------------------------------------
 
     @discord.ui.button(
         label="게임 참가",
@@ -689,7 +785,11 @@ class WaitingView(discord.ui.View):
 
         try:
 
-            game, joined, count = await join_game_player(
+            (
+                game,
+                joined,
+                count
+            ) = await join_game_player(
                 interaction.user,
                 interaction.guild,
                 interaction.channel
@@ -698,16 +798,21 @@ class WaitingView(discord.ui.View):
             if not joined:
 
                 await interaction.response.send_message(
-                    f"⚠️ 이미 참가 중입니다.\n\n"
-                    f"👥 현재 참가자: **{count}명**",
+                    (
+                        "⚠️ 이미 참가 중입니다.\n\n"
+                        f"👥 현재 참가자: **{count}명**"
+                    ),
                     ephemeral=True
                 )
+
                 return
 
             await interaction.response.send_message(
-                f"🎉 게임 참가 완료!\n\n"
-                f"👥 현재 참가자: **{count}명**\n"
-                f"🎯 최소 참가 인원: **{MIN_PLAYERS}명**",
+                (
+                    "🎉 게임 참가 완료!\n\n"
+                    f"👥 현재 참가자: **{count}명**\n"
+                    f"🎯 최소 참가 인원: **{MIN_PLAYERS}명**"
+                ),
                 ephemeral=True
             )
 
@@ -720,11 +825,17 @@ class WaitingView(discord.ui.View):
             )
 
             await interaction.response.send_message(
-                f"🔴 참가 실패\n"
-                f"`{type(e).__name__}`\n"
-                f"{str(e)[:300]}",
+                (
+                    "🔴 참가 실패\n"
+                    f"`{type(e).__name__}`\n"
+                    f"{str(e)[:300]}"
+                ),
                 ephemeral=True
             )
+
+    # --------------------------------------------------------
+    # 참가 취소
+    # --------------------------------------------------------
 
     @discord.ui.button(
         label="참가 취소",
@@ -739,7 +850,11 @@ class WaitingView(discord.ui.View):
 
         try:
 
-            game, cancelled, count = await cancel_game_player(
+            (
+                game,
+                cancelled,
+                count
+            ) = await cancel_game_player(
                 interaction.user,
                 interaction.guild,
                 interaction.channel
@@ -751,20 +866,26 @@ class WaitingView(discord.ui.View):
                     "⚠️ 현재 대기 중인 게임이 없습니다.",
                     ephemeral=True
                 )
+
                 return
 
             if not cancelled:
 
                 await interaction.response.send_message(
-                    f"⚠️ 참가 중이 아닙니다.\n\n"
-                    f"👥 현재 참가자: **{count}명**",
+                    (
+                        "⚠️ 참가 중이 아닙니다.\n\n"
+                        f"👥 현재 참가자: **{count}명**"
+                    ),
                     ephemeral=True
                 )
+
                 return
 
             await interaction.response.send_message(
-                f"❌ 참가를 취소했습니다.\n\n"
-                f"👥 현재 참가자: **{count}명**",
+                (
+                    "❌ 참가를 취소했습니다.\n\n"
+                    f"👥 현재 참가자: **{count}명**"
+                ),
                 ephemeral=True
             )
 
@@ -780,6 +901,10 @@ class WaitingView(discord.ui.View):
                 "🔴 참가 취소 중 오류가 발생했습니다.",
                 ephemeral=True
             )
+
+    # --------------------------------------------------------
+    # 게임 시작
+    # --------------------------------------------------------
 
     @discord.ui.button(
         label="게임 시작",
@@ -804,6 +929,7 @@ class WaitingView(discord.ui.View):
                     "⚠️ 대기 중인 게임이 없습니다.",
                     ephemeral=True
                 )
+
                 return
 
             if str(game["host_id"]) != str(
@@ -814,6 +940,7 @@ class WaitingView(discord.ui.View):
                     "🔒 게임 시작은 방장만 할 수 있습니다.",
                     ephemeral=True
                 )
+
                 return
 
             count = await get_player_count(
@@ -823,16 +950,21 @@ class WaitingView(discord.ui.View):
             if count < MIN_PLAYERS:
 
                 await interaction.response.send_message(
-                    f"⚠️ 아직 게임을 시작할 수 없습니다.\n\n"
-                    f"👥 현재 참가자: **{count}명**\n"
-                    f"🎯 최소 참가자: **{MIN_PLAYERS}명**",
+                    (
+                        "⚠️ 아직 게임을 시작할 수 없습니다.\n\n"
+                        f"👥 현재 참가자: **{count}명**\n"
+                        f"🎯 최소 참가자: **{MIN_PLAYERS}명**"
+                    ),
                     ephemeral=True
                 )
+
                 return
 
             await interaction.response.send_message(
-                "🎮 게임 시작 준비!\n\n"
-                "⏳ **3초 후 게임이 시작됩니다!**"
+                (
+                    "🎮 게임 시작 준비!\n\n"
+                    "⏳ **3초 후 게임이 시작됩니다!**"
+                )
             )
 
             for number in [3, 2, 1]:
@@ -872,28 +1004,123 @@ class WaitingView(discord.ui.View):
             if interaction.response.is_done():
 
                 await interaction.followup.send(
-                    f"🔴 게임 시작 실패\n"
-                    f"`{type(e).__name__}`\n"
-                    f"{str(e)[:500]}",
+                    (
+                        "🔴 게임 시작 실패\n"
+                        f"`{type(e).__name__}`\n"
+                        f"{str(e)[:500]}"
+                    ),
                     ephemeral=True
                 )
 
             else:
 
                 await interaction.response.send_message(
-                    f"🔴 게임 시작 실패\n"
-                    f"`{type(e).__name__}`\n"
-                    f"{str(e)[:500]}",
+                    (
+                        "🔴 게임 시작 실패\n"
+                        f"`{type(e).__name__}`\n"
+                        f"{str(e)[:500]}"
+                    ),
                     ephemeral=True
                 )
+
 
 # ============================================================
 # 알바 시스템
 # ============================================================
 
-class JobView(discord.ui.View):
+JOBS = {
+    "청소": {
+        "emoji": "🧹",
+        "reward": 20_000
+    },
+    "택배": {
+        "emoji": "📦",
+        "reward": 22_000
+    },
+    "과녁": {
+        "emoji": "🎯",
+        "reward": 22_000
+    },
+    "패스트푸드": {
+        "emoji": "🍔",
+        "reward": 25_000
+    },
+    "배달": {
+        "emoji": "🏃",
+        "reward": 25_000
+    },
+    "주방": {
+        "emoji": "🍳",
+        "reward": 28_000
+    },
+    "데이터 입력": {
+        "emoji": "🧠",
+        "reward": 30_000
+    },
+    "낚시": {
+        "emoji": "🎣",
+        "reward": 30_000
+    }
+}
 
-    def __init__(self, game_id):
+
+def get_job_remaining(
+    user_id: int
+):
+
+    cooldown = job_cooldowns.get(
+        user_id
+    )
+
+    if cooldown is None:
+
+        return 0
+
+    now = datetime.utcnow()
+
+    if now >= cooldown:
+
+        job_cooldowns.pop(
+            user_id,
+            None
+        )
+
+        return 0
+
+    return int(
+        (cooldown - now).total_seconds()
+    )
+
+
+def format_seconds(
+    seconds: int
+):
+
+    minutes = seconds // 60
+    seconds %= 60
+
+    if minutes > 0:
+
+        return (
+            f"{minutes}분 "
+            f"{seconds}초"
+        )
+
+    return f"{seconds}초"
+
+
+# ============================================================
+# 알바 View
+# ============================================================
+
+class JobView(
+    discord.ui.View
+):
+
+    def __init__(
+        self,
+        game_id
+    ):
 
         super().__init__(
             timeout=300
@@ -901,204 +1128,84 @@ class JobView(discord.ui.View):
 
         self.game_id = game_id
 
-    # --------------------------------------------------------
-    # 청소
-    # --------------------------------------------------------
-
-    @discord.ui.button(
-        label="청소",
-        emoji="🧹",
-        style=discord.ButtonStyle.primary,
-        row=0
-    )
-    async def cleaning(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
-
-        await self.do_job(
-            interaction,
-            "청소",
-            20_000
-        )
-
-    # --------------------------------------------------------
-    # 택배
-    # --------------------------------------------------------
-
-    @discord.ui.button(
-        label="택배",
-        emoji="📦",
-        style=discord.ButtonStyle.primary,
-        row=0
-    )
-    async def delivery_box(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
-
-        await self.do_job(
-            interaction,
-            "택배",
-            22_000
-        )
-
-    # --------------------------------------------------------
-    # 과녁
-    # --------------------------------------------------------
-
-    @discord.ui.button(
-        label="과녁",
-        emoji="🎯",
-        style=discord.ButtonStyle.primary,
-        row=0
-    )
-    async def target(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
-
-        await self.do_job(
-            interaction,
-            "과녁",
-            22_000
-        )
-
-    # --------------------------------------------------------
-    # 패스트푸드
-    # --------------------------------------------------------
-
-    @discord.ui.button(
-        label="패스트푸드",
-        emoji="🍔",
-        style=discord.ButtonStyle.primary,
-        row=1
-    )
-    async def fast_food(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
-
-        await self.do_job(
-            interaction,
-            "패스트푸드",
-            25_000
-        )
-
-    # --------------------------------------------------------
-    # 배달
-    # --------------------------------------------------------
-
-    @discord.ui.button(
-        label="배달",
-        emoji="🏃",
-        style=discord.ButtonStyle.primary,
-        row=1
-    )
-    async def delivery(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
-
-        await self.do_job(
-            interaction,
-            "배달",
-            25_000
-        )
-
-    # --------------------------------------------------------
-    # 주방
-    # --------------------------------------------------------
-
-    @discord.ui.button(
-        label="주방",
-        emoji="🍳",
-        style=discord.ButtonStyle.primary,
-        row=1
-    )
-    async def kitchen(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
-
-        await self.do_job(
-            interaction,
-            "주방",
-            28_000
-        )
-
-    # --------------------------------------------------------
-    # 데이터 입력
-    # --------------------------------------------------------
-
-    @discord.ui.button(
-        label="데이터 입력",
-        emoji="🧠",
-        style=discord.ButtonStyle.primary,
-        row=2
-    )
-    async def data_input(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
-
-        await self.do_job(
-            interaction,
-            "데이터 입력",
-            30_000
-        )
-
-    # --------------------------------------------------------
-    # 낚시
-    # --------------------------------------------------------
-
-    @discord.ui.button(
-        label="낚시",
-        emoji="🎣",
-        style=discord.ButtonStyle.primary,
-        row=2
-    )
-    async def fishing(
-        self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
-    ):
-
-        await self.do_job(
-            interaction,
-            "낚시",
-            30_000
-        )
-
-    # --------------------------------------------------------
-    # 실제 알바 처리
-    # --------------------------------------------------------
-
     async def do_job(
         self,
         interaction: discord.Interaction,
-        job_name: str,
-        reward: int
+        job_name: str
     ):
 
         try:
+
+            remaining = get_job_remaining(
+                interaction.user.id
+            )
+
+            if remaining > 0:
+
+                await interaction.response.send_message(
+                    (
+                        "⏳ **아직 알바를 할 수 없습니다.**\n\n"
+                        f"🕐 남은 시간: **{format_seconds(remaining)}**"
+                    ),
+                    ephemeral=True
+                )
+
+                return
+
+            job = JOBS[job_name]
 
             player = await get_or_create_player(
                 interaction.user,
                 interaction.guild
             )
 
+            reward = job["reward"]
+
+            connection = await get_db()
+
+            try:
+
+                new_money = await connection.fetchval(
+                    """
+                    UPDATE players
+                    SET
+                        money = money + $1,
+                        updated_at = NOW()
+                    WHERE server_id = $2
+                      AND user_id = $3
+                    RETURNING money
+                    """,
+                    reward,
+                    str(interaction.guild.id),
+                    str(interaction.user.id)
+                )
+
+            finally:
+
+                await connection.close()
+
+            if new_money is None:
+
+                raise RuntimeError(
+                    "플레이어 정보를 업데이트하지 못했습니다."
+                )
+
+            job_cooldowns[
+                interaction.user.id
+            ] = (
+                datetime.utcnow()
+                + timedelta(
+                    seconds=JOB_COOLDOWN_SECONDS
+                )
+            )
+
             await interaction.response.send_message(
-                f"🧑‍💼 **{job_name}** 알바를 시작했습니다!\n\n"
-                f"💰 보상: **{reward:,} 코인**\n\n"
-                "⏳ 실제 보상 처리는 다음 단계에서 연결됩니다.",
+                (
+                    f"{job['emoji']} **{job_name} 알바 완료!**\n\n"
+                    f"💰 획득: **+{reward:,} 코인**\n"
+                    f"🪙 현재 코인: **{new_money:,} 코인**\n\n"
+                    "⏳ 다음 알바까지 **5분**"
+                ),
                 ephemeral=True
             )
 
@@ -1113,37 +1220,24 @@ class JobView(discord.ui.View):
             if interaction.response.is_done():
 
                 await interaction.followup.send(
-                    f"🔴 알바 처리 오류\n"
-                    f"`{type(e).__name__}`\n"
-                    f"{str(e)[:300]}",
+                    (
+                        "🔴 알바 처리 오류\n"
+                        f"`{type(e).__name__}`\n"
+                        f"{str(e)[:300]}"
+                    ),
                     ephemeral=True
                 )
 
             else:
 
                 await interaction.response.send_message(
-                    f"🔴 알바 처리 오류\n"
-                    f"`{type(e).__name__}`\n"
-                    f"{str(e)[:300]}",
+                    (
+                        "🔴 알바 처리 오류\n"
+                        f"`{type(e).__name__}`\n"
+                        f"{str(e)[:300]}"
+                    ),
                     ephemeral=True
                 )
-
-# ============================================================
-# 실제 게임 화면
-# ============================================================
-# ============================================================
-# 알바 메뉴 View
-# ============================================================
-
-class JobView(discord.ui.View):
-
-    def __init__(self, game_id):
-
-        super().__init__(
-            timeout=300
-        )
-
-        self.game_id = game_id
 
     @discord.ui.button(
         label="청소",
@@ -1153,15 +1247,13 @@ class JobView(discord.ui.View):
     )
     async def cleaning(
         self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
+        interaction,
+        button
     ):
 
-        await interaction.response.send_message(
-            "🧹 **청소 알바**\n\n"
-            "💰 보상: **20,000 코인**\n\n"
-            "⏳ 실제 보상 기능은 다음 단계에서 연결됩니다.",
-            ephemeral=True
+        await self.do_job(
+            interaction,
+            "청소"
         )
 
     @discord.ui.button(
@@ -1170,17 +1262,15 @@ class JobView(discord.ui.View):
         style=discord.ButtonStyle.primary,
         row=0
     )
-    async def delivery_package(
+    async def package(
         self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
+        interaction,
+        button
     ):
 
-        await interaction.response.send_message(
-            "📦 **택배 알바**\n\n"
-            "💰 보상: **22,000 코인**\n\n"
-            "⏳ 실제 보상 기능은 다음 단계에서 연결됩니다.",
-            ephemeral=True
+        await self.do_job(
+            interaction,
+            "택배"
         )
 
     @discord.ui.button(
@@ -1191,15 +1281,13 @@ class JobView(discord.ui.View):
     )
     async def target(
         self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
+        interaction,
+        button
     ):
 
-        await interaction.response.send_message(
-            "🎯 **과녁 알바**\n\n"
-            "💰 보상: **22,000 코인**\n\n"
-            "⏳ 실제 보상 기능은 다음 단계에서 연결됩니다.",
-            ephemeral=True
+        await self.do_job(
+            interaction,
+            "과녁"
         )
 
     @discord.ui.button(
@@ -1210,15 +1298,13 @@ class JobView(discord.ui.View):
     )
     async def fast_food(
         self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
+        interaction,
+        button
     ):
 
-        await interaction.response.send_message(
-            "🍔 **패스트푸드 알바**\n\n"
-            "💰 보상: **25,000 코인**\n\n"
-            "⏳ 실제 보상 기능은 다음 단계에서 연결됩니다.",
-            ephemeral=True
+        await self.do_job(
+            interaction,
+            "패스트푸드"
         )
 
     @discord.ui.button(
@@ -1229,15 +1315,13 @@ class JobView(discord.ui.View):
     )
     async def delivery(
         self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
+        interaction,
+        button
     ):
 
-        await interaction.response.send_message(
-            "🏃 **배달 알바**\n\n"
-            "💰 보상: **25,000 코인**\n\n"
-            "⏳ 실제 보상 기능은 다음 단계에서 연결됩니다.",
-            ephemeral=True
+        await self.do_job(
+            interaction,
+            "배달"
         )
 
     @discord.ui.button(
@@ -1248,15 +1332,13 @@ class JobView(discord.ui.View):
     )
     async def kitchen(
         self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
+        interaction,
+        button
     ):
 
-        await interaction.response.send_message(
-            "🍳 **주방 알바**\n\n"
-            "💰 보상: **28,000 코인**\n\n"
-            "⏳ 실제 보상 기능은 다음 단계에서 연결됩니다.",
-            ephemeral=True
+        await self.do_job(
+            interaction,
+            "주방"
         )
 
     @discord.ui.button(
@@ -1265,17 +1347,15 @@ class JobView(discord.ui.View):
         style=discord.ButtonStyle.primary,
         row=2
     )
-    async def data_entry(
+    async def data_input(
         self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
+        interaction,
+        button
     ):
 
-        await interaction.response.send_message(
-            "🧠 **데이터 입력 알바**\n\n"
-            "💰 보상: **30,000 코인**\n\n"
-            "⏳ 실제 보상 기능은 다음 단계에서 연결됩니다.",
-            ephemeral=True
+        await self.do_job(
+            interaction,
+            "데이터 입력"
         )
 
     @discord.ui.button(
@@ -1286,15 +1366,13 @@ class JobView(discord.ui.View):
     )
     async def fishing(
         self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
+        interaction,
+        button
     ):
 
-        await interaction.response.send_message(
-            "🎣 **낚시 알바**\n\n"
-            "💰 보상: **30,000 코인**\n\n"
-            "⏳ 실제 보상 기능은 다음 단계에서 연결됩니다.",
-            ephemeral=True
+        await self.do_job(
+            interaction,
+            "낚시"
         )
 
     @discord.ui.button(
@@ -1305,8 +1383,8 @@ class JobView(discord.ui.View):
     )
     async def close(
         self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
+        interaction,
+        button
     ):
 
         await interaction.response.edit_message(
@@ -1315,15 +1393,29 @@ class JobView(discord.ui.View):
             view=None
         )
 
-class SurvivalGameView(discord.ui.View):
 
-    def __init__(self, game_id):
+# ============================================================
+# 실제 게임 화면
+# ============================================================
+
+class SurvivalGameView(
+    discord.ui.View
+):
+
+    def __init__(
+        self,
+        game_id
+    ):
 
         super().__init__(
             timeout=None
         )
 
         self.game_id = game_id
+
+    # --------------------------------------------------------
+    # 게임
+    # --------------------------------------------------------
 
     @discord.ui.button(
         label="게임",
@@ -1338,23 +1430,25 @@ class SurvivalGameView(discord.ui.View):
     ):
 
         await interaction.response.send_message(
-            "🎮 **게임 메뉴**\n\n"
-            "🃏 블랙잭\n"
-            "🃏 에이스 브레이커\n"
-            "🎲 미니 친치로\n"
-            "🧠 인디언 포커\n"
-            "🎡 룰렛\n"
-            "💣 폭탄 룰렛\n"
-            "🔢 홀짝\n"
-            "🎭 야바위\n"
-            "🏇 경마\n\n"
-            "⚠️ 게임 기능은 순차적으로 연결됩니다.",
+            (
+                "🎮 **게임 메뉴**\n\n"
+                "🃏 블랙잭\n"
+                "🃏 에이스 브레이커\n"
+                "🎲 미니 친치로\n"
+                "🧠 인디언 포커\n"
+                "🎡 룰렛\n"
+                "💣 폭탄 룰렛\n"
+                "🔢 홀짝\n"
+                "🎭 야바위\n"
+                "🏇 경마\n\n"
+                "⚠️ 게임 기능은 순차적으로 연결됩니다."
+            ),
             ephemeral=True
         )
 
-    # ========================================================
+    # --------------------------------------------------------
     # 알바
-    # ========================================================
+    # --------------------------------------------------------
 
     @discord.ui.button(
         label="알바",
@@ -1375,70 +1469,58 @@ class SurvivalGameView(discord.ui.View):
                 interaction.guild
             )
 
+            remaining = get_job_remaining(
+                interaction.user.id
+            )
+
+            if remaining > 0:
+
+                cooldown_text = (
+                    f"⏳ 현재 알바 쿨타임: "
+                    f"**{format_seconds(remaining)}**"
+                )
+
+            else:
+
+                cooldown_text = (
+                    "🟢 지금 바로 알바할 수 있습니다."
+                )
+
             embed = discord.Embed(
                 title="🧑‍💼 알바",
                 description=(
                     "알바를 해서 코인을 벌 수 있습니다.\n\n"
-                    "⏱️ 한 번 일을 하면 **5분 동안 다시 일할 수 없습니다.**"
+                    f"{cooldown_text}\n\n"
+                    "한 번 일을 하면 **5분 동안** "
+                    "다시 일할 수 없습니다."
                 )
             )
 
-            embed.add_field(
-                name="🧹 청소",
-                value="20,000 코인",
-                inline=True
-            )
+            for job_name, job in JOBS.items():
 
-            embed.add_field(
-                name="📦 택배",
-                value="22,000 코인",
-                inline=True
-            )
+                embed.add_field(
+                    name=(
+                        f"{job['emoji']} "
+                        f"{job_name}"
+                    ),
+                    value=(
+                        f"{job['reward']:,} 코인"
+                    ),
+                    inline=True
+                )
 
-            embed.add_field(
-                name="🎯 과녁",
-                value="22,000 코인",
-                inline=True
-            )
-
-            embed.add_field(
-                name="🍔 패스트푸드",
-                value="25,000 코인",
-                inline=True
-            )
-
-            embed.add_field(
-                name="🏃 배달",
-                value="25,000 코인",
-                inline=True
-            )
-
-            embed.add_field(
-                name="🍳 주방",
-                value="28,000 코인",
-                inline=True
-            )
-
-            embed.add_field(
-                name="🧠 데이터 입력",
-                value="30,000 코인",
-                inline=True
-            )
-
-            embed.add_field(
-                name="🎣 낚시",
-                value="30,000 코인",
-                inline=True
-            )
-
-            # ⚠️ 3번 단계에서 JobView 클래스를 추가해야 합니다.
-            view = JobView(
-                self.game_id
+            embed.set_footer(
+                text=(
+                    f"현재 코인: "
+                    f"{player['money']:,}"
+                )
             )
 
             await interaction.response.send_message(
                 embed=embed,
-                view=view,
+                view=JobView(
+                    self.game_id
+                ),
                 ephemeral=True
             )
 
@@ -1451,11 +1533,17 @@ class SurvivalGameView(discord.ui.View):
             )
 
             await interaction.response.send_message(
-                f"🔴 알바 메뉴 오류\n"
-                f"`{type(e).__name__}`\n"
-                f"{str(e)[:300]}",
+                (
+                    "🔴 알바 메뉴 오류\n"
+                    f"`{type(e).__name__}`\n"
+                    f"{str(e)[:300]}"
+                ),
                 ephemeral=True
             )
+
+    # --------------------------------------------------------
+    # 상점
+    # --------------------------------------------------------
 
     @discord.ui.button(
         label="상점",
@@ -1470,15 +1558,21 @@ class SurvivalGameView(discord.ui.View):
     ):
 
         await interaction.response.send_message(
-            "🏪 **일반 상점**\n\n"
-            "👁️ 정찰권 — 300,000 코인\n"
-            "🪣 빨대 쪼옵 — 600,000 코인\n"
-            "🎟️ 이벤트 참가권 — 500,000 코인\n"
-            "⏳ 시간 연장권 — 1,000,000 코인\n"
-            "🎁 랜덤박스 — 400,000 코인~\n"
-            "🎭 밑장빼기권 — 800,000 코인",
+            (
+                "🏪 **일반 상점**\n\n"
+                "👁️ 정찰권 — 300,000 코인\n"
+                "🪣 빨대 쪼옵 — 600,000 코인\n"
+                "🎟️ 이벤트 참가권 — 500,000 코인\n"
+                "⏳ 시간 연장권 — 1,000,000 코인\n"
+                "🎁 랜덤박스 — 400,000 코인~\n"
+                "🎭 밑장빼기권 — 800,000 코인"
+            ),
             ephemeral=True
         )
+
+    # --------------------------------------------------------
+    # 기부
+    # --------------------------------------------------------
 
     @discord.ui.button(
         label="기부",
@@ -1493,11 +1587,17 @@ class SurvivalGameView(discord.ui.View):
     ):
 
         await interaction.response.send_message(
-            "😇 **기부 시스템**\n\n"
-            "현재 꼴등에게 코인을 기부할 수 있습니다.\n"
-            "기부 기능은 다음 단계에서 연결합니다.",
+            (
+                "😇 **기부 시스템**\n\n"
+                "현재 꼴등에게 코인을 기부할 수 있습니다.\n"
+                "기부 기능은 다음 단계에서 연결합니다."
+            ),
             ephemeral=True
         )
+
+    # --------------------------------------------------------
+    # 아이템
+    # --------------------------------------------------------
 
     @discord.ui.button(
         label="아이템",
@@ -1512,11 +1612,17 @@ class SurvivalGameView(discord.ui.View):
     ):
 
         await interaction.response.send_message(
-            "🎒 **보유 아이템**\n\n"
-            "현재 보유한 아이템을 표시합니다.\n"
-            "아이템 기능은 다음 단계에서 연결합니다.",
+            (
+                "🎒 **보유 아이템**\n\n"
+                "현재 보유한 아이템을 표시합니다.\n"
+                "아이템 기능은 다음 단계에서 연결합니다."
+            ),
             ephemeral=True
         )
+
+    # --------------------------------------------------------
+    # 내 정보
+    # --------------------------------------------------------
 
     @discord.ui.button(
         label="내 정보",
@@ -1538,11 +1644,13 @@ class SurvivalGameView(discord.ui.View):
             )
 
             await interaction.response.send_message(
-                f"👤 **내 정보**\n\n"
-                f"🪙 코인: **{player['money']:,}**\n"
-                f"💎 다이아: **{player['diamonds']:,}**\n"
-                f"⭐ 포인트: **{player['points']:,}**\n"
-                f"😇 선행 포인트: **{player['good_deed']:,}**",
+                (
+                    "👤 **내 정보**\n\n"
+                    f"🪙 코인: **{player['money']:,}**\n"
+                    f"💎 다이아: **{player['diamonds']:,}**\n"
+                    f"⭐ 포인트: **{player['points']:,}**\n"
+                    f"😇 선행 포인트: **{player['good_deed']:,}**"
+                ),
                 ephemeral=True
             )
 
@@ -1564,7 +1672,9 @@ class SurvivalGameView(discord.ui.View):
 # 게임 강제종료
 # ============================================================
 
-async def force_end_game(game_id: int):
+async def force_end_game(
+    game_id: int
+):
 
     connection = await get_db()
 
@@ -1580,12 +1690,17 @@ async def force_end_game(game_id: int):
         )
 
         if not game:
+
             raise RuntimeError(
                 "게임을 찾을 수 없습니다."
             )
 
         if game["status"] == "ended":
-            return False, "이미 종료된 게임입니다."
+
+            return (
+                False,
+                "이미 종료된 게임입니다."
+            )
 
         await connection.execute(
             """
@@ -1595,7 +1710,10 @@ async def force_end_game(game_id: int):
                 current_phase = 'ended',
                 ended_at = NOW(),
                 game_data = jsonb_set(
-                    COALESCE(game_data, '{}'::jsonb),
+                    COALESCE(
+                        game_data,
+                        '{}'::jsonb
+                    ),
                     '{force_ended}',
                     'true'::jsonb,
                     TRUE
@@ -1633,7 +1751,10 @@ async def force_end_game(game_id: int):
             game_id
         )
 
-        return True, "게임이 강제 종료되었습니다."
+        return (
+            True,
+            "게임이 강제 종료되었습니다."
+        )
 
     finally:
 
@@ -1658,6 +1779,7 @@ async def force_end_game_command(
             "🔴 디스코드 서버에서 사용해주세요.",
             ephemeral=True
         )
+
         return
 
     try:
@@ -1685,10 +1807,15 @@ async def force_end_game_command(
         if not game:
 
             await interaction.response.send_message(
-                "⚠️ 현재 이 채널에서 **진행 중인 게임**이 없습니다.\n\n"
-                "💡 대기 중인 게임은 `/게임종료`로 종료되지 않습니다.",
+                (
+                    "⚠️ 현재 이 채널에서 "
+                    "**진행 중인 게임**이 없습니다.\n\n"
+                    "💡 대기 중인 게임은 "
+                    "`/게임종료`로 종료되지 않습니다."
+                ),
                 ephemeral=True
             )
+
             return
 
         if str(game["host_id"]) != str(
@@ -1696,9 +1823,13 @@ async def force_end_game_command(
         ):
 
             await interaction.response.send_message(
-                "🔒 게임 강제종료는 **방장만** 사용할 수 있습니다.",
+                (
+                    "🔒 게임 강제종료는 "
+                    "**방장만** 사용할 수 있습니다."
+                ),
                 ephemeral=True
             )
+
             return
 
         view = ForceEndConfirmView(
@@ -1706,12 +1837,14 @@ async def force_end_game_command(
         )
 
         await interaction.response.send_message(
-            "⚠️ **게임 강제종료**\n\n"
-            f"🎮 Game ID: **{game['id']}**\n"
-            "📌 현재 상태: **PLAYING**\n\n"
-            "정말 현재 게임을 강제로 종료하시겠습니까?\n\n"
-            "⚠️ 종료된 게임은 다시 시작할 수 없습니다.\n"
-            "⚠️ 모든 참가자는 해당 게임에서 탈락 처리됩니다.",
+            (
+                "⚠️ **게임 강제종료**\n\n"
+                f"🎮 Game ID: **{game['id']}**\n"
+                "📌 현재 상태: **PLAYING**\n\n"
+                "정말 현재 게임을 강제로 종료하시겠습니까?\n\n"
+                "⚠️ 종료된 게임은 다시 시작할 수 없습니다.\n"
+                "⚠️ 모든 참가자는 해당 게임에서 탈락 처리됩니다."
+            ),
             view=view,
             ephemeral=True
         )
@@ -1727,18 +1860,22 @@ async def force_end_game_command(
         if interaction.response.is_done():
 
             await interaction.followup.send(
-                f"🔴 게임 종료 중 오류가 발생했습니다.\n"
-                f"`{type(e).__name__}`\n"
-                f"{str(e)[:500]}",
+                (
+                    "🔴 게임 종료 중 오류가 발생했습니다.\n"
+                    f"`{type(e).__name__}`\n"
+                    f"{str(e)[:500]}"
+                ),
                 ephemeral=True
             )
 
         else:
 
             await interaction.response.send_message(
-                f"🔴 게임 종료 중 오류가 발생했습니다.\n"
-                f"`{type(e).__name__}`\n"
-                f"{str(e)[:500]}",
+                (
+                    "🔴 게임 종료 중 오류가 발생했습니다.\n"
+                    f"`{type(e).__name__}`\n"
+                    f"{str(e)[:500]}"
+                ),
                 ephemeral=True
             )
 
@@ -1747,10 +1884,19 @@ async def force_end_game_command(
 # 강제종료 확인 UI
 # ============================================================
 
-class ForceEndConfirmView(discord.ui.View):
+class ForceEndConfirmView(
+    discord.ui.View
+):
 
-    def __init__(self, game_id: int):
-        super().__init__(timeout=30)
+    def __init__(
+        self,
+        game_id: int
+    ):
+
+        super().__init__(
+            timeout=30
+        )
+
         self.game_id = game_id
 
     @discord.ui.button(
@@ -1760,8 +1906,8 @@ class ForceEndConfirmView(discord.ui.View):
     )
     async def confirm(
         self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
+        interaction,
+        button
     ):
 
         try:
@@ -1789,6 +1935,7 @@ class ForceEndConfirmView(discord.ui.View):
                     content="⚠️ 게임을 찾을 수 없습니다.",
                     view=None
                 )
+
                 return
 
             if game["status"] != "playing":
@@ -1797,6 +1944,7 @@ class ForceEndConfirmView(discord.ui.View):
                     content="⚠️ 이 게임은 더 이상 진행 중이 아닙니다.",
                     view=None
                 )
+
                 return
 
             if str(game["host_id"]) != str(
@@ -1807,9 +1955,13 @@ class ForceEndConfirmView(discord.ui.View):
                     content="🔒 게임 종료 권한이 없습니다.",
                     view=None
                 )
+
                 return
 
-            success, message = await force_end_game(
+            (
+                success,
+                message
+            ) = await force_end_game(
                 self.game_id
             )
 
@@ -1819,6 +1971,7 @@ class ForceEndConfirmView(discord.ui.View):
                     content=f"⚠️ {message}",
                     view=None
                 )
+
                 return
 
             await interaction.response.edit_message(
@@ -1842,9 +1995,11 @@ class ForceEndConfirmView(discord.ui.View):
             if interaction.response.is_done():
 
                 await interaction.followup.send(
-                    f"🔴 게임 강제종료 중 오류가 발생했습니다.\n"
-                    f"`{type(e).__name__}`\n"
-                    f"{str(e)[:500]}",
+                    (
+                        "🔴 게임 강제종료 중 오류가 발생했습니다.\n"
+                        f"`{type(e).__name__}`\n"
+                        f"{str(e)[:500]}"
+                    ),
                     ephemeral=True
                 )
 
@@ -1866,8 +2021,8 @@ class ForceEndConfirmView(discord.ui.View):
     )
     async def cancel(
         self,
-        interaction: discord.Interaction,
-        button: discord.ui.Button
+        interaction,
+        button
     ):
 
         await interaction.response.edit_message(
@@ -1880,13 +2035,19 @@ class ForceEndConfirmView(discord.ui.View):
 # 메인 메뉴
 # ============================================================
 
-class MainView(discord.ui.View):
+class MainView(
+    discord.ui.View
+):
 
     def __init__(self):
 
         super().__init__(
             timeout=300
         )
+
+    # --------------------------------------------------------
+    # 내 정보
+    # --------------------------------------------------------
 
     @discord.ui.button(
         label="내 정보",
@@ -1908,11 +2069,13 @@ class MainView(discord.ui.View):
             )
 
             await interaction.response.send_message(
-                f"👤 **{interaction.user.display_name}님의 정보**\n\n"
-                f"🪙 코인: **{player['money']:,}**\n"
-                f"💎 다이아: **{player['diamonds']:,}**\n"
-                f"⭐ 포인트: **{player['points']:,}**\n"
-                f"😇 선행 포인트: **{player['good_deed']:,}**",
+                (
+                    f"👤 **{interaction.user.display_name}님의 정보**\n\n"
+                    f"🪙 코인: **{player['money']:,}**\n"
+                    f"💎 다이아: **{player['diamonds']:,}**\n"
+                    f"⭐ 포인트: **{player['points']:,}**\n"
+                    f"😇 선행 포인트: **{player['good_deed']:,}**"
+                ),
                 ephemeral=True
             )
 
@@ -1929,6 +2092,10 @@ class MainView(discord.ui.View):
                 ephemeral=True
             )
 
+    # --------------------------------------------------------
+    # 게임 참가
+    # --------------------------------------------------------
+
     @discord.ui.button(
         label="게임 참가",
         emoji="🎮",
@@ -1943,7 +2110,11 @@ class MainView(discord.ui.View):
 
         try:
 
-            game, joined, count = await join_game_player(
+            (
+                game,
+                joined,
+                count
+            ) = await join_game_player(
                 interaction.user,
                 interaction.guild,
                 interaction.channel
@@ -1962,13 +2133,17 @@ class MainView(discord.ui.View):
                 )
 
                 if member:
+
                     names.append(
                         f"• {member.display_name}"
                     )
 
-            player_list = "\n".join(names)
+            player_list = "\n".join(
+                names
+            )
 
             if not player_list:
+
                 player_list = "없음"
 
             embed = discord.Embed(
@@ -1977,7 +2152,7 @@ class MainView(discord.ui.View):
                     "게임 참가 대기 중입니다.\n\n"
                     f"👥 참가자: **{count}명**\n"
                     f"🎯 최소 인원: **{MIN_PLAYERS}명**\n\n"
-                    f"**참가자 목록**\n"
+                    "**참가자 목록**\n"
                     f"{player_list}"
                 )
             )
@@ -1996,7 +2171,9 @@ class MainView(discord.ui.View):
 
             await interaction.response.send_message(
                 embed=embed,
-                view=WaitingView(game["id"])
+                view=WaitingView(
+                    game["id"]
+                )
             )
 
         except Exception as e:
@@ -2008,11 +2185,17 @@ class MainView(discord.ui.View):
             )
 
             await interaction.response.send_message(
-                f"🔴 게임 참가 중 오류가 발생했습니다.\n"
-                f"`{type(e).__name__}`\n"
-                f"{str(e)[:300]}",
+                (
+                    "🔴 게임 참가 중 오류가 발생했습니다.\n"
+                    f"`{type(e).__name__}`\n"
+                    f"{str(e)[:300]}"
+                ),
                 ephemeral=True
             )
+
+    # --------------------------------------------------------
+    # 게임 설명
+    # --------------------------------------------------------
 
     @discord.ui.button(
         label="게임 설명",
@@ -2057,6 +2240,10 @@ class MainView(discord.ui.View):
             ephemeral=True
         )
 
+    # --------------------------------------------------------
+    # 닫기
+    # --------------------------------------------------------
+
     @discord.ui.button(
         label="닫기",
         emoji="🔒",
@@ -2084,7 +2271,9 @@ class MainView(discord.ui.View):
     name="메인",
     description="머니 배틀로얄 메인 메뉴를 엽니다."
 )
-async def main_menu(interaction):
+async def main_menu(
+    interaction
+):
 
     if interaction.guild is None:
 
@@ -2132,9 +2321,11 @@ async def main_menu(interaction):
         )
 
         await interaction.response.send_message(
-            f"🔴 메인 메뉴 오류\n"
-            f"`{type(e).__name__}`\n"
-            f"{str(e)[:500]}",
+            (
+                "🔴 메인 메뉴 오류\n"
+                f"`{type(e).__name__}`\n"
+                f"{str(e)[:500]}"
+            ),
             ephemeral=True
         )
 
@@ -2147,7 +2338,9 @@ async def main_menu(interaction):
     name="게임테스트",
     description="1인으로 실제 게임 화면을 테스트합니다."
 )
-async def game_test(interaction):
+async def game_test(
+    interaction
+):
 
     if interaction.guild is None:
 
@@ -2206,7 +2399,10 @@ async def game_test(interaction):
         )
 
         embed.set_footer(
-            text=f"Game ID: {game_row['id']} • TEST MODE"
+            text=(
+                f"Game ID: {game_row['id']} "
+                "• TEST MODE"
+            )
         )
 
         await interaction.edit_original_response(
@@ -2218,7 +2414,7 @@ async def game_test(interaction):
         )
 
         print(
-            f"[GAME TEST] "
+            "[GAME TEST] "
             f"game_id={game_row['id']} "
             f"user_id={interaction.user.id}"
         )
@@ -2234,18 +2430,22 @@ async def game_test(interaction):
         if interaction.response.is_done():
 
             await interaction.followup.send(
-                f"🔴 게임 테스트 실패\n"
-                f"`{type(e).__name__}`\n"
-                f"{str(e)[:500]}",
+                (
+                    "🔴 게임 테스트 실패\n"
+                    f"`{type(e).__name__}`\n"
+                    f"{str(e)[:500]}"
+                ),
                 ephemeral=True
             )
 
         else:
 
             await interaction.response.send_message(
-                f"🔴 게임 테스트 실패\n"
-                f"`{type(e).__name__}`\n"
-                f"{str(e)[:500]}",
+                (
+                    "🔴 게임 테스트 실패\n"
+                    f"`{type(e).__name__}`\n"
+                    f"{str(e)[:500]}"
+                ),
                 ephemeral=True
             )
 
@@ -2258,7 +2458,9 @@ async def game_test(interaction):
     name="dbtest",
     description="Supabase 데이터베이스 연결을 테스트합니다."
 )
-async def dbtest(interaction):
+async def dbtest(
+    interaction
+):
 
     try:
 
@@ -2286,9 +2488,11 @@ async def dbtest(interaction):
         )
 
         await interaction.response.send_message(
-            f"🔴 DB 연결 실패\n"
-            f"`{type(e).__name__}`\n"
-            f"{str(e)[:500]}",
+            (
+                "🔴 DB 연결 실패\n"
+                f"`{type(e).__name__}`\n"
+                f"{str(e)[:500]}"
+            ),
             ephemeral=True
         )
 
