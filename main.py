@@ -2271,20 +2271,52 @@ class MainView(
     name="메인",
     description="머니 배틀로얄 메인 메뉴를 엽니다."
 )
-async def main_menu(
-    interaction
-):
+async def main_menu(interaction):
 
     if interaction.guild is None:
-
         await interaction.response.send_message(
             "🔴 디스코드 서버에서 사용해주세요.",
             ephemeral=True
         )
-
         return
 
     try:
+
+        # 현재 채널에서 진행 중인 게임 확인
+        connection = await get_db()
+
+        try:
+            game = await connection.fetchrow(
+                """
+                SELECT *
+                FROM games
+                WHERE channel_id = $1
+                  AND status = 'playing'
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                str(interaction.channel.id)
+            )
+        finally:
+            await connection.close()
+
+        # ==================================================
+        # 게임 진행 중
+        # ==================================================
+
+        if game:
+
+            await interaction.response.send_message(
+                "🎮 **현재 진행 중인 게임 메뉴**",
+                view=SurvivalGameView(game["id"]),
+                ephemeral=True
+            )
+
+            return
+
+        # ==================================================
+        # 게임 진행 중이 아님
+        # ==================================================
 
         player = await get_or_create_player(
             interaction.user,
@@ -2320,14 +2352,23 @@ async def main_menu(
             str(e)
         )
 
-        await interaction.response.send_message(
-            (
-                "🔴 메인 메뉴 오류\n"
+        if interaction.response.is_done():
+
+            await interaction.followup.send(
+                f"🔴 메인 메뉴 오류\n"
                 f"`{type(e).__name__}`\n"
-                f"{str(e)[:500]}"
-            ),
-            ephemeral=True
-        )
+                f"{str(e)[:500]}",
+                ephemeral=True
+            )
+
+        else:
+
+            await interaction.response.send_message(
+                f"🔴 메인 메뉴 오류\n"
+                f"`{type(e).__name__}`\n"
+                f"{str(e)[:500]}",
+                ephemeral=True
+            )
 
 
 # ============================================================
