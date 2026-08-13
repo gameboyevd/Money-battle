@@ -15,7 +15,6 @@ class JobView(discord.ui.View):
         self.game_id = game_id
 
     async def interaction_check(self, interaction: discord.Interaction):
-        # game_id가 0인 경우(단독 /알바 명령어 실행) DB 상태 체크 패스
         if self.game_id == 0:
             return True
 
@@ -25,8 +24,11 @@ class JobView(discord.ui.View):
         finally:
             await connection.close()
 
-        if not game or game["status"] != "playing":
-            await interaction.response.send_message("🔒 더 이상 진행 중인 게임이 아닙니다.", ephemeral=True)
+        if not game:
+            await interaction.response.send_message("🔒 이 게임은 존재하지 않습니다.", ephemeral=True)
+            return False
+        if game["status"] != "playing":
+            await interaction.response.send_message("🔒 이 게임은 더 이상 진행 중이 아닙니다.", ephemeral=True)
             return False
         return True
 
@@ -35,18 +37,16 @@ class JobView(discord.ui.View):
         lock = action_lock(user_id)
 
         if lock.locked():
-            await interaction.response.send_message("⏳ 이미 다른 요청을 처리 중입니다.", ephemeral=True)
-            return
+            return await interaction.response.send_message("⏳ 이미 다른 요청을 처리 중입니다.", ephemeral=True)
 
         async with lock:
             try:
                 remaining = get_job_remaining(user_id)
                 if remaining > 0:
-                    await interaction.response.send_message(
+                    return await interaction.response.send_message(
                         f"⏳ **아직 알바를 할 수 없습니다.**\n\n🕐 남은 시간: **{format_seconds(remaining)}**",
                         ephemeral=True
                     )
-                    return
 
                 job = JOBS[job_name]
                 await get_or_create_player(interaction.user, interaction.guild)
@@ -75,7 +75,11 @@ class JobView(discord.ui.View):
                     ephemeral=True
                 )
             except Exception as e:
-                await interaction.response.send_message(f"🔴 알바 오류: `{type(e).__name__}`", ephemeral=True)
+                msg = f"🔴 알바 처리 오류\n`{type(e).__name__}`\n{str(e)[:300]}"
+                if interaction.response.is_done():
+                    await interaction.followup.send(msg, ephemeral=True)
+                else:
+                    await interaction.response.send_message(msg, ephemeral=True)
 
     @discord.ui.button(label="청소", emoji="🧹", style=discord.ButtonStyle.primary, row=0)
     async def cleaning(self, interaction: discord.Interaction, button: discord.ui.Button): await self.do_job(interaction, "청소")
@@ -114,9 +118,12 @@ class JobCog(commands.Cog):
     async def open_job_menu(self, interaction: discord.Interaction):
         player = await get_or_create_player(interaction.user, interaction.guild)
         remaining = get_job_remaining(interaction.user.id)
-        cooldown_text = f"⏳ 남은 쿨타임: **{format_seconds(remaining)}**" if remaining > 0 else "🟢 바로 알바 가능!"
+        cooldown_text = f"⏳ 현재 알바 쿨타임: **{format_seconds(remaining)}**" if remaining > 0 else "🟢 지금 바로 알바할 수 있습니다."
 
-        embed = discord.Embed(title="🧑‍💼 알바", description=f"{cooldown_text}\n\n알바 후 5분 쿨타임 적용")
+        embed = discord.Embed(
+            title="🧑‍💼 알바",
+            description=f"알바를 해서 코인을 벌 수 있습니다.\n\n{cooldown_text}\n\n한 번 일을 하면 **5분 동안** 다시 일할 수 없습니다."
+        )
         for job_name, job in JOBS.items():
             embed.add_field(name=f"{job['emoji']} {job_name}", value=f"{job['reward']:,} 코인", inline=True)
         embed.set_footer(text=f"현재 코인: {player['money']:,}")
