@@ -4,7 +4,6 @@ import discord
 from discord.ext import commands
 from server import start_web_server
 
-# Discord Bot Intents 설정
 intents = discord.Intents.default()
 intents.message_content = True
 
@@ -15,7 +14,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 async def on_ready():
     print(f"Logged in as {bot.user.name} (ID: {bot.user.id})")
     
-    # 슬래시 명령어 동기화 (Slash Commands Sync)
+    # 슬래시 명령어 동기화
     try:
         synced = await bot.tree.sync()
         print(f"🔄 슬래시 명령어 {len(synced)}개 동기화 완료")
@@ -26,16 +25,21 @@ async def on_ready():
 
 
 async def load_extensions():
-    """cogs/games 폴더 안의 게임 파일 자동 로드"""
-    for filename in os.listdir("./cogs/games"):
-        if filename.endswith(".py") and not filename.startswith("__"):
-            await bot.load_extension(f"cogs.games.{filename[:-3]}")
-            print(f"Loaded Game Cog: {filename[:-3]}")
-
+    """cogs 폴더 및 그 하위 폴더의 모든 Cog 파일 재귀적 로드"""
+    for root, _, files in os.walk("./cogs"):
+        for filename in files:
+            if filename.endswith(".py") and not filename.startswith("__"):
+                # 파일 경로를 discord.ext.commands가 읽을 수 있는 모듈 형태(예: cogs.games.blackjack)로 변환
+                rel_path = os.path.relpath(os.path.join(root, filename), ".")
+                module_name = rel_path[:-3].replace(os.sep, ".")
+                try:
+                    await bot.load_extension(module_name)
+                    print(f"✅ Loaded Cog: {module_name}")
+                except Exception as e:
+                    print(f"❌ Failed to load Cog {module_name}: {e}")
 
 
 async def main():
-    # Render 웹서버 스레드 구동
     start_web_server()
 
     async with bot:
