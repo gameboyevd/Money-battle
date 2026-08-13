@@ -12,6 +12,96 @@ from utils import MIN_PLAYERS, STARTING_MONEY, action_lock, JOBS, get_job_remain
 from cogs.job import JobView
 
 
+# 이미지 레이아웃 형태의 임베드를 생성해주는 공통 함수
+def create_game_embed(game_id: int, player_data: dict, alive_count: int = 1, rank: int = 1, is_test: bool = False):
+    embed = discord.Embed(color=0x2b2d31) # 디스코드 다크 테마 어울리는 색상
+    
+    status_text = "Game ID: " + str(game_id) + (" • TEST MODE" if is_test else "")
+    
+    embed.description = (
+        "💰 **MONEY BATTLE ROYALE**\n"
+        "-----------------------------------\n"
+        "🔥 **SURVIVAL GAME**\n"
+        "-----------------------------------\n\n"
+        f"👥 **생존자:** {alive_count}명\n"
+        f"🏆 **현재 순위:** {rank}위\n"
+        f"🪙 **보유 코인:** {player_data['money']:,}\n"
+        f"😇 **선행 포인트:** {player_data.get('good_deed', 0)}\n\n"
+        "☠️ **다음 탈락 판정까지 준비 중...**\n\n"
+        "게임에서 돈을 벌고\n"
+        "최후의 1인이 되어보세요!\n\n"
+        f"`{status_text}`"
+    )
+    return embed
+
+
+class SurvivalGameView(discord.ui.View):
+    def __init__(self, game_id: int):
+        super().__init__(timeout=None)
+        self.game_id = game_id
+
+    # 1행 버튼
+    @discord.ui.button(label="게임", emoji="🎮", style=discord.ButtonStyle.success, row=0)
+    async def games(self, interaction: discord.Interaction, button: discord.ui.Button):
+        lock = action_lock(interaction.user.id)
+        if lock.locked():
+            return await interaction.response.send_message("⏳ 이전 요청을 처리하고 있습니다.", ephemeral=True)
+
+        async with lock:
+            await interaction.response.send_message(
+                "🎮 **게임 메뉴**\n\n"
+                "🃏 블랙잭\n🃏 에이스 브레이커\n🎲 미니 친치로\n🧠 인디언 포커\n"
+                "🎡 룰렛\n💣 폭탄 룰렛\n🔢 홀짝\n🎭 야바위\n🏇 경마\n\n"
+                "⚠️ 게임 기능은 순차적으로 연결됩니다.",
+                ephemeral=True
+            )
+
+    @discord.ui.button(label="알바", emoji="🧑‍💼", style=discord.ButtonStyle.primary, row=0)
+    async def jobs(self, interaction: discord.Interaction, button: discord.ui.Button):
+        lock = action_lock(interaction.user.id)
+        if lock.locked():
+            return await interaction.response.send_message("⏳ 이전 요청을 처리하고 있습니다.", ephemeral=True)
+
+        async with lock:
+            player = await get_or_create_player(interaction.user, interaction.guild)
+            remaining = get_job_remaining(interaction.user.id)
+            cooldown_text = f"⏳ 현재 알바 쿨타임: **{format_seconds(remaining)}**" if remaining > 0 else "🟢 지금 바로 알바할 수 있습니다."
+
+            embed = discord.Embed(
+                title="🧑‍💼 알바",
+                description=f"알바를 해서 코인을 벌 수 있습니다.\n\n{cooldown_text}\n\n한 번 일을 하면 **5분 동안** 다시 일할 수 없습니다."
+            )
+            for job_name, job in JOBS.items():
+                embed.add_field(name=f"{job['emoji']} {job_name}", value=f"{job['reward']:,} 코인", inline=True)
+            embed.set_footer(text=f"현재 코인: {player['money']:,}")
+
+            await interaction.response.send_message(embed=embed, view=JobView(self.game_id), ephemeral=True)
+
+    @discord.ui.button(label="상점", emoji="🏪", style=discord.ButtonStyle.secondary, row=0)
+    async def shop(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("🏪 상점 기능 준비 중입니다.", ephemeral=True)
+
+    # 2행 버튼
+    @discord.ui.button(label="기부", emoji="😇", style=discord.ButtonStyle.secondary, row=1)
+    async def donate(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("😇 기부 기능 준비 중입니다.", ephemeral=True)
+
+    @discord.ui.button(label="아이템", emoji="🎒", style=discord.ButtonStyle.secondary, row=1)
+    async def items(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message("🎒 아이템 가방 준비 중입니다.", ephemeral=True)
+
+    # 3행 버튼
+    @discord.ui.button(label="내 정보", emoji="👤", style=discord.ButtonStyle.secondary, row=2)
+    async def profile(self, interaction: discord.Interaction, button: discord.ui.Button):
+        player = await get_or_create_player(interaction.user, interaction.guild)
+        await interaction.response.send_message(
+            f"👤 **내 정보**\n\n"
+            f"💰 보유 코인: **{player['money']:,} 코인**\n"
+            f"😇 선행 포인트: **{player.get('good_deed', 0)} P**",
+            ephemeral=True
+        )
+
+
 class WaitingView(discord.ui.View):
     def __init__(self, game_id):
         super().__init__(timeout=300)
@@ -103,12 +193,12 @@ class WaitingView(discord.ui.View):
                     )
 
                 started_count = await start_survival_game(game["id"])
+                player = await get_or_create_player(interaction.user, interaction.guild)
+                embed = create_game_embed(game["id"], player, alive_count=started_count, rank=1, is_test=False)
+
                 await interaction.edit_original_response(
-                    content=(
-                        f"💰 **MONEY BATTLE ROYALE**\n\n🎉 **게임이 시작되었습니다!**\n\n"
-                        f"👥 참가자: **{started_count}명**\n🪙 시작 자금: **{STARTING_MONEY:,} 코인**\n\n"
-                        "☠️ 이제 서바이벌이 시작됩니다."
-                    ),
+                    content=None,
+                    embed=embed,
                     view=SurvivalGameView(game["id"])
                 )
             except Exception as e:
@@ -117,48 +207,6 @@ class WaitingView(discord.ui.View):
                     await interaction.followup.send(msg, ephemeral=True)
                 else:
                     await interaction.response.send_message(msg, ephemeral=True)
-
-
-class SurvivalGameView(discord.ui.View):
-    def __init__(self, game_id):
-        super().__init__(timeout=None)
-        self.game_id = game_id
-
-    @discord.ui.button(label="게임", emoji="🎮", style=discord.ButtonStyle.success, row=0)
-    async def games(self, interaction: discord.Interaction, button: discord.ui.Button):
-        lock = action_lock(interaction.user.id)
-        if lock.locked():
-            return await interaction.response.send_message("⏳ 이전 요청을 처리하고 있습니다.", ephemeral=True)
-
-        async with lock:
-            await interaction.response.send_message(
-                "🎮 **게임 메뉴**\n\n"
-                "🃏 블랙잭\n🃏 에이스 브레이커\n🎲 미니 친치로\n🧠 인디언 포커\n"
-                "🎡 룰렛\n💣 폭탄 룰렛\n🔢 홀짝\n🎭 야바위\n🏇 경마\n\n"
-                "⚠️ 게임 기능은 순차적으로 연결됩니다.",
-                ephemeral=True
-            )
-
-    @discord.ui.button(label="알바", emoji="🧑‍💼", style=discord.ButtonStyle.primary, row=0)
-    async def jobs(self, interaction: discord.Interaction, button: discord.ui.Button):
-        lock = action_lock(interaction.user.id)
-        if lock.locked():
-            return await interaction.response.send_message("⏳ 이전 요청을 처리하고 있습니다.", ephemeral=True)
-
-        async with lock:
-            player = await get_or_create_player(interaction.user, interaction.guild)
-            remaining = get_job_remaining(interaction.user.id)
-            cooldown_text = f"⏳ 현재 알바 쿨타임: **{format_seconds(remaining)}**" if remaining > 0 else "🟢 지금 바로 알바할 수 있습니다."
-
-            embed = discord.Embed(
-                title="🧑‍💼 알바",
-                description=f"알바를 해서 코인을 벌 수 있습니다.\n\n{cooldown_text}\n\n한 번 일을 하면 **5분 동안** 다시 일할 수 없습니다."
-            )
-            for job_name, job in JOBS.items():
-                embed.add_field(name=f"{job['emoji']} {job_name}", value=f"{job['reward']:,} 코인", inline=True)
-            embed.set_footer(text=f"현재 코인: {player['money']:,}")
-
-            await interaction.response.send_message(embed=embed, view=JobView(self.game_id), ephemeral=True)
 
 
 class GameCog(commands.Cog):
@@ -174,8 +222,11 @@ class GameCog(commands.Cog):
     @app_commands.command(name="테스트게임", description="테스트용 게임 대기방을 바로 생성하고 시작합니다.")
     async def test_game(self, interaction: discord.Interaction):
         game = await create_test_game(interaction)
+        player = await get_or_create_player(interaction.user, interaction.guild)
+        embed = create_game_embed(game["id"], player, alive_count=1, rank=1, is_test=True)
+
         await interaction.response.send_message(
-            f"🧪 **테스트 게임 시작!** (ID: {game['id']})\n\n버튼을 눌러 미니게임 및 알바 테스트를 진행해보세요.",
+            embed=embed,
             view=SurvivalGameView(game["id"])
         )
 
