@@ -110,13 +110,9 @@ class JobView(discord.ui.View):
         await interaction.response.edit_message(content="🧑‍💼 알바 메뉴를 닫았습니다.", embed=None, view=None)
 
 
-# cogs/job.py 파일의 JobCog 수정
 class JobCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    # @app_commands.command(name="알바") 부분 삭제됨
-
 async def setup(bot):
     await bot.add_cog(JobCog(bot))
-
