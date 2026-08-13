@@ -6,10 +6,11 @@ from discord.ext import commands
 from database import (
     get_waiting_game, join_game_player, cancel_game_player,
     get_player_count, start_survival_game, get_or_create_waiting_game,
-    get_or_create_player, create_test_game
+    get_or_create_player, create_test_game, force_stop_game
 )
 from utils import MIN_PLAYERS, STARTING_MONEY, action_lock, JOBS, get_job_remaining, format_seconds
 from cogs.job import JobView
+
 
 class WaitingView(discord.ui.View):
     def __init__(self, game_id):
@@ -178,23 +179,8 @@ class GameCog(commands.Cog):
             view=SurvivalGameView(game["id"])
         )
 
-async def setup(bot):
-    await bot.add_cog(GameCog(bot))
-# cogs/game.py 파일의 import 문에 force_stop_game 추가
-from database import (
-    get_waiting_game, join_game_player, cancel_game_player,
-    get_player_count, start_survival_game, get_or_create_waiting_game,
-    get_or_create_player, create_test_game, force_stop_game
-)
-
-class GameCog(commands.Cog):
-    def __init__(self, bot):
-        self.bot = bot
-
-    # ... 기존 @app_commands.command(name="대기방") 및 (name="테스트게임") 아래에 추가 ...
-
     @app_commands.command(name="강제종료", description="현재 채널에서 진행 중이거나 대기 중인 게임을 강제 종료합니다.")
-    @app_commands.checks.has_permissions(administrator=True) # 관리자 권한을 가진 사용자만 실행 가능
+    @app_commands.checks.has_permissions(administrator=True)
     async def force_stop(self, interaction: discord.Interaction):
         lock = action_lock(interaction.user.id)
         if lock.locked():
@@ -221,8 +207,11 @@ class GameCog(commands.Cog):
                     ephemeral=True
                 )
 
-    # 관리자 권한이 없을 때 핸들링
     @force_stop.error
     async def force_stop_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
         if isinstance(error, app_commands.MissingPermissions):
             await interaction.response.send_message("🔒 이 명령어는 **관리자 권한**이 있는 사용자만 사용할 수 있습니다.", ephemeral=True)
+
+
+async def setup(bot):
+    await bot.add_cog(GameCog(bot))
