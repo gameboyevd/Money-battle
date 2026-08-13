@@ -7,7 +7,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import discord
 from discord.ext import commands
 import asyncpg
-
+from collections import defaultdict
 
 # ============================================================
 # 설정
@@ -23,6 +23,30 @@ JOB_COOLDOWN_SECONDS = 5 * 60
 # {user_id: datetime}
 job_cooldowns = {}
 
+
+# ============================================================
+# 중복 클릭 방지
+# ============================================================
+
+_user_locks = defaultdict(asyncio.Lock)
+
+
+class UserActionLock:
+
+    def __init__(self, user_id):
+        self.user_id = user_id
+        self.lock = _user_locks[user_id]
+
+    async def __aenter__(self):
+        await self.lock.acquire()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self.lock.release()
+
+
+def action_lock(user_id):
+    return UserActionLock(user_id)
 
 # ============================================================
 # Render HTTP 서버
@@ -335,74 +359,147 @@ async def join_game_player(
         guild
     )
 
-    game = await get_or_create_waiting_game(
-        guild,
-        channel,
-        user.id
-    )
-
     connection = await get_db()
 
     try:
 
-        existing = await connection.fetchrow(
-            """
-            SELECT *
-            FROM game_players
-            WHERE game_id = $1
-              AND user_id = $2
-            """,
-            game["id"],
-            str(user.id)
-        )
+        async with connection.transaction():
 
-        if existing:
+            # --------------------------------------------
+            # 현재 대기 게임을 DB Lock과 함께 확인
+            # --------------------------------------------
 
-            count = await get_player_count(
+            game = await connection.fetchrow(
+                """
+                SELECT *
+                FROM games
+                WHERE channel_id = $1
+                  AND status = 'waiting'
+                ORDER BY id DESC
+                LIMIT 1
+                FOR UPDATE
+                """,
+                str(channel.id)
+            )
+
+            # --------------------------------------------
+            # 대기 게임이 없으면 새로 생성
+            # --------------------------------------------
+
+            if not game:
+
+                game = await connection.fetchrow(
+                    """
+                    INSERT INTO games (
+                        game_type,
+                        status,
+                        host_id,
+                        channel_id,
+                        current_phase,
+                        game_data
+                    )
+                    VALUES (
+                        'money_battle_royale',
+                        'waiting',
+                        $1,
+                        $2,
+                        'waiting',
+                        $3::jsonb
+                    )
+                    RETURNING *
+                    """,
+                    str(user.id),
+                    str(channel.id),
+                    (
+                        '{"starting_money":10000,'
+                        '"min_players":4}'
+                    )
+                )
+
+            # --------------------------------------------
+            # 이미 참가했는지 확인
+            # --------------------------------------------
+
+            existing = await connection.fetchrow(
+                """
+                SELECT *
+                FROM game_players
+                WHERE game_id = $1
+                  AND user_id = $2
+                """,
+                game["id"],
+                str(user.id)
+            )
+
+            if existing:
+
+                count = await connection.fetchval(
+                    """
+                    SELECT COUNT(*)
+                    FROM game_players
+                    WHERE game_id = $1
+                    """,
+                    game["id"]
+                )
+
+                return (
+                    game,
+                    False,
+                    count
+                )
+
+            # --------------------------------------------
+            # 참가
+            #
+            # UNIQUE(game_id, user_id)가 있기 때문에
+            # 동시에 여러 번 눌러도 중복 참가 방지
+            # --------------------------------------------
+
+            await connection.execute(
+                """
+                INSERT INTO game_players (
+                    game_id,
+                    user_id,
+                    bet_amount,
+                    result,
+                    profit
+                )
+                VALUES (
+                    $1,
+                    $2,
+                    0,
+                    NULL,
+                    0
+                )
+                ON CONFLICT (game_id, user_id)
+                DO NOTHING
+                """,
+                game["id"],
+                str(user.id)
+            )
+
+            # --------------------------------------------
+            # 최종 참가자 수
+            # --------------------------------------------
+
+            count = await connection.fetchval(
+                """
+                SELECT COUNT(*)
+                FROM game_players
+                WHERE game_id = $1
+                """,
                 game["id"]
             )
 
             return (
                 game,
-                False,
+                True,
                 count
             )
-
-        await connection.execute(
-            """
-            INSERT INTO game_players (
-                game_id,
-                user_id,
-                bet_amount,
-                result,
-                profit
-            )
-            VALUES (
-                $1,
-                $2,
-                0,
-                NULL,
-                0
-            )
-            """,
-            game["id"],
-            str(user.id)
-        )
-
-        count = await get_player_count(
-            game["id"]
-        )
-
-        return (
-            game,
-            True,
-            count
-        )
 
     finally:
 
         await connection.close()
-
 
 # ============================================================
 # 게임 참가 취소
@@ -414,70 +511,110 @@ async def cancel_game_player(
     channel
 ):
 
-    game = await get_waiting_game(
-        channel.id
-    )
-
-    if not game:
-
-        return (
-            None,
-            False,
-            0
-        )
-
     connection = await get_db()
 
     try:
 
-        existing = await connection.fetchrow(
-            """
-            SELECT *
-            FROM game_players
-            WHERE game_id = $1
-              AND user_id = $2
-            """,
-            game["id"],
-            str(user.id)
-        )
+        async with connection.transaction():
 
-        if not existing:
+            # 현재 대기 게임을 잠금
+            game = await connection.fetchrow(
+                """
+                SELECT *
+                FROM games
+                WHERE channel_id = $1
+                ORDER BY id DESC
+                LIMIT 1
+                FOR UPDATE
+                """,
+                str(channel.id)
+            )
 
-            count = await get_player_count(
+            if not game:
+
+                return (
+                    None,
+                    False,
+                    0
+                )
+
+            # --------------------------------------------
+            # 게임이 이미 시작됐으면 참가 취소 금지
+            # --------------------------------------------
+
+            if game["status"] != "waiting":
+
+                count = await connection.fetchval(
+                    """
+                    SELECT COUNT(*)
+                    FROM game_players
+                    WHERE game_id = $1
+                    """,
+                    game["id"]
+                )
+
+                return (
+                    game,
+                    False,
+                    count
+                )
+
+            existing = await connection.fetchrow(
+                """
+                SELECT *
+                FROM game_players
+                WHERE game_id = $1
+                  AND user_id = $2
+                """,
+                game["id"],
+                str(user.id)
+            )
+
+            if not existing:
+
+                count = await connection.fetchval(
+                    """
+                    SELECT COUNT(*)
+                    FROM game_players
+                    WHERE game_id = $1
+                    """,
+                    game["id"]
+                )
+
+                return (
+                    game,
+                    False,
+                    count
+                )
+
+            await connection.execute(
+                """
+                DELETE FROM game_players
+                WHERE game_id = $1
+                  AND user_id = $2
+                """,
+                game["id"],
+                str(user.id)
+            )
+
+            count = await connection.fetchval(
+                """
+                SELECT COUNT(*)
+                FROM game_players
+                WHERE game_id = $1
+                """,
                 game["id"]
             )
 
             return (
                 game,
-                False,
+                True,
                 count
             )
-
-        await connection.execute(
-            """
-            DELETE FROM game_players
-            WHERE game_id = $1
-              AND user_id = $2
-            """,
-            game["id"],
-            str(user.id)
-        )
-
-        count = await get_player_count(
-            game["id"]
-        )
-
-        return (
-            game,
-            True,
-            count
-        )
 
     finally:
 
         await connection.close()
-
-
 # ============================================================
 # 게임 시작
 # ============================================================
@@ -752,10 +889,26 @@ async def get_test_game_screen(
 # ============================================================
 # 대기방 View
 # ============================================================
+# ============================================================
+# 안전한 View
+# ============================================================
 
-class WaitingView(
-    discord.ui.View
-):
+class SafeView(discord.ui.View):
+
+    def __init__(self, timeout=300):
+        super().__init__(timeout=timeout)
+
+    async def on_timeout(self):
+
+        for item in self.children:
+
+            if isinstance(item, discord.ui.Button):
+                item.disabled = True
+
+        # Discord 메시지를 직접 수정하지 않음.
+        # ephemeral 메시지는 봇이 나중에 안정적으로 찾기 어려울 수 있음.
+
+class WaitingView(SafeView):
 
     def __init__(
         self,
@@ -763,7 +916,7 @@ class WaitingView(
     ):
 
         super().__init__(
-            timeout=None
+            timeout=600
         )
 
         self.game_id = game_id
@@ -778,12 +931,47 @@ class WaitingView(
         style=discord.ButtonStyle.success
     )
     async def join(
-        self,
-        interaction,
-        button
-    ):
+    self,
+    interaction,
+    button
+):
+
+    user_id = interaction.user.id
+
+    if _user_locks[user_id].locked():
+
+        await interaction.response.send_message(
+            "⏳ 처리 중입니다. 잠시만 기다려주세요.",
+            ephemeral=True
+        )
+
+        return
+
+    async with action_lock(user_id):
 
         try:
+
+            game = await get_waiting_game(
+                interaction.channel.id
+            )
+
+            if not game:
+
+                await interaction.response.send_message(
+                    "⚠️ 이 대기방은 더 이상 존재하지 않습니다.",
+                    ephemeral=True
+                )
+
+                return
+
+            if game["id"] != self.game_id:
+
+                await interaction.response.send_message(
+                    "⚠️ 이미 다른 게임 대기방으로 변경되었습니다.",
+                    ephemeral=True
+                )
+
+                return
 
             (
                 game,
@@ -824,15 +1012,16 @@ class WaitingView(
                 str(e)
             )
 
-            await interaction.response.send_message(
-                (
-                    "🔴 참가 실패\n"
-                    f"`{type(e).__name__}`\n"
-                    f"{str(e)[:300]}"
-                ),
-                ephemeral=True
-            )
+            if not interaction.response.is_done():
 
+                await interaction.response.send_message(
+                    (
+                        "🔴 참가 실패\n"
+                        f"`{type(e).__name__}`\n"
+                        f"{str(e)[:300]}"
+                    ),
+                    ephemeral=True
+                )
     # --------------------------------------------------------
     # 참가 취소
     # --------------------------------------------------------
@@ -1398,9 +1587,7 @@ class JobView(
 # 실제 게임 화면
 # ============================================================
 
-class SurvivalGameView(
-    discord.ui.View
-):
+class SurvivalGameView(SafeView):
 
     def __init__(
         self,
@@ -1408,7 +1595,7 @@ class SurvivalGameView(
     ):
 
         super().__init__(
-            timeout=None
+            timeout=1800
         )
 
         self.game_id = game_id
