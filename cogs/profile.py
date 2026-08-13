@@ -7,6 +7,7 @@ class ProfileCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
+    # 슬래시 명령어 등록 (@app_commands.command)
     @app_commands.command(name="프로필", description="내 프로필과 보유 코인을 확인합니다.")
     async def show_profile(self, interaction: discord.Interaction):
         player = await get_or_create_player(interaction.user, interaction.guild)
