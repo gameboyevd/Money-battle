@@ -210,3 +210,32 @@ async def create_test_game(interaction):
             return game
     finally:
         await connection.close()
+async def force_stop_game(channel_id: int):
+    connection = await get_db()
+    try:
+        async with connection.transaction():
+            # 대기 중이거나 진행 중인 게임 조회 및 락
+            game = await connection.fetchrow(
+                """
+                SELECT * FROM games
+                WHERE channel_id = $1 AND status IN ('waiting', 'playing')
+                ORDER BY id DESC LIMIT 1 FOR UPDATE
+                """,
+                str(channel_id)
+            )
+            if not game:
+                return None
+
+            # 게임 상태를 cancelled(취소됨)로 업데이트
+            await connection.execute(
+                """
+                UPDATE games
+                SET status = 'cancelled', ended_at = NOW(), updated_at = NOW()
+                WHERE id = $1
+                """,
+                game["id"]
+            )
+            return game
+    finally:
+        await connection.close()
+
