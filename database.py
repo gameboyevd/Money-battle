@@ -226,11 +226,11 @@ async def force_stop_game(channel_id: int):
             if not game:
                 return None
 
-            # 게임 상태를 cancelled(취소됨)로 업데이트
+            # 게임 상태를 cancelled(취소됨)로 업데이트 (updated_at 컬럼 제외)
             await connection.execute(
                 """
                 UPDATE games
-                SET status = 'cancelled', ended_at = NOW(), updated_at = NOW()
+                SET status = 'cancelled', ended_at = NOW()
                 WHERE id = $1
                 """,
                 game["id"]
@@ -238,4 +238,3 @@ async def force_stop_game(channel_id: int):
             return game
     finally:
         await connection.close()
-
