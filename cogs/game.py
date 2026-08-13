@@ -39,7 +39,7 @@ def create_game_embed(game_id: int, player_data: dict, alive_count: int = 1, ran
 
 
 # ==========================================
-# 📚 통합 설명서 (PAGINATION VIEW)
+# 📚 상세 통합 설명서 (PAGINATION VIEW)
 # ==========================================
 
 class HelpGuideView(discord.ui.View):
@@ -55,9 +55,9 @@ class HelpGuideView(discord.ui.View):
                         "💰 **게임 목표**\n"
                         "다양한 미니게임, 알바, 배팅을 통해 코인을 벌고, 주기마다 찾아오는 **최저 코인 보유자 탈락 판정**에서 살아남아 최후의 1인이 되세요!\n\n"
                         "⚙️ **주요 구조**\n"
-                        "• **기본 시작 자금:** 10,000 코인 (다이아 상점으로 증액 가능)\n"
-                        "• **탈락 주기:** 설정된 시간(예: 5분)마다 코인이 가장 적은 플레이어가 탈락합니다.\n"
-                        "• **탈락 코인:** 탈락자의 코인은 **JACKPOT 풀**로 이동합니다.\n"
+                        "• **시작 자금:** 기본 10,000 코인 (다이아 상점으로 증액 가능)\n"
+                        "• **탈락 주기:** 설정된 시간(1분~60분)마다 코인이 가장 적은 플레이어가 탈락합니다.\n"
+                        "• **탈락 코인:** 탈락자의 남아있는 코인은 **JACKPOT 풀**로 이동합니다.\n"
                         "• **재화 초기화:** 게임 종료 시 보유 코인과 선행 포인트는 초기화됩니다."
                     ),
                     color=0x3498db
@@ -65,8 +65,8 @@ class HelpGuideView(discord.ui.View):
                 discord.Embed(
                     title="📖 머니 배틀로얄 - 재화 & 기부 (2/2)",
                     description=(
-                        "🪙 **코인:** 서바이벌 핵심 재화 (게임/알바/상점 이용)\n"
-                        "💎 **다이아:** 게임 종료 후에도 유지되는 영구 재화 (시작 자금 업그레이드 등)\n"
+                        "🪙 **코인:** 서바이벌 핵심 재화 (게임/알바/상점 이용, 게임 후 초기화)\n"
+                        "💎 **다이아:** 게임 종료 후에도 영구 유지되는 재화 (시작 자금 강화에 사용)\n"
                         "😇 **선행 포인트:** 꼴등에게 코인을 기부하면 획득 (천사의 상점에서 전용 아이템 구매)\n\n"
                         "❤️ **기부 시스템**\n"
                         "현재 최하위 플레이어에게 코인을 기부하여 선행 포인트를 얻고 생존시킬 수 있습니다."
@@ -76,65 +76,91 @@ class HelpGuideView(discord.ui.View):
             ],
             "game": [
                 discord.Embed(
-                    title="🎮 미니게임 안내 (1/2)",
+                    title="🎮 미니게임 상세 설명 (1/3)",
                     description=(
-                        "🃏 **블랙잭 / 마스터 블랙잭:** 21에 가까운 숫자를 만드는 카지노 명작\n"
-                        "🃏 **에이스 브레이커:** ACE, JOKER, 숫자로 펼치는 심리 카드 배틀\n"
-                        "🎲 **미니 친치로:** 주사위 3개로 겨루는 족보 승부 (핀조로, 고조로 등)\n"
-                        "🧠 **인디언 포커:** 상대의 카드와 배팅 패턴만 보고 진행하는 심리전\n"
-                        "🎡 **룰렛 / 💣 폭탄 룰렛:** 다양한 배율 또는 위험한 폭탄을 피해 배팅!"
+                        "🃏 **블랙잭 / 마스터 블랙잭**\n"
+                        "• 21을 넘지 않고 딜러보다 높은 숫자를 만드는 게임.\n"
+                        "• K/Q/J=10점, A=1 또는 11점.\n"
+                        "• `HIT`, `STAND`, `DOUBLE`(배팅2배+1장), `SURRENDER`(포기 후 50% 환불) 조작 가능.\n\n"
+                        "🃏 **에이스 브레이커**\n"
+                        "• 3장의 카드로 [높음 ➔ 낮음 ➔ 높음] 순서대로 비교하여 승부하는 심리전.\n"
+                        "• **🅰️ ACE:** 모든 숫자 카드를 이김 (보유 수에 따라 최대 3.1배 보너스).\n"
+                        "• **🃏 JOKER:** ACE를 파괴하고 승리 (성공 시 2.1배, 사용 시 소멸)."
                     ),
                     color=0x2ecc71
                 ),
                 discord.Embed(
-                    title="🎮 미니게임 안내 (2/2)",
+                    title="🎲 미니 친치로 전체 족보 (2/3)",
                     description=(
-                        "🔢 **홀짝 게임:** 최대 7라운드 연속 홀짝 맞추기\n"
-                        "🎭 **야바위:** 컵 속에 숨겨진 당첨 보상 찾기 (난이도 1~5)\n"
-                        "🏇 **경마:** 다양한 배율의 말에 배팅하는 실시간 경주\n"
-                        "🎟️ **잭팟 복권 / 🎫 즉석 복권:** 잭팟 상금을 노리는 복권 시스템"
+                        "주사위 3개를 굴려 승부합니다. (부모/자식 승부)\n\n"
+                        "🎯 **핀조로 (1, 1, 1):** 배팅액의 **10배**\n"
+                        "🎯 **고조로 (5, 5, 5):** 배팅액의 **5배**\n"
+                        "🌪️ **아라시 (같은 숫자 3개):** 배팅액의 **3배** (핀조로/고조로 제외)\n"
+                        "⚡ **시고로 (4, 5, 6):** 배팅액의 **2배**\n"
+                        "🎲 **기본 족보 (같은 숫자 2개 + 다른 숫자 1개):**\n"
+                        "  └ 예: 6 / 3 / 6 ➔ **눈 3** (남은 숫자 1개가 점수, 높은 쪽 승리)\n"
+                        "👑 **즉시 승리:** 부모 굴림 6 / 자식 굴림 1 나오면 즉시 승리\n"
+                        "💀 **히후미 (1, 2, 3):** 즉시 패배 및 **배팅액 2배 손실**"
+                    ),
+                    color=0x2ecc71
+                ),
+                discord.Embed(
+                    title="🎡 룰렛 / 🎭 야바위 / 기타 (3/3)",
+                    description=(
+                        "🎡 **룰렛 배율 & 상세 구간**\n"
+                        "• **홀 / 짝:** x1.85 | **레드 / 블랙:** x1.85\n"
+                        "• **1~18 / 19~36 구간:** x1.85\n"
+                        "• **3분할 구간 (12개 숫자):** 1st(1~12), 2nd(13~24), 3rd(25~36) ➔ **x2.7**\n"
+                        "• **6개 숫자:** x5.5 | **3개 숫자:** x10 | **1개 숫자 (단독):** x30\n"
+                        "• *(초록색 0칸 존재)*\n\n"
+                        "💣 **폭탄 룰렛:** 1.15배 ➔ 1.5배 ➔ 2.4배 ➔ 5.28배 ➔ 21.12배 (폭탄 시 전액 몰수)\n\n"
+                        "🎭 **야바위**\n"
+                        "• 시작 전 **난이도 1~5 선택 가능**\n"
+                        "• 난이도가 올라갈수록 **컵의 개수가 늘어남** (성공 시 보상 대폭 증가)\n\n"
+                        "🧠 **인디언 포커** / 🔢 **홀짝** / 🏇 **경마** / 🎟️ **복권 시스템**"
                     ),
                     color=0x2ecc71
                 )
             ],
             "job": [
                 discord.Embed(
-                    title="🧑‍💼 알바 안내 (1/1)",
+                    title="🧑‍💼 알바 상세 설명 (1/1)",
                     description=(
-                        "알바는 참가비 없이 쿨타임(5분)마다 미니게임을 진행해 안정적으로 코인을 버는 수단입니다.\n\n"
-                        "🧹 **청소:** 20,000 코인\n"
-                        "📦 **택배:** 22,000 코인\n"
-                        "🎯 **과녁:** 22,000 코인\n"
-                        "🍔 **패스트푸드:** 25,000 코인\n"
-                        "🏃 **배달:** 25,000 코인\n"
-                        "🍳 **주방:** 28,000 코인\n"
-                        "🧠 **데이터 입력:** 30,000 코인\n"
-                        "🎣 **낚시:** 30,000 코인"
+                        "참가비나 손실 위험이 없는 노리스크 코인 수급 수단입니다. (쿨타임: 5분)\n\n"
+                        "🧹 **청소 (20,000):** 화면 오염물 빠르게 클릭\n"
+                        "📦 **택배 (22,000):** 주소 확인 후 상자 분류\n"
+                        "🎯 **과녁 (22,000):** 제한시간 내 과녁 클릭\n"
+                        "🍔 **패스트푸드 (25,000):** 주문 재료 순서대로 조리\n"
+                        "🏃 **배달 (25,000):** 지정 경로 순서대로 방문\n"
+                        "🍳 **주방 (28,000):** 레시피 기억 후 요리\n"
+                        "🧠 **데이터 입력 (30,000):** 제시된 문자/숫자 정확히 입력\n"
+                        "🎣 **낚시 (30,000):** 타이밍 맞춰 버튼 누르기"
                     ),
                     color=0xf1c40f
                 )
             ],
             "item": [
                 discord.Embed(
-                    title="🎒 일반 & 천사의 상점 아이템 (1/2)",
+                    title="🎒 일반 상점 아이템 (1/2)",
                     description=(
-                        "🏪 **일반 상점 아이템 (게임 시작 전 10초 사용)**\n"
-                        "👁️ **정찰권 (300,000):** 상대 패 또는 확률 정보 확인\n"
-                        "🪣 **빨대 쪼옵 (600,000):** 상대 코인 소량 흡수\n"
-                        "🎟️ **경매 주최권 (1,500,000):** 미스터리 코인 상자 경매 개최\n"
-                        "⏳ **시간 연장권 (1,000,000):** 다음 탈락 판정 3분 연장\n"
-                        "🎭 **밑장빼기권 (800,000):** 시작 전 카드 1장 교체"
+                        "⚠️ **공통 규칙:** 게임 시작 전 **10초 대기 시간**에만 사용 가능.\n\n"
+                        "👁️ **정찰권 (300,000):** 상대 ACE 보유 여부, 인디언 포커 힌트, 룰렛 확률 확인.\n"
+                        "🪣 **빨대 쪼옵 (600,000):** 지정 상대의 코인 중 소액 강제 흡수.\n"
+                        "🎭 **밑장빼기권 (800,000):** 게임 시작 전 내 패 1장 랜덤 교체.\n"
+                        "⏳ **시간 연장권 (1,000,000):** 다음 탈락 판정 3분 연장 (중복 불가).\n"
+                        "🎟️ **경매 주최권 (1,500,000):** 10초 후 미스터리 상자 실시간 경매 개최."
                     ),
                     color=0xe74c3c
                 ),
                 discord.Embed(
-                    title="😇 천사의 상점 (게임 중 1회 구매 가능) (2/2)",
+                    title="😇 천사의 상점 아이템 (2/2)",
                     description=(
-                        "🪽 **천사의 구원 (3,000,000 P):** 탈락 대상 지정 시 1회 면제\n"
-                        "🏹 **큐피트 소환권 (6,000,000 P):** 꼴등과 운명 공동체 연결\n"
-                        "⏳ **신의 모래시계 (7,000,000 P):** 직전 손실 코인 복구\n"
-                        "🕊️ **천사의 구제 (8,000,000 P):** 상위권 코인 일부 뺏어 하위권 분배\n"
-                        "🏛️ **승천궁 (10,000,000 P):** 탈락자 임시 부활 및 연동 타격"
+                        "⚠️ **공통 규칙:** 게임 중 선행 포인트로 구매하며, **한 게임당 단 1개만 구매 가능!**\n\n"
+                        "🪽 **천사의 구원 (3,000,000P):** 탈락 대상 지정 시 1회 면제.\n"
+                        "🏹 **큐피트 소환권 (6,000,000P):** 꼴등과 운명 연결. 꼴등 탈락 시 자신도 동반 탈락.\n"
+                        "⏳ **신의 모래시계 (7,000,000P):** 직전 배팅으로 잃은 코인 1회 완전 복구.\n"
+                        "🕊️ **천사의 구제 (8,000,000P):** 상위권 코인 일부를 뺏어 하위권 분배.\n"
+                        "🏛️ **승천궁 (10,000,000P):** 탈락자 1명 임시 부활 및 연동 타격."
                     ),
                     color=0xe74c3c
                 )
@@ -156,41 +182,40 @@ class HelpGuideView(discord.ui.View):
         self.update_buttons()
         await interaction.response.edit_message(embed=self.get_current_embed(), view=self)
 
-    @discord.ui.button(label="🎮 게임", style=discord.ButtonStyle.primary, row=0)
+    @discord.ui.button(label="🎮 게임 설명", style=discord.ButtonStyle.primary, row=0)
     async def cat_game(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.category = "game"
         self.page = 0
         self.update_buttons()
         await interaction.response.edit_message(embed=self.get_current_embed(), view=self)
 
-    @discord.ui.button(label="🧑‍💼 알바", style=discord.ButtonStyle.primary, row=0)
+    @discord.ui.button(label="🧑‍💼 알바 설명", style=discord.ButtonStyle.primary, row=0)
     async def cat_job(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.category = "job"
         self.page = 0
         self.update_buttons()
         await interaction.response.edit_message(embed=self.get_current_embed(), view=self)
 
-    @discord.ui.button(label="🎒 아이템", style=discord.ButtonStyle.primary, row=0)
+    @discord.ui.button(label="🎒 아이템 설명", style=discord.ButtonStyle.primary, row=0)
     async def cat_item(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.category = "item"
         self.page = 0
         self.update_buttons()
         await interaction.response.edit_message(embed=self.get_current_embed(), view=self)
 
-    @discord.ui.button(label="◀ 이전", style=discord.ButtonStyle.secondary, row=1, disabled=True)
+    @discord.ui.button(label="◀ 이전 페이지", style=discord.ButtonStyle.secondary, row=1, disabled=True)
     async def prev_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.page > 0:
             self.page -= 1
             self.update_buttons()
             await interaction.response.edit_message(embed=self.get_current_embed(), view=self)
 
-    @discord.ui.button(label="다음 ▶", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="다음 페이지 ▶", style=discord.ButtonStyle.secondary, row=1)
     async def next_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         if self.page < len(self.pages[self.category]) - 1:
             self.page += 1
             self.update_buttons()
             await interaction.response.edit_message(embed=self.get_current_embed(), view=self)
-
 
 # ==========================================
 # 💎 다이아 상점 VIEW (시작 전 전용)
