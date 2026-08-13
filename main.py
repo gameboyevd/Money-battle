@@ -14,13 +14,21 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user.name} (ID: {bot.user.id})")
+    
+    # 슬래시 명령어 동기화 (Slash Commands Sync)
+    try:
+        synced = await bot.tree.sync()
+        print(f"🔄 슬래시 명령어 {len(synced)}개 동기화 완료")
+    except Exception as e:
+        print(f"❌ 명령어 동기화 실패: {e}")
+
     print("---------------------------------------------")
 
 
 async def load_extensions():
     """cogs 폴더 안의 모든 Cog 파일 자동 로드"""
     for filename in os.listdir("./cogs"):
-        if filename.endswith(".py"):
+        if filename.endswith(".py") and not filename.startswith("__"):
             await bot.load_extension(f"cogs.{filename[:-3]}")
             print(f"Loaded Cog: {filename[:-3]}")
 
