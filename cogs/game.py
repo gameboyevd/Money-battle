@@ -211,39 +211,6 @@ class DiamondShopView(discord.ui.View):
 
 
 # ==========================================
-# 🔨 미스터리 코인 상자 실시간 경매 VIEW
-# ==========================================
-
-class AuctionView(discord.ui.View):
-    def __init__(self, host: discord.User):
-        super().__init__(timeout=60)
-        self.host = host
-        self.current_bid = 100000
-        self.highest_bidder = None
-        self.timer = 20
-
-    @discord.ui.button(label="✋ +50,000 입찰", style=discord.ButtonStyle.primary)
-    async def bid_50k(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.current_bid += 50000
-        self.highest_bidder = interaction.user
-        self.timer = min(self.timer + 5, 30)
-        await interaction.response.send_message(
-            f"💥 {interaction.user.mention} 님이 **{self.current_bid:,} 코인**으로 입찰하셨습니다! (제한시간 5초 연장)",
-            ephemeral=False
-        )
-
-    @discord.ui.button(label="🚀 +200,000 찌르기", style=discord.ButtonStyle.danger)
-    async def bid_200k(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.current_bid += 200000
-        self.highest_bidder = interaction.user
-        self.timer = min(self.timer + 5, 30)
-        await interaction.response.send_message(
-            f"🚀 {interaction.user.mention} 님이 **{self.current_bid:,} 코인**으로 강하게 입찰하셨습니다! (제한시간 5초 연장)",
-            ephemeral=False
-        )
-
-
-# ==========================================
 # 🎮 SURVIVAL GAME & WAITING VIEWS
 # ==========================================
 
@@ -398,7 +365,6 @@ class GameCog(commands.Cog):
             await connection.close()
 
         if not game:
-            # 방이 없으면 새로 개설
             game = await get_or_create_waiting_game(interaction.guild, interaction.channel, interaction.user.id)
             view = WaitingView(game["id"])
             await interaction.response.send_message("🎮 **Money Battle Royale 대기방이 생성되었습니다!**", view=view)
@@ -438,18 +404,6 @@ class GameCog(commands.Cog):
     async def guide(self, interaction: discord.Interaction):
         view = HelpGuideView()
         await interaction.response.send_message(embed=view.get_current_embed(), view=view, ephemeral=True)
-
-    @app_commands.command(name="프로필", description="현재 내 코인, 다이아, 선행 포인트 및 승률 통계를 확인합니다.")
-    async def profile_cmd(self, interaction: discord.Interaction):
-        player = await get_or_create_player(interaction.user, interaction.guild)
-        embed = discord.Embed(
-            title=f"👤 {interaction.user.display_name} 님의 프로필",
-            color=0xf39c12
-        )
-        embed.add_field(name="🪙 보유 코인", value=f"{player['money']:,} 코인", inline=True)
-        embed.add_field(name="💎 보유 다이아", value=f"{player.get('diamond', 0):,} 개", inline=True)
-        embed.add_field(name="😇 선행 포인트", value=f"{player.get('good_deed', 0):,} P", inline=True)
-        await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="테스트게임", description="테스트용 대기방을 바로 생성하고 진행합니다.")
     async def test_game(self, interaction: discord.Interaction):
