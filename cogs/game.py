@@ -180,3 +180,49 @@ class GameCog(commands.Cog):
 
 async def setup(bot):
     await bot.add_cog(GameCog(bot))
+# cogs/game.py 파일의 import 문에 force_stop_game 추가
+from database import (
+    get_waiting_game, join_game_player, cancel_game_player,
+    get_player_count, start_survival_game, get_or_create_waiting_game,
+    get_or_create_player, create_test_game, force_stop_game
+)
+
+class GameCog(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+
+    # ... 기존 @app_commands.command(name="대기방") 및 (name="테스트게임") 아래에 추가 ...
+
+    @app_commands.command(name="강제종료", description="현재 채널에서 진행 중이거나 대기 중인 게임을 강제 종료합니다.")
+    @app_commands.checks.has_permissions(administrator=True) # 관리자 권한을 가진 사용자만 실행 가능
+    async def force_stop(self, interaction: discord.Interaction):
+        lock = action_lock(interaction.user.id)
+        if lock.locked():
+            return await interaction.response.send_message("⏳ 처리 중입니다. 잠시만 기다려주세요.", ephemeral=True)
+
+        async with lock:
+            try:
+                stopped_game = await force_stop_game(interaction.channel.id)
+                if not stopped_game:
+                    return await interaction.response.send_message(
+                        "❌ 현재 채널에서 진행 중이거나 대기 중인 게임이 없습니다.",
+                        ephemeral=True
+                    )
+
+                await interaction.response.send_message(
+                    f"🛑 **게임 강제 종료**\n\n"
+                    f"🎮 게임 ID: **{stopped_game['id']}**\n"
+                    f"📌 상태: **{stopped_game['status']}** ➡️ **cancelled**\n\n"
+                    f"관리자({interaction.user.mention})에 의해 게임이 강제 종료되었습니다."
+                )
+            except Exception as e:
+                await interaction.response.send_message(
+                    f"🔴 게임 강제 종료 중 오류가 발생했습니다.\n`{type(e).__name__}`: {str(e)[:300]}",
+                    ephemeral=True
+                )
+
+    # 관리자 권한이 없을 때 핸들링
+    @force_stop.error
+    async def force_stop_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
+        if isinstance(error, app_commands.MissingPermissions):
+            await interaction.response.send_message("🔒 이 명령어는 **관리자 권한**이 있는 사용자만 사용할 수 있습니다.", ephemeral=True)
