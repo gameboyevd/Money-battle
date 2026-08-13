@@ -26,11 +26,12 @@ async def on_ready():
 
 
 async def load_extensions():
-    """cogs 폴더 안의 모든 Cog 파일 자동 로드"""
-    for filename in os.listdir("./cogs"):
+    """cogs/games 폴더 안의 게임 파일 자동 로드"""
+    for filename in os.listdir("./cogs/games"):
         if filename.endswith(".py") and not filename.startswith("__"):
-            await bot.load_extension(f"cogs.{filename[:-3]}")
-            print(f"Loaded Cog: {filename[:-3]}")
+            await bot.load_extension(f"cogs.games.{filename[:-3]}")
+            print(f"Loaded Game Cog: {filename[:-3]}")
+
 
 
 async def main():
