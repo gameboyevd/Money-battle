@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 from database import get_db, get_or_create_player
@@ -73,37 +74,50 @@ class JobView(discord.ui.View):
                 await interaction.response.send_message(f"🔴 알바 오류: `{type(e).__name__}`", ephemeral=True)
 
     @discord.ui.button(label="청소", emoji="🧹", style=discord.ButtonStyle.primary, row=0)
-    async def cleaning(self, interaction, button): await self.do_job(interaction, "청소")
+    async def cleaning(self, interaction: discord.Interaction, button: discord.ui.Button): await self.do_job(interaction, "청소")
 
     @discord.ui.button(label="택배", emoji="📦", style=discord.ButtonStyle.primary, row=0)
-    async def package(self, interaction, button): await self.do_job(interaction, "택배")
+    async def package(self, interaction: discord.Interaction, button: discord.ui.Button): await self.do_job(interaction, "택배")
 
     @discord.ui.button(label="과녁", emoji="🎯", style=discord.ButtonStyle.primary, row=0)
-    async def target(self, interaction, button): await self.do_job(interaction, "과녁")
+    async def target(self, interaction: discord.Interaction, button: discord.ui.Button): await self.do_job(interaction, "과녁")
 
     @discord.ui.button(label="패스트푸드", emoji="🍔", style=discord.ButtonStyle.primary, row=1)
-    async def fast_food(self, interaction, button): await self.do_job(interaction, "패스트푸드")
+    async def fast_food(self, interaction: discord.Interaction, button: discord.ui.Button): await self.do_job(interaction, "패스트푸드")
 
     @discord.ui.button(label="배달", emoji="🏃", style=discord.ButtonStyle.primary, row=1)
-    async def delivery(self, interaction, button): await self.do_job(interaction, "배달")
+    async def delivery(self, interaction: discord.Interaction, button: discord.ui.Button): await self.do_job(interaction, "배달")
 
     @discord.ui.button(label="주방", emoji="🍳", style=discord.ButtonStyle.primary, row=1)
-    async def kitchen(self, interaction, button): await self.do_job(interaction, "주방")
+    async def kitchen(self, interaction: discord.Interaction, button: discord.ui.Button): await self.do_job(interaction, "주방")
 
     @discord.ui.button(label="데이터 입력", emoji="🧠", style=discord.ButtonStyle.primary, row=2)
-    async def data_input(self, interaction, button): await self.do_job(interaction, "데이터 입력")
+    async def data_input(self, interaction: discord.Interaction, button: discord.ui.Button): await self.do_job(interaction, "데이터 입력")
 
     @discord.ui.button(label="낚시", emoji="🎣", style=discord.ButtonStyle.primary, row=2)
-    async def fishing(self, interaction, button): await self.do_job(interaction, "낚시")
+    async def fishing(self, interaction: discord.Interaction, button: discord.ui.Button): await self.do_job(interaction, "낚시")
 
     @discord.ui.button(label="닫기", emoji="❌", style=discord.ButtonStyle.secondary, row=3)
-    async def close(self, interaction, button):
+    async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.edit_message(content="🧑‍💼 알바 메뉴를 닫았습니다.", embed=None, view=None)
 
 
 class JobCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+
+    @app_commands.command(name="알바", description="알바 메뉴를 출력합니다.")
+    async def open_job_menu(self, interaction: discord.Interaction):
+        player = await get_or_create_player(interaction.user, interaction.guild)
+        remaining = get_job_remaining(interaction.user.id)
+        cooldown_text = f"⏳ 남은 쿨타임: **{format_seconds(remaining)}**" if remaining > 0 else "🟢 바로 알바 가능!"
+
+        embed = discord.Embed(title="🧑‍💼 알바", description=f"{cooldown_text}\n\n알바 후 5분 쿨타임 적용")
+        for job_name, job in JOBS.items():
+            embed.add_field(name=f"{job['emoji']} {job_name}", value=f"{job['reward']:,} 코인", inline=True)
+        embed.set_footer(text=f"현재 코인: {player['money']:,}")
+
+        await interaction.response.send_message(embed=embed, view=JobView(0), ephemeral=True)
 
 async def setup(bot):
     await bot.add_cog(JobCog(bot))
