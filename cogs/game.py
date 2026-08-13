@@ -20,7 +20,7 @@ from cogs.job import JobView
 def create_game_embed(game_id: int, player_data: dict, alive_count: int = 1, rank: int = 1, is_test: bool = False):
     embed = discord.Embed(color=0x2b2d31)
     status_text = f"Game ID: {game_id}" + (" • TEST MODE" if is_test else "")
-    
+
     embed.description = (
         "💰 **MONEY BATTLE ROYALE**\n"
         "-----------------------------------\n"
@@ -216,6 +216,7 @@ class HelpGuideView(discord.ui.View):
             self.page += 1
             self.update_buttons()
             await interaction.response.edit_message(embed=self.get_current_embed(), view=self)
+
 
 # ==========================================
 # 💎 다이아 상점 VIEW (시작 전 전용)
