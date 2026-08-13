@@ -1939,14 +1939,27 @@ class MainView(discord.ui.View):
                 names = []
 
                 for player in players:
-                    member = interaction.guild.get_member(
-                        int(player["user_id"])
-                    )
 
-                    if member:
-                        names.append(
-                            f"• {member.display_name}"
-                        )
+    player_id = int(player["user_id"])
+
+    member = interaction.guild.get_member(player_id)
+
+    if member is None:
+        try:
+            member = await interaction.guild.fetch_member(player_id)
+        except discord.NotFound:
+            member = None
+        except discord.HTTPException:
+            member = None
+
+    if member:
+        names.append(
+            f"• {member.display_name}"
+        )
+    else:
+        names.append(
+            f"• <@{player_id}>"
+        )
 
                 player_list = "\n".join(names) or "없음"
 
