@@ -110,25 +110,13 @@ class JobView(discord.ui.View):
         await interaction.response.edit_message(content="🧑‍💼 알바 메뉴를 닫았습니다.", embed=None, view=None)
 
 
+# cogs/job.py 파일의 JobCog 수정
 class JobCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @app_commands.command(name="알바", description="알바 메뉴를 출력합니다.")
-    async def open_job_menu(self, interaction: discord.Interaction):
-        player = await get_or_create_player(interaction.user, interaction.guild)
-        remaining = get_job_remaining(interaction.user.id)
-        cooldown_text = f"⏳ 현재 알바 쿨타임: **{format_seconds(remaining)}**" if remaining > 0 else "🟢 지금 바로 알바할 수 있습니다."
-
-        embed = discord.Embed(
-            title="🧑‍💼 알바",
-            description=f"알바를 해서 코인을 벌 수 있습니다.\n\n{cooldown_text}\n\n한 번 일을 하면 **5분 동안** 다시 일할 수 없습니다."
-        )
-        for job_name, job in JOBS.items():
-            embed.add_field(name=f"{job['emoji']} {job_name}", value=f"{job['reward']:,} 코인", inline=True)
-        embed.set_footer(text=f"현재 코인: {player['money']:,}")
-
-        await interaction.response.send_message(embed=embed, view=JobView(0), ephemeral=True)
+    # @app_commands.command(name="알바") 부분 삭제됨
 
 async def setup(bot):
     await bot.add_cog(JobCog(bot))
+
