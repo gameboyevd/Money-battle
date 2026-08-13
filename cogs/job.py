@@ -10,11 +10,15 @@ from utils import (
 )
 
 class JobView(discord.ui.View):
-    def __init__(self, game_id):
+    def __init__(self, game_id=0):
         super().__init__(timeout=300)
         self.game_id = game_id
 
     async def interaction_check(self, interaction: discord.Interaction):
+        # game_id가 0인 경우(단독 /알바 명령어 실행) DB 상태 체크 패스
+        if self.game_id == 0:
+            return True
+
         connection = await get_db()
         try:
             game = await connection.fetchrow("SELECT * FROM games WHERE id = $1", self.game_id)
