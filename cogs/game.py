@@ -6,17 +6,17 @@ from discord.ext import commands
 from database import (
     get_waiting_game, join_game_player, cancel_game_player,
     get_player_count, start_survival_game, get_or_create_waiting_game,
-    get_or_create_player, create_test_game, force_stop_game
+    get_or_create_player, create_test_game, force_stop_game, get_db
 )
 from utils import MIN_PLAYERS, STARTING_MONEY, action_lock, JOBS, get_job_remaining, format_seconds
 from cogs.job import JobView
 
 
-# 이미지 레이아웃 형태의 임베드를 생성해주는 공통 함수
+# 메인 화면 임베드 생성 함수
 def create_game_embed(game_id: int, player_data: dict, alive_count: int = 1, rank: int = 1, is_test: bool = False):
-    embed = discord.Embed(color=0x2b2d31) # 디스코드 다크 테마 어울리는 색상
+    embed = discord.Embed(color=0x2b2d31)
     
-    status_text = "Game ID: " + str(game_id) + (" • TEST MODE" if is_test else "")
+    status_text = f"Game ID: {game_id}" + (" • TEST MODE" if is_test else "")
     
     embed.description = (
         "💰 **MONEY BATTLE ROYALE**\n"
@@ -224,6 +224,39 @@ class GameCog(commands.Cog):
         game = await create_test_game(interaction)
         player = await get_or_create_player(interaction.user, interaction.guild)
         embed = create_game_embed(game["id"], player, alive_count=1, rank=1, is_test=True)
+
+        await interaction.response.send_message(
+            embed=embed,
+            view=SurvivalGameView(game["id"])
+        )
+
+    @app_commands.command(name="메인", description="현재 진행 중인 게임의 메인 화면 패널을 다시 엽니다.")
+    async def main_menu(self, interaction: discord.Interaction):
+        connection = await get_db()
+        try:
+            # 현재 채널에서 진행 중인 게임 조회
+            game = await connection.fetchrow(
+                """
+                SELECT * FROM games
+                WHERE channel_id = $1 AND status = 'playing'
+                ORDER BY id DESC LIMIT 1
+                """,
+                str(interaction.channel.id)
+            )
+        finally:
+            await connection.close()
+
+        if not game:
+            return await interaction.response.send_message(
+                "❌ 현재 이 채널에서 진행 중인 게임이 없습니다.",
+                ephemeral=True
+            )
+
+        player = await get_or_create_player(interaction.user, interaction.guild)
+        is_test = game["game_type"] == "money_battle_royale_test"
+        alive_count = await get_player_count(game["id"])
+
+        embed = create_game_embed(game["id"], player, alive_count=alive_count, rank=1, is_test=is_test)
 
         await interaction.response.send_message(
             embed=embed,
