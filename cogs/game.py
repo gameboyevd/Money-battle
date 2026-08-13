@@ -40,7 +40,7 @@ class SurvivalGameView(discord.ui.View):
         super().__init__(timeout=None)
         self.game_id = game_id
 
-    # 1행 버튼
+    # 1행 버튼 (게임 / 알바 / 상점)
     @discord.ui.button(label="게임", emoji="🎮", style=discord.ButtonStyle.success, row=0)
     async def games(self, interaction: discord.Interaction, button: discord.ui.Button):
         lock = action_lock(interaction.user.id)
@@ -81,7 +81,7 @@ class SurvivalGameView(discord.ui.View):
     async def shop(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message("🏪 상점 기능 준비 중입니다.", ephemeral=True)
 
-    # 2행 버튼
+    # 2행 버튼 (기부 / 아이템)
     @discord.ui.button(label="기부", emoji="😇", style=discord.ButtonStyle.secondary, row=1)
     async def donate(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message("😇 기부 기능 준비 중입니다.", ephemeral=True)
@@ -90,7 +90,7 @@ class SurvivalGameView(discord.ui.View):
     async def items(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message("🎒 아이템 가방 준비 중입니다.", ephemeral=True)
 
-    # 3행 버튼
+    # 3행 버튼 (내 정보)
     @discord.ui.button(label="내 정보", emoji="👤", style=discord.ButtonStyle.secondary, row=2)
     async def profile(self, interaction: discord.Interaction, button: discord.ui.Button):
         player = await get_or_create_player(interaction.user, interaction.guild)
