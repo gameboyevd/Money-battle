@@ -531,8 +531,8 @@ async def elimination_loop(game_id: int, channel: discord.TextChannel):
                 break
 
             # 다음 탈락 시간 확인
-            game_data = game["game_data"] or {}
-            next_elim_str = game_data.get("next_elimination_at")
+            game_data = parse_game_data(game["game_data"])
+next_elim_str = game_data.get("next_elimination_at")
             if not next_elim_str:
                 break
 
@@ -771,14 +771,18 @@ async def build_main_embed(game_id: int, user_id: int, guild_id: int):
     game = await get_game_by_id(game_id)
 
     next_elim_text = "계산 중..."
-    if game and game["game_data"]:
-        next_str = game["game_data"].get("next_elimination_at")
-        if next_str:
+if game:
+    game_data = parse_game_data(game["game_data"])
+    next_str = game_data.get("next_elimination_at")
+    if next_str:
+        try:
             next_time = datetime.fromisoformat(next_str)
             remaining = max(0, int((next_time - datetime.utcnow()).total_seconds()))
             minutes = remaining // 60
             seconds = remaining % 60
             next_elim_text = f"{minutes:02d}:{seconds:02d}"
+        except Exception:
+            next_elim_text = "오류"
 
     money = player["money"] if player else 0
     diamonds = player["diamonds"] if player else 0
