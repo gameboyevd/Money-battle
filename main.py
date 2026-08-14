@@ -675,6 +675,11 @@ async def start_survival_game(game_id):
                     """,
                     STARTING_MONEY, str(player["user_id"])
                 )
+                # 알바 쿨타임 초기화 (게임 재시작 시)
+                try:
+                    job_cooldowns.pop(int(player["user_id"]), None)
+                except (TypeError, ValueError):
+                    job_cooldowns.pop(player["user_id"], None)
 
             return count
     finally:
@@ -4345,6 +4350,8 @@ async def test_game(interaction: discord.Interaction):
                     """,
                     STARTING_MONEY, str(interaction.user.id)
                 )
+                # 알바 쿨타임 초기화
+                job_cooldowns.pop(interaction.user.id, None)
 
                 # 다음 탈락 시간 저장
                 await connection.execute(
