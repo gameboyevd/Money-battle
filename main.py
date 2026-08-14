@@ -40,6 +40,52 @@ job_states = {}
 _user_locks = defaultdict(asyncio.Lock)
 active_elimination_tasks = {}  # game_id: asyncio.Task
 
+# 도박 중퇴 방지 세션: user_id -> {type, bet, channel_id, game_id, started_at}
+active_gambles = {}
+
+
+def is_user_gambling(user_id: int) -> bool:
+    return int(user_id) in active_gambles
+
+
+def register_gamble(user_id: int, gtype: str, bet: int, channel_id: int, game_id: int):
+    active_gambles[int(user_id)] = {
+        "type": gtype,
+        "bet": bet,
+        "channel_id": int(channel_id),
+        "game_id": game_id,
+        "started_at": datetime.utcnow(),
+    }
+
+
+def clear_gamble(user_id: int):
+    active_gambles.pop(int(user_id), None)
+
+
+# 시간 초과 중퇴 패널티: user_id -> datetime (이 시각까지 도박/알바 불가)
+TIMEOUT_PENALTY_SECONDS = 5 * 60  # 기본 5분
+timeout_penalties = {}
+
+
+def apply_timeout_penalty(user_id: int, seconds: int = None):
+    sec = seconds if seconds is not None else TIMEOUT_PENALTY_SECONDS
+    timeout_penalties[int(user_id)] = datetime.utcnow() + timedelta(seconds=sec)
+
+
+def get_penalty_remaining(user_id: int) -> int:
+    until = timeout_penalties.get(int(user_id))
+    if not until:
+        return 0
+    left = int((until - datetime.utcnow()).total_seconds())
+    if left <= 0:
+        timeout_penalties.pop(int(user_id), None)
+        return 0
+    return left
+
+
+def is_timeout_penalized(user_id: int) -> bool:
+    return get_penalty_remaining(user_id) > 0
+
 
 def action_lock(user_id: int):
     return _user_locks[user_id]
@@ -1892,6 +1938,14 @@ class JobView(discord.ui.View):
 
     async def start_job(self, interaction, job_name):
         user_id = interaction.user.id
+        pen = get_penalty_remaining(user_id)
+        if pen > 0:
+            await interaction.response.send_message(
+                f"🚫 시간 초과 패널티 중입니다.\n"
+                f"도박·알바 이용 불가 — 남은 시간: **{format_seconds(pen)}**",
+                ephemeral=True
+            )
+            return
         cd = await get_job_cooldown_for_game(self.game_id)
         charges, remaining = get_job_charges(user_id, cd)
         if charges <= 0:
@@ -3685,27 +3739,32 @@ def format_hand(hand, hide_first=False):
 
 
 class BlackjackView(discord.ui.View):
-    def __init__(self, game_id, user_id, guild_id, bet: int):
-        super().__init__(timeout=120)
+    def __init__(self, game_id, user_id, guild_id, bet: int, channel_id: int = None):
+        super().__init__(timeout=90)  # 90초 무응답 = 중퇴 패배
         self.game_id = game_id
         self.user_id = user_id
         self.guild_id = guild_id
+        self.channel_id = channel_id
         self.bet = bet
         self.deck = create_deck()
         self.player_hand = [self.deck.pop(), self.deck.pop()]
         self.dealer_hand = [self.deck.pop(), self.deck.pop()]
         self.finished = False
         self.doubled = False
+        self.public_message = None  # 채널 공개 메시지
 
     def build_embed(self, reveal=False):
         p_val = hand_value(self.player_hand)
-        embed = discord.Embed(title="🃏 블랙잭", color=discord.Color.dark_green())
+        embed = discord.Embed(
+            title="🃏 블랙잭 (공개 진행 · 중퇴 불가)",
+            description=f"플레이어: <@{self.user_id}>\n⚠️ 제한시간 내 미응답 시 **배팅액 몰수**",
+            color=discord.Color.dark_green()
+        )
         if reveal:
             d_val = hand_value(self.dealer_hand)
             dealer_text = f"**{format_hand(self.dealer_hand)}**  (`합: {d_val}`)"
             dealer_name = f"딜러 (합 {d_val})"
         else:
-            # 공개된 카드는 플레이어 카드와 동일하게 크게 표시
             shown = self.dealer_hand[0]
             dealer_text = f"**{shown}**  + 🂠"
             dealer_name = f"딜러 (공개 {card_value(shown)})"
@@ -3716,13 +3775,53 @@ class BlackjackView(discord.ui.View):
             inline=False
         )
         embed.add_field(name="배팅", value=f"**{self.bet:,}** 코인", inline=True)
+        embed.set_footer(text="채널에 공개 진행됩니다. 메시지를 지워도 세션은 유지됩니다.")
         return embed
+
+    async def on_timeout(self):
+        """무응답 중퇴 → 배팅 몰수 + 도박/알바 일시 금지"""
+        if self.finished:
+            return
+        self.finished = True
+        clear_gamble(self.user_id)
+        apply_timeout_penalty(self.user_id)
+        pen_sec = TIMEOUT_PENALTY_SECONDS
+        connection = await get_db()
+        try:
+            await connection.execute(
+                "UPDATE players SET last_money_loss = $1, updated_at = NOW() WHERE user_id = $2",
+                self.bet, str(self.user_id)
+            )
+            new_money = await connection.fetchval(
+                "SELECT money FROM players WHERE user_id = $1", str(self.user_id)
+            )
+        finally:
+            await connection.close()
+        embed = self.build_embed(reveal=True)
+        embed.color = discord.Color.dark_red()
+        embed.add_field(
+            name="결과",
+            value=(
+                f"⏰ **시간 초과 중퇴!** 배팅 **{self.bet:,}** 코인 몰수\n"
+                f"🚫 패널티: **{pen_sec // 60}분** 동안 도박·알바 이용 불가"
+            ),
+            inline=False
+        )
+        embed.add_field(name="현재 코인", value=f"**{new_money:,}**", inline=True)
+        for child in self.children:
+            child.disabled = True
+        if self.public_message:
+            try:
+                await self.public_message.edit(embed=embed, view=None)
+            except Exception:
+                pass
 
     async def end_game(self, interaction, result: str, payout_mult: float):
         if self.finished:
             return
         self.finished = True
         self.stop()
+        clear_gamble(self.user_id)
         for child in self.children:
             child.disabled = True
 
@@ -3735,13 +3834,11 @@ class BlackjackView(discord.ui.View):
                     payout, str(self.user_id)
                 )
             elif payout_mult == 1.0:
-                # push - 배팅 반환
                 new_money = await connection.fetchval(
                     "UPDATE players SET money = money + $1, updated_at = NOW() WHERE user_id = $2 RETURNING money",
                     self.bet, str(self.user_id)
                 )
             else:
-                # 패배: 이미 배팅 차감됨 + 손실 기록
                 await connection.execute(
                     "UPDATE players SET last_money_loss = $1, updated_at = NOW() WHERE user_id = $2",
                     self.bet, str(self.user_id)
@@ -3754,18 +3851,22 @@ class BlackjackView(discord.ui.View):
 
         embed = self.build_embed(reveal=True)
         embed.add_field(name="결과", value=result, inline=False)
-        if payout > 0:
+        if payout > 0 and payout_mult > 1.0:
             embed.add_field(name="획득", value=f"+**{payout:,}** 코인", inline=True)
-        elif payout == 0 and "무승부" in result:
+        elif payout_mult == 1.0 or "무승부" in result:
             embed.add_field(name="반환", value=f"**{self.bet:,}** 코인 반환", inline=True)
         else:
             embed.add_field(name="손실", value=f"-**{self.bet:,}** 코인", inline=True)
         embed.add_field(name="현재 코인", value=f"**{new_money:,}**", inline=True)
 
         try:
-            await interaction.response.edit_message(embed=embed, view=self)
+            await interaction.response.edit_message(embed=embed, view=None)
         except Exception:
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            if self.public_message:
+                try:
+                    await self.public_message.edit(embed=embed, view=None)
+                except Exception:
+                    pass
 
     @discord.ui.button(label="HIT", emoji="🃏", style=discord.ButtonStyle.primary)
     async def hit(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -3875,6 +3976,7 @@ class BlackjackView(discord.ui.View):
             await connection.close()
         self.finished = True
         self.stop()
+        clear_gamble(self.user_id)
         embed = self.build_embed(reveal=True)
         embed.add_field(name="결과", value="🏳️ SURRENDER (절반 반환)", inline=False)
         embed.add_field(name="반환", value=f"**{half:,}** 코인", inline=True)
@@ -3915,6 +4017,7 @@ class UnderdrawBlackjackView(discord.ui.View):
                 await connection.close()
             embed = self.bj.build_embed(reveal=True)
             embed.add_field(name="밑장빼기", value=f"{old} → {new}", inline=False)
+            clear_gamble(self.bj.user_id)
             embed.add_field(name="결과", value="🎉 **블랙잭!** (×2.5)", inline=False)
             embed.add_field(name="획득", value=f"+**{payout:,}**", inline=True)
             embed.add_field(name="현재 코인", value=f"**{new_money:,}**", inline=True)
@@ -3957,6 +4060,23 @@ class BlackjackBetModal(discord.ui.Modal, title="🃏 블랙잭 배팅"):
             await interaction.response.send_message("올바른 숫자를 입력하세요.", ephemeral=True)
             return
 
+        if is_user_gambling(interaction.user.id):
+            sess = active_gambles[int(interaction.user.id)]
+            await interaction.response.send_message(
+                f"🔒 이미 **{sess['type']}** 진행 중입니다.\n"
+                f"배팅 **{sess['bet']:,}** — 종료 전까지 다른 도박을 시작할 수 없습니다.",
+                ephemeral=True
+            )
+            return
+        pen = get_penalty_remaining(interaction.user.id)
+        if pen > 0:
+            await interaction.response.send_message(
+                f"🚫 시간 초과 패널티 중입니다.\n"
+                f"도박·알바 이용 불가 — 남은 시간: **{format_seconds(pen)}**",
+                ephemeral=True
+            )
+            return
+
         player = await get_or_create_player(interaction.user, interaction.guild)
         if not player["alive"] or player["eliminated"]:
             await interaction.response.send_message("탈락자는 게임을 할 수 없습니다.", ephemeral=True)
@@ -3967,7 +4087,6 @@ class BlackjackBetModal(discord.ui.Modal, title="🃏 블랙잭 배팅"):
             )
             return
 
-        # 배팅 차감
         connection = await get_db()
         try:
             ok = await connection.fetchval(
@@ -3980,8 +4099,11 @@ class BlackjackBetModal(discord.ui.Modal, title="🃏 블랙잭 배팅"):
         finally:
             await connection.close()
 
-        view = BlackjackView(self.game_id, interaction.user.id, interaction.guild.id, bet)
-        # 자연 블랙잭 체크
+        view = BlackjackView(
+            self.game_id, interaction.user.id, interaction.guild.id, bet,
+            channel_id=interaction.channel.id
+        )
+        # 자연 블랙잭
         if hand_value(view.player_hand) == 21:
             payout = int(bet * 2.5)
             connection = await get_db()
@@ -3996,22 +4118,40 @@ class BlackjackBetModal(discord.ui.Modal, title="🃏 블랙잭 배팅"):
             embed.add_field(name="결과", value="🎉 **블랙잭!** (×2.5)", inline=False)
             embed.add_field(name="획득", value=f"+**{payout:,}**", inline=True)
             embed.add_field(name="현재 코인", value=f"**{new_money:,}**", inline=True)
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.response.send_message(
+                content=f"🃏 <@{interaction.user.id}> 블랙잭 결과",
+                embed=embed
+            )
             return
 
-        # 밑장빼기권 보유 시 1장 교체 기회
+        # 세션 등록 (중퇴 방지)
+        register_gamble(interaction.user.id, "블랙잭", bet, interaction.channel.id, self.game_id)
+
         inv = await get_player_inventory(str(interaction.user.id), str(interaction.guild.id))
         if inv.get("밑장빼기권", 0) > 0:
             under_view = UnderdrawBlackjackView(view)
-            await interaction.response.send_message(
-                content="🎭 **밑장빼기권 보유 중!** 패 1장을 랜덤 교체할 수 있습니다.",
+            msg = await interaction.channel.send(
+                content=f"🃏 <@{interaction.user.id}> 블랙잭 시작! (공개 진행 · 중퇴 시 배팅 몰수)",
                 embed=view.build_embed(),
-                view=under_view,
+                view=under_view
+            )
+            view.public_message = msg
+            await interaction.response.send_message(
+                "블랙잭이 채널에 **공개**로 시작되었습니다. (지워도 세션 유지)",
                 ephemeral=True
             )
             return
 
-        await interaction.response.send_message(embed=view.build_embed(), view=view, ephemeral=True)
+        msg = await interaction.channel.send(
+            content=f"🃏 <@{interaction.user.id}> 블랙잭 시작! (공개 진행 · 중퇴 시 배팅 몰수)",
+            embed=view.build_embed(),
+            view=view
+        )
+        view.public_message = msg
+        await interaction.response.send_message(
+            "블랙잭이 채널에 **공개**로 시작되었습니다. 제한시간 내 미응답 시 배팅 몰수.",
+            ephemeral=True
+        )
 
 
 # ============================================================
@@ -4079,13 +4219,14 @@ class AceBreakerView(discord.ui.View):
     PHASE_BET = "bet"
     PHASE_DONE = "done"
 
-    def __init__(self, game_id, user_id, guild_id):
-        super().__init__(timeout=180)
+    def __init__(self, game_id, user_id, guild_id, channel_id: int = None):
+        super().__init__(timeout=120)
         self.game_id = game_id
         self.user_id = user_id
         self.guild_id = guild_id
+        self.channel_id = channel_id
         self.phase = self.PHASE_DRAW
-        self.draw_index = 0  # 0,1,2 → 다음에 뽑을 슬롯
+        self.draw_index = 0
         self.player_cards = [None, None, None]
         self.player_joker = False
         self.bot_cards = [None, None, None]
@@ -4094,7 +4235,39 @@ class AceBreakerView(discord.ui.View):
         self.mulligan_used = False
         self.bet = 0
         self.finished = False
+        self.public_message = None
         self._rebuild_buttons()
+
+    async def on_timeout(self):
+        if self.finished:
+            return
+        self.finished = True
+        bet = self.bet
+        clear_gamble(self.user_id)
+        apply_timeout_penalty(self.user_id)
+        pen_sec = TIMEOUT_PENALTY_SECONDS
+        msg = "⏰ **시간 초과 중퇴!**"
+        if bet > 0:
+            connection = await get_db()
+            try:
+                await connection.execute(
+                    "UPDATE players SET last_money_loss = $1, updated_at = NOW() WHERE user_id = $2",
+                    bet, str(self.user_id)
+                )
+            finally:
+                await connection.close()
+            msg += f" 배팅 **{bet:,}** 코인 몰수"
+        else:
+            msg += " (배팅 전 종료)"
+        msg += f"\n🚫 패널티: **{pen_sec // 60}분** 동안 도박·알바 이용 불가"
+        embed = self.build_embed(reveal_bot=True)
+        embed.color = discord.Color.dark_red()
+        embed.add_field(name="결과", value=msg, inline=False)
+        if self.public_message:
+            try:
+                await self.public_message.edit(content=f"<@{self.user_id}> {msg}", embed=embed, view=None)
+            except Exception:
+                pass
 
     def _rebuild_buttons(self):
         self.clear_items()
@@ -4135,7 +4308,11 @@ class AceBreakerView(discord.ui.View):
         return " | ".join(parts) + jtxt
 
     def build_embed(self, reveal_bot=False):
-        embed = discord.Embed(title="🃏 에이스 브레이커", color=discord.Color.purple())
+        embed = discord.Embed(
+            title="🃏 에이스 브레이커 (공개 진행 · 중퇴 불가)",
+            description=f"플레이어: <@{self.user_id}>\n⚠️ 제한시간 내 미응답 시 중퇴 처리",
+            color=discord.Color.purple()
+        )
         embed.add_field(
             name="당신의 패",
             value=self._hand_display(self.player_cards, self.player_joker, hide_joker=False),
@@ -4257,9 +4434,7 @@ class AceBreakerView(discord.ui.View):
         self.finished = True
         self.phase = self.PHASE_DONE
         self.stop()
-
-        # 싱글: 봇은 동일 금액 매칭
-        # 배팅액은 이미 차감됨
+        clear_gamble(self.user_id)
 
         # JOKER 자동 사용: 상대 ACE가 있는 라운드에 우선 사용
         # 라운드 결과: "win" | "lose" | "draw"
@@ -4431,6 +4606,16 @@ class AceBreakerBetAmountModal(discord.ui.Modal, title="💰 에이스 브레이
         finally:
             await connection.close()
 
+        # 세션 배팅액 갱신 (중퇴 시 몰수 금액)
+        uid = int(self.parent.user_id)
+        if uid in active_gambles:
+            active_gambles[uid]["bet"] = bet
+        else:
+            register_gamble(
+                uid, "에이스 브레이커", bet,
+                self.parent.channel_id or 0, self.parent.game_id
+            )
+
         await self.parent.resolve_after_bet(interaction, bet)
 
 
@@ -4481,6 +4666,9 @@ class AceBreakerStartView(discord.ui.View):
 
     @discord.ui.button(label="에이스 브레이커 시작", emoji="🅰️", style=discord.ButtonStyle.primary)
     async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if is_user_gambling(interaction.user.id):
+            await interaction.response.send_message("이미 도박 진행 중입니다.", ephemeral=True)
+            return
         player = await get_or_create_player(interaction.user, interaction.guild)
         if not player["alive"] or player["eliminated"]:
             await interaction.response.send_message("탈락자는 게임을 할 수 없습니다.", ephemeral=True)
@@ -4491,13 +4679,18 @@ class AceBreakerStartView(discord.ui.View):
                 ephemeral=True
             )
             return
-        view = AceBreakerView(self.game_id, interaction.user.id, interaction.guild.id)
-        await interaction.response.send_message(
-            content="🃏 **에이스 브레이커**\n1번째 카드부터 순서대로 뽑으세요!",
-            embed=view.build_embed(),
-            view=view,
-            ephemeral=True
+        view = AceBreakerView(
+            self.game_id, interaction.user.id, interaction.guild.id,
+            channel_id=interaction.channel.id
         )
+        register_gamble(interaction.user.id, "에이스 브레이커", 0, interaction.channel.id, self.game_id)
+        msg = await interaction.channel.send(
+            content=f"🃏 <@{interaction.user.id}> 에이스 브레이커 시작! (공개 · 중퇴 불가)",
+            embed=view.build_embed(),
+            view=view
+        )
+        view.public_message = msg
+        await interaction.response.send_message("공개 채널에서 시작되었습니다.", ephemeral=True)
 
 
 # ============================================================
@@ -4511,11 +4704,41 @@ class GameSelectView(discord.ui.View):
 
     @discord.ui.button(label="블랙잭", emoji="🃏", style=discord.ButtonStyle.primary, row=0)
     async def blackjack(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if is_user_gambling(interaction.user.id):
+            sess = active_gambles[int(interaction.user.id)]
+            await interaction.response.send_message(
+                f"🔒 이미 **{sess['type']}** 진행 중입니다. 종료 후 다시 시도하세요.",
+                ephemeral=True
+            )
+            return
+        pen = get_penalty_remaining(interaction.user.id)
+        if pen > 0:
+            await interaction.response.send_message(
+                f"🚫 시간 초과 패널티 중입니다.\n"
+                f"도박·알바 이용 불가 — 남은 시간: **{format_seconds(pen)}**",
+                ephemeral=True
+            )
+            return
         modal = BlackjackBetModal(self.game_id)
         await interaction.response.send_modal(modal)
 
     @discord.ui.button(label="에이스 브레이커", emoji="🅰️", style=discord.ButtonStyle.primary, row=0)
     async def ace_breaker(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if is_user_gambling(interaction.user.id):
+            sess = active_gambles[int(interaction.user.id)]
+            await interaction.response.send_message(
+                f"🔒 이미 **{sess['type']}** 진행 중입니다. 종료 후 다시 시도하세요.",
+                ephemeral=True
+            )
+            return
+        pen = get_penalty_remaining(interaction.user.id)
+        if pen > 0:
+            await interaction.response.send_message(
+                f"🚫 시간 초과 패널티 중입니다.\n"
+                f"도박·알바 이용 불가 — 남은 시간: **{format_seconds(pen)}**",
+                ephemeral=True
+            )
+            return
         player = await get_or_create_player(interaction.user, interaction.guild)
         if not player["alive"] or player["eliminated"]:
             await interaction.response.send_message("탈락자는 게임을 할 수 없습니다.", ephemeral=True)
@@ -4526,22 +4749,24 @@ class GameSelectView(discord.ui.View):
                 ephemeral=True
             )
             return
-        view = AceBreakerView(self.game_id, interaction.user.id, interaction.guild.id)
+        view = AceBreakerView(
+            self.game_id, interaction.user.id, interaction.guild.id,
+            channel_id=interaction.channel.id
+        )
+        register_gamble(interaction.user.id, "에이스 브레이커", 0, interaction.channel.id, self.game_id)
         inv = await get_player_inventory(str(interaction.user.id), str(interaction.guild.id))
-        if inv.get("밑장빼기권", 0) > 0:
-            under = UnderdrawAceBreakerView(view)
-            await interaction.response.send_message(
-                content="🎭 **밑장빼기권 보유!** 시작 전 패 구성을 미리 흔들 수 있습니다.\n"
-                        "(사용 시 첫 드로우 풀이 한 번 섞입니다)",
-                embed=view.build_embed(),
-                view=under,
-                ephemeral=True
-            )
-            return
-        await interaction.response.send_message(
-            content="🃏 **에이스 브레이커**\n1번째 카드부터 순서대로 뽑으세요!\n(배팅은 카드/멀리건 완료 후)",
+        start_view = UnderdrawAceBreakerView(view) if inv.get("밑장빼기권", 0) > 0 else view
+        msg = await interaction.channel.send(
+            content=(
+                f"🃏 <@{interaction.user.id}> **에이스 브레이커** 시작!\n"
+                f"(공개 진행 · 중퇴/시간초과 시 배팅 몰수)"
+            ),
             embed=view.build_embed(),
-            view=view,
+            view=start_view
+        )
+        view.public_message = msg
+        await interaction.response.send_message(
+            "에이스 브레이커가 채널에 **공개**로 시작되었습니다.",
             ephemeral=True
         )
 
