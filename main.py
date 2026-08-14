@@ -10,7 +10,20 @@ import discord
 from discord.ext import commands, tasks
 from discord import app_commands
 import asyncpg
+import json
 
+def parse_game_data(game_data):
+    """game_data가 str이든 dict이든 안전하게 dict로 변환"""
+    if game_data is None:
+        return {}
+    if isinstance(game_data, dict):
+        return game_data
+    if isinstance(game_data, str):
+        try:
+            return json.loads(game_data)
+        except Exception:
+            return {}
+    return {}
 
 # ============================================================
 # 설정
