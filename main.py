@@ -1011,6 +1011,114 @@ class SurvivalGameView(discord.ui.View):
 # ============================================================
 # 슬래시 커맨드
 # ============================================================
+@bot.tree.command(name="테스트게임", description="혼자서 바로 테스트할 수 있는 게임을 시작합니다 (최소인원 무시)")
+async def test_game(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
+        return
+
+    # 이미 진행 중인 게임이 있으면 안내
+    playing = await get_playing_game(interaction.channel.id)
+    if playing:
+        await interaction.response.send_message(
+            "이미 이 채널에서 진행 중인 게임이 있습니다.\n"
+            "`/강제종료` 후 다시 시도해주세요.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=False)
+
+    try:
+        # 플레이어 생성
+        await get_or_create_player(interaction.user, interaction.guild)
+
+        connection = await get_db()
+        try:
+            async with connection.transaction():
+                # 테스트 게임 생성
+                game = await connection.fetchrow(
+                    """
+                    INSERT INTO games (
+                        game_type, status, host_id, channel_id,
+                        current_phase, started_at, game_data
+                    )
+                    VALUES (
+                        'money_battle_royale_test',
+                        'playing',
+                        $1, $2, 'survival_test', NOW(),
+                        $3::jsonb
+                    )
+                    RETURNING *
+                    """,
+                    str(interaction.user.id),
+                    str(interaction.channel.id),
+                    '{"test": true, "starting_money": 10000, "min_players": 1, "elimination_interval": 300}'
+                )
+
+                # 참가자 등록
+                await connection.execute(
+                    """
+                    INSERT INTO game_players (game_id, user_id, bet_amount, result, profit)
+                    VALUES ($1, $2, 0, NULL, 0)
+                    ON CONFLICT (game_id, user_id) DO NOTHING
+                    """,
+                    game["id"], str(interaction.user.id)
+                )
+
+                # 플레이어 상태 초기화
+                next_elim = datetime.utcnow() + timedelta(seconds=DEFAULT_ELIMINATION_INTERVAL)
+
+                await connection.execute(
+                    """
+                    UPDATE players
+                    SET money = $1,
+                        alive = TRUE,
+                        eliminated = FALSE,
+                        good_deed = 0,
+                        updated_at = NOW()
+                    WHERE user_id = $2
+                    """,
+                    STARTING_MONEY, str(interaction.user.id)
+                )
+
+                # 다음 탈락 시간 저장
+                await connection.execute(
+                    """
+                    UPDATE games
+                    SET game_data = jsonb_set(
+                        COALESCE(game_data, '{}'::jsonb),
+                        '{next_elimination_at}',
+                        to_jsonb($2::text),
+                        TRUE
+                    )
+                    WHERE id = $1
+                    """,
+                    game["id"], next_elim.isoformat()
+                )
+
+        finally:
+            await connection.close()
+
+        # 탈락 타이머 시작
+        start_elimination_task(game["id"], interaction.channel)
+
+        # 메인 UI 전송
+        embed = await build_main_embed(game["id"], interaction.user.id, interaction.guild.id)
+        view = SurvivalGameView(game["id"])
+
+        await interaction.followup.send(
+            content="🧪 **테스트 게임이 시작되었습니다!**\n(최소 인원 무시 + 혼자 플레이 가능)",
+            embed=embed,
+            view=view
+        )
+
+    except Exception as e:
+        print("Test game error:", type(e).__name__, str(e))
+        await interaction.followup.send(
+            f"🔴 테스트 게임 생성 실패\n`{type(e).__name__}`: {str(e)[:300]}",
+            ephemeral=True
+        )
 
 @bot.tree.command(name="메인", description="머니 배틀로얄 메인 메뉴")
 async def main_command(interaction: discord.Interaction):
