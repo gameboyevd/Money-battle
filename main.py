@@ -3011,24 +3011,32 @@ class ItemBagView(discord.ui.View):
             return None
 
         elif item_name == "경매 주최권":
-            # 미스터리 코인 상자 경매 시작
+            ch_id = interaction.channel.id
+            if active_auctions.get(ch_id):
+                await interaction.response.send_message(
+                    "이미 이 채널에서 경매가 진행 중입니다.", ephemeral=True
+                )
+                return None
+
             embed = discord.Embed(
                 title="🚨 SPECIAL EVENT: 미스터리 코인 상자 등장!",
                 description=(
                     f"<@{user_id}> 님이 **경매 주최권**을 사용했습니다!\n\n"
-                    "🎁 상자 내용물: 🪙 ??? 코인 (대박 or 꽝!)\n"
+                    "🎁 상자 내용물: 🪙 ??? 코인 (주작/초대박/대박/본전/꽝)\n"
                     "🏁 시작가: **100,000** 코인\n"
-                    "📈 입찰 단위: +50,000 / +200,000\n"
-                    "⏱️ 입찰 시간: 60초 (입찰 시 5초 연장)\n\n"
-                    "10초 후 경매가 시작됩니다..."
+                    "📈 입찰: +50,000 / +200,000\n"
+                    "⏱️ 60초 (입찰 시 5초 연장)\n"
+                    f"💰 현재 잭팟: **{mystery_jackpots.get(ch_id, 0):,}**\n\n"
+                    "⏳ **10초 후** 경매가 시작됩니다!"
                 ),
                 color=discord.Color.gold()
             )
             await interaction.channel.send(embed=embed)
+            active_auctions[ch_id] = True
 
             async def _start_auction():
                 await asyncio.sleep(10)
-                auction_view = MysteryAuctionView(self.game_id, str(user_id))
+                auction_view = MysteryAuctionView(self.game_id, str(user_id), ch_id)
                 msg = await interaction.channel.send(
                     embed=auction_view.build_embed(),
                     view=auction_view
@@ -3044,29 +3052,129 @@ class ItemBagView(discord.ui.View):
 
 
 # ============================================================
-# 보물찾기 (이벤트 참가권)
+# 보물찾기 이벤트
 # ============================================================
+# 참가: 이벤트 참가권 1장 소모 (또는 코인 200,000 — 티켓 우선)
+# 장소별 이벤트가 다르고, 2단계 탐험 가능
+
+TREASURE_LOCATIONS = {
+    "forest": {
+        "name": "🌲 숲",
+        "flavor": ["나무 틈새에서 뭔가가 반짝인다...", "발밑에 오래된 상자가 있다.", "덤불 사이로 금화가 보인다."],
+        "events": [
+            ("야생동물 습격!", 0.15, "fail", 0),
+            ("작은 금화 주머니", 0.25, "coin", (40_000, 100_000)),
+            ("보물 상자", 0.20, "coin", (120_000, 350_000)),
+            ("희귀 다이아", 0.10, "dia", (1, 2)),
+            ("숨겨진 아이템", 0.12, "item", None),
+            ("전설의 유물!", 0.08, "coin", (400_000, 1_200_000)),
+            ("아무것도 없음", 0.10, "fail", 0),
+        ],
+    },
+    "ruins": {
+        "name": "🏚️ 폐허",
+        "flavor": ["무너진 기둥 뒤에 금고가...", "먼지 쌓인 상자.", "함정이 있을지도 모른다."],
+        "events": [
+            ("함정 발동!", 0.18, "fail", 0),
+            ("녹슨 동전 더미", 0.22, "coin", (50_000, 130_000)),
+            ("고대 유물", 0.18, "coin", (150_000, 400_000)),
+            ("다이아 조각", 0.12, "dia", (1, 3)),
+            ("봉인된 아이템", 0.12, "item", None),
+            ("왕실 금고!", 0.08, "coin", (500_000, 1_500_000)),
+            ("빈 방", 0.10, "fail", 0),
+        ],
+    },
+    "castle": {
+        "name": "🏰 성",
+        "flavor": ["왕좌 아래에 비밀 통로가...", "보물창고 문이 살짝 열려 있다.", "경비는 없는 것 같다."],
+        "events": [
+            ("경비 출동!", 0.12, "fail", 0),
+            ("은화 주머니", 0.20, "coin", (80_000, 180_000)),
+            ("왕실 보석함", 0.22, "coin", (200_000, 500_000)),
+            ("다이아 왕관 조각", 0.15, "dia", (2, 4)),
+            ("귀족의 유품", 0.12, "item", None),
+            ("드래곤 골드!", 0.09, "coin", (700_000, 2_000_000)),
+            ("빈 금고", 0.10, "fail", 0),
+        ],
+    },
+    "cave": {
+        "name": "🕳️ 동굴",
+        "flavor": ["어둠 속에서 빛이 보인다...", "종유석 사이에 상자.", "깊은 곳에서 메아리가..."],
+        "events": [
+            ("낙석!", 0.20, "fail", 0),
+            ("광석 덩어리", 0.20, "coin", (60_000, 150_000)),
+            ("지하 보물", 0.20, "coin", (180_000, 450_000)),
+            ("원석 다이아", 0.12, "dia", (1, 3)),
+            ("고대 유물 상자", 0.10, "item", None),
+            ("용암 속 금괴!", 0.08, "coin", (600_000, 1_800_000)),
+            ("막다른 길", 0.10, "fail", 0),
+        ],
+    },
+}
+
+
+def _pick_treasure_event(loc_key: str):
+    loc = TREASURE_LOCATIONS[loc_key]
+    events = loc["events"]
+    r = random.random()
+    acc = 0.0
+    for name, prob, kind, data in events:
+        acc += prob
+        if r <= acc:
+            return name, kind, data
+    return events[-1][0], events[-1][2], events[-1][3]
+
+
+async def _apply_treasure_reward(user_id: str, guild_id: str, kind: str, data) -> str:
+    connection = await get_db()
+    try:
+        if kind == "fail":
+            return "💨 꽝... 빈손입니다."
+        if kind == "coin":
+            lo, hi = data
+            reward = random.randint(lo, hi)
+            await connection.execute(
+                "UPDATE players SET money = money + $1, updated_at = NOW() WHERE user_id = $2",
+                reward, user_id
+            )
+            return f"🪙 **{reward:,}** 코인 획득!"
+        if kind == "dia":
+            lo, hi = data
+            dia = random.randint(lo, hi)
+            await connection.execute(
+                "UPDATE players SET diamonds = diamonds + $1, updated_at = NOW() WHERE user_id = $2",
+                dia, user_id
+            )
+            return f"💎 다이아 **+{dia}**"
+        if kind == "item":
+            gift = random.choice(["정찰권", "랜덤박스", "시간 연장권", "빨대 쪼옵"])
+            await add_item_to_inventory(user_id, guild_id, gift, 1)
+            return f"🎒 아이템 **{gift}** ×1 획득!"
+        return "결과 없음"
+    finally:
+        await connection.close()
+
 
 class TreasureHuntView(discord.ui.View):
-    LOCATIONS = [
-        ("🌲 숲", "forest"),
-        ("🏚️ 폐허", "ruins"),
-        ("🏰 성", "castle"),
-        ("🕳️ 동굴", "cave"),
-    ]
+    """1단계: 장소 선택 → 이벤트 결과 → (성공 시) 더 깊이 탐험 기회"""
 
     def __init__(self, game_id, user_id, guild_id):
-        super().__init__(timeout=60)
+        super().__init__(timeout=90)
         self.game_id = game_id
         self.user_id = str(user_id)
         self.guild_id = str(guild_id)
         self.done = False
-        for label, key in self.LOCATIONS:
-            btn = discord.ui.Button(label=label, style=discord.ButtonStyle.primary, custom_id=f"th_{key}")
-            btn.callback = self._make_cb(key, label)
+        self.ticket_consumed = False
+        for key, loc in TREASURE_LOCATIONS.items():
+            btn = discord.ui.Button(
+                label=loc["name"],
+                style=discord.ButtonStyle.primary,
+                custom_id=f"th_{key}"
+            )
+            btn.callback = self._make_loc_cb(key)
             self.add_item(btn)
 
-    def _make_cb(self, key, label):
+    def _make_loc_cb(self, loc_key: str):
         async def callback(interaction: discord.Interaction):
             if str(interaction.user.id) != self.user_id:
                 await interaction.response.send_message("본인만 탐험할 수 있습니다.", ephemeral=True)
@@ -3074,63 +3182,132 @@ class TreasureHuntView(discord.ui.View):
             if self.done:
                 await interaction.response.defer()
                 return
-            self.done = True
-            self.stop()
 
-            # 참가권 소모
-            inv = await get_player_inventory(self.user_id, self.guild_id)
-            if inv.get("이벤트 참가권", 0) <= 0:
-                await interaction.response.edit_message(
-                    content="🎟️ 이벤트 참가권이 없습니다.", view=None
-                )
-                return
-            await remove_item_from_inventory(self.user_id, self.guild_id, "이벤트 참가권", 1)
+            # 참가권 소모 (1회)
+            if not self.ticket_consumed:
+                inv = await get_player_inventory(self.user_id, self.guild_id)
+                if inv.get("이벤트 참가권", 0) <= 0:
+                    await interaction.response.edit_message(
+                        content="🎟️ 이벤트 참가권이 없습니다.", view=None
+                    )
+                    return
+                await remove_item_from_inventory(self.user_id, self.guild_id, "이벤트 참가권", 1)
+                self.ticket_consumed = True
 
-            roll = random.random()
-            connection = await get_db()
-            try:
-                if roll < 0.08:
-                    reward = random.randint(500_000, 1_500_000)
-                    await connection.execute(
-                        "UPDATE players SET money = money + $1 WHERE user_id = $2", reward, self.user_id
-                    )
-                    result = f"🏆 **대보물!** {label}에서 **{reward:,}** 코인 발견!"
-                elif roll < 0.25:
-                    reward = random.randint(150_000, 400_000)
-                    await connection.execute(
-                        "UPDATE players SET money = money + $1 WHERE user_id = $2", reward, self.user_id
-                    )
-                    result = f"✨ 보물 상자! **{reward:,}** 코인"
-                elif roll < 0.45:
-                    reward = random.randint(50_000, 120_000)
-                    await connection.execute(
-                        "UPDATE players SET money = money + $1 WHERE user_id = $2", reward, self.user_id
-                    )
-                    result = f"🪙 약간의 금화 **{reward:,}** 코인"
-                elif roll < 0.55:
-                    dia = random.randint(1, 3)
-                    await connection.execute(
-                        "UPDATE players SET diamonds = diamonds + $1 WHERE user_id = $2", dia, self.user_id
-                    )
-                    result = f"💎 희귀 다이아 **+{dia}**"
-                elif roll < 0.65:
-                    gift = random.choice(["정찰권", "랜덤박스", "시간 연장권"])
-                    await add_item_to_inventory(self.user_id, self.guild_id, gift, 1)
-                    result = f"🎒 아이템 발견: **{gift}** ×1"
-                else:
-                    result = f"💨 {label}... 아무것도 없었습니다. (꽝)"
-            finally:
-                await connection.close()
+            loc = TREASURE_LOCATIONS[loc_key]
+            flavor = random.choice(loc["flavor"])
+            ev_name, kind, data = _pick_treasure_event(loc_key)
+            reward_txt = await _apply_treasure_reward(self.user_id, self.guild_id, kind, data)
 
-            embed = discord.Embed(
-                title="🗺️ 보물찾기 결과",
-                description=f"<@{self.user_id}> 님이 {label}을(를) 탐험했습니다!\n\n{result}",
-                color=discord.Color.dark_green()
+            public = discord.Embed(
+                title=f"🗺️ 보물찾기 — {loc['name']}",
+                description=(
+                    f"<@{self.user_id}> 님이 탐험을 떠났습니다!\n\n"
+                    f"_{flavor}_\n\n"
+                    f"**이벤트:** {ev_name}\n"
+                    f"**결과:** {reward_txt}"
+                ),
+                color=discord.Color.dark_green() if kind != "fail" else discord.Color.dark_grey()
             )
-            await interaction.channel.send(embed=embed)
-            await interaction.response.edit_message(content=result, view=None)
+            await interaction.channel.send(embed=public)
 
+            # 성공 시 2단계 심층 탐험 기회 (1회)
+            if kind != "fail" and not self.done:
+                deep = TreasureDeepView(self.game_id, self.user_id, self.guild_id, loc_key)
+                await interaction.response.edit_message(
+                    content=(
+                        f"{loc['name']} 탐험 결과\n{reward_txt}\n\n"
+                        f"🔍 더 깊이 들어갈 수 있습니다. (추가 위험 / 추가 보상)"
+                    ),
+                    view=deep
+                )
+            else:
+                self.done = True
+                self.stop()
+                await interaction.response.edit_message(
+                    content=f"{loc['name']} 탐험 종료\n{reward_txt}",
+                    view=None
+                )
         return callback
+
+
+class TreasureDeepView(discord.ui.View):
+    """2단계 심층 탐험 — 성공 시 보상 배율 상승, 실패 확률 증가"""
+
+    def __init__(self, game_id, user_id, guild_id, loc_key):
+        super().__init__(timeout=45)
+        self.game_id = game_id
+        self.user_id = str(user_id)
+        self.guild_id = str(guild_id)
+        self.loc_key = loc_key
+
+    @discord.ui.button(label="더 깊이 들어간다", emoji="🔦", style=discord.ButtonStyle.danger)
+    async def go_deeper(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if str(interaction.user.id) != self.user_id:
+            await interaction.response.send_message("본인만 가능합니다.", ephemeral=True)
+            return
+        self.stop()
+        loc = TREASURE_LOCATIONS[self.loc_key]
+        # 심층: 실패 확률 상승, 보상 상향
+        if random.random() < 0.35:
+            result = "💀 심층에서 위험 발생! 빈손으로 탈출했습니다."
+            color = discord.Color.red()
+        else:
+            roll = random.random()
+            if roll < 0.15:
+                reward = random.randint(800_000, 2_500_000)
+                connection = await get_db()
+                try:
+                    await connection.execute(
+                        "UPDATE players SET money = money + $1 WHERE user_id = $2",
+                        reward, self.user_id
+                    )
+                finally:
+                    await connection.close()
+                result = f"🏆 심층 대보물! **{reward:,}** 코인!"
+            elif roll < 0.40:
+                reward = random.randint(250_000, 700_000)
+                connection = await get_db()
+                try:
+                    await connection.execute(
+                        "UPDATE players SET money = money + $1 WHERE user_id = $2",
+                        reward, self.user_id
+                    )
+                finally:
+                    await connection.close()
+                result = f"✨ 심층 보물 **{reward:,}** 코인"
+            elif roll < 0.55:
+                dia = random.randint(2, 5)
+                connection = await get_db()
+                try:
+                    await connection.execute(
+                        "UPDATE players SET diamonds = diamonds + $1 WHERE user_id = $2",
+                        dia, self.user_id
+                    )
+                finally:
+                    await connection.close()
+                result = f"💎 심층 다이아 **+{dia}**"
+            else:
+                gift = random.choice(["시간 연장권", "정찰권", "랜덤박스", "경매 주최권"])
+                await add_item_to_inventory(self.user_id, self.guild_id, gift, 1)
+                result = f"🎒 심층 아이템 **{gift}** ×1"
+            color = discord.Color.gold()
+
+        embed = discord.Embed(
+            title=f"🔦 심층 탐험 — {loc['name']}",
+            description=f"<@{self.user_id}>\n\n{result}",
+            color=color
+        )
+        await interaction.channel.send(embed=embed)
+        await interaction.response.edit_message(content=result, view=None)
+
+    @discord.ui.button(label="여기서 그만둔다", emoji="🚪", style=discord.ButtonStyle.secondary)
+    async def leave(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if str(interaction.user.id) != self.user_id:
+            await interaction.response.send_message("본인만 가능합니다.", ephemeral=True)
+            return
+        self.stop()
+        await interaction.response.edit_message(content="탐험을 종료하고 안전하게 돌아왔습니다.", view=None)
 
 
 # ============================================================
@@ -3210,51 +3387,108 @@ class StrawSelectView(discord.ui.View):
 # ============================================================
 # 미스터리 코인 상자 경매
 # ============================================================
+# 기획 확률:
+#  주작 1%  : 15,000,000 + 잭팟
+#  초대박 14%: 5,000,000 ~ 15,000,000
+#  대박 35%  : 2,000,000 ~ 4,000,000
+#  본전 30%  : 500,000 ~ 1,500,000
+#  꽝 20%    : 10 ~ 1,000
+
+active_auctions = {}  # channel_id -> True
+# 채널별 미스터리 잭팟 누적 (메모리, 서버 재시작 시 초기화)
+mystery_jackpots = defaultdict(int)  # channel_id -> amount
+
+
+def roll_mystery_box(channel_id: int):
+    """상자 개봉 결과. (grade, reward, jackpot_taken)"""
+    roll = random.random()
+    jackpot = mystery_jackpots.get(channel_id, 0)
+    if roll < 0.01:
+        # 주작: 1500만 + 잭팟 전액
+        reward = 15_000_000 + jackpot
+        mystery_jackpots[channel_id] = 0
+        return "🏆 주작 (Wtf)!!!", reward, jackpot
+    if roll < 0.15:
+        return "💎 초대박 JACKPOT!", random.randint(5_000_000, 15_000_000), 0
+    if roll < 0.50:
+        return "🎉 대박!", random.randint(2_000_000, 4_000_000), 0
+    if roll < 0.80:
+        return "✨ 본전치기급", random.randint(500_000, 1_500_000), 0
+    return "💣 대박 꽝 (Trap)...", random.randint(10, 1_000), 0
+
 
 class MysteryAuctionView(discord.ui.View):
-    def __init__(self, game_id, host_id: str):
+    START_BID = 100_000
+    STEP_SMALL = 50_000
+    STEP_BIG = 200_000
+    DURATION = 60
+
+    def __init__(self, game_id, host_id: str, channel_id: int):
         super().__init__(timeout=180)
         self.game_id = game_id
         self.host_id = host_id
-        self.current_bid = 100_000
-        self.highest_bidder = None  # user_id
+        self.channel_id = channel_id
+        self.current_bid = self.START_BID
+        self.highest_bidder = None
         self.highest_name = None
-        self.ends_at = datetime.utcnow() + timedelta(seconds=60)
+        self.ends_at = datetime.utcnow() + timedelta(seconds=self.DURATION)
         self.finished = False
         self.message = None
         self.lock = asyncio.Lock()
+        self.bid_count = 0
 
     def build_embed(self):
         remaining = max(0, int((self.ends_at - datetime.utcnow()).total_seconds()))
         bidder = f"<@{self.highest_bidder}>" if self.highest_bidder else "없음"
+        jp = mystery_jackpots.get(self.channel_id, 0)
         embed = discord.Embed(
             title="🔨 미스터리 코인 상자 실시간 경매!",
             description=(
-                "🎁 상자 구성: 🪙 ??? 코인 (초대박 vs 10 코인 꽝)\n"
-                f"🏁 현재 최고가: **{self.current_bid:,}** 코인\n"
+                "🎁 상자 내용물: 🪙 **???** 코인\n"
+                "_(주작 / 초대박 / 대박 / 본전 / 꽝 중 하나)_\n\n"
+                f"🏁 시작가: **{self.START_BID:,}**\n"
+                f"📈 현재 최고가: **{self.current_bid:,}** 코인\n"
                 f"👤 최고 입찰자: {bidder}\n"
-                f"⏱️ 남은 시간: **{remaining}초**"
+                f"🔢 입찰 횟수: **{self.bid_count}**회\n"
+                f"⏱️ 남은 시간: **{remaining}초**\n"
+                f"💰 누적 잭팟: **{jp:,}** 코인 _(주작 당첨 시 합산)_"
             ),
             color=discord.Color.gold()
         )
-        embed.set_footer(text="입찰 시 남은 시간이 5초 미만이면 5초로 연장됩니다.")
+        embed.add_field(
+            name="확률 안내",
+            value=(
+                "🏆 주작 1% · 💎 초대박 14% · 🎉 대박 35%\n"
+                "✨ 본전 30% · 💣 꽝 20%"
+            ),
+            inline=False
+        )
+        embed.set_footer(text="입찰 시 5초 미만이면 5초로 연장 · 낙찰자만 최종 금액 차감")
         return embed
 
     async def run_timer(self):
         try:
             while not self.finished:
-                await asyncio.sleep(2)
+                await asyncio.sleep(1)
                 remaining = (self.ends_at - datetime.utcnow()).total_seconds()
                 if remaining <= 0:
                     await self.finalize()
                     break
-                if self.message and remaining < 50:
+                # 마지막 15초는 자주 갱신
+                if self.message and remaining <= 15:
+                    try:
+                        await self.message.edit(embed=self.build_embed(), view=self)
+                    except Exception:
+                        pass
+                elif self.message and int(remaining) % 5 == 0:
                     try:
                         await self.message.edit(embed=self.build_embed(), view=self)
                     except Exception:
                         pass
         except asyncio.CancelledError:
             pass
+        finally:
+            active_auctions.pop(self.channel_id, None)
 
     async def place_bid(self, interaction: discord.Interaction, amount: int):
         async with self.lock:
@@ -3269,24 +3503,25 @@ class MysteryAuctionView(discord.ui.View):
             if not player or not player["alive"] or player["eliminated"]:
                 await interaction.response.send_message("생존자만 입찰할 수 있습니다.", ephemeral=True)
                 return
-            if player["money"] < amount:
+            if (player["money"] or 0) < amount:
                 await interaction.response.send_message(
-                    f"코인이 부족합니다. 보유: **{player['money']:,}**", ephemeral=True
+                    f"🔴 돈이 부족합니다.\n필요: **{amount:,}** / 보유: **{player['money']:,}**",
+                    ephemeral=True
                 )
                 return
 
-            # 이전 최고 입찰자 환불은 finalize에서 처리하지 않고, 낙찰자만 차감
             self.current_bid = amount
             self.highest_bidder = str(interaction.user.id)
             self.highest_name = interaction.user.display_name
+            self.bid_count += 1
 
-            # 시간 연장
             remaining = (self.ends_at - datetime.utcnow()).total_seconds()
             if remaining < 5:
                 self.ends_at = datetime.utcnow() + timedelta(seconds=5)
 
             await interaction.response.send_message(
-                f"💥 <@{interaction.user.id}> 님이 **{amount:,}** 코인으로 입찰!",
+                f"💥 <@{interaction.user.id}> 님이 **{amount:,}** 코인으로 응수!\n"
+                f"⏱️ 남은 시간: **{max(0, int((self.ends_at - datetime.utcnow()).total_seconds()))}초**",
                 ephemeral=False
             )
             if self.message:
@@ -3303,100 +3538,108 @@ class MysteryAuctionView(discord.ui.View):
         for child in self.children:
             child.disabled = True
 
+        channel = self.message.channel if self.message else None
+
         if not self.highest_bidder:
+            embed = discord.Embed(
+                title="🔨 경매 유찰",
+                description="입찰자가 없어 경매가 취소되었습니다.",
+                color=discord.Color.dark_grey()
+            )
             if self.message:
-                embed = discord.Embed(
-                    title="🔨 경매 유찰",
-                    description="입찰자가 없어 경매가 취소되었습니다.",
-                    color=discord.Color.dark_grey()
-                )
                 try:
                     await self.message.edit(embed=embed, view=None)
                 except Exception:
                     pass
             return
 
-        # 낙찰자 차감
+        # 낙찰 차감
         connection = await get_db()
         try:
             ok = await connection.fetchval(
                 """
-                UPDATE players SET money = money - $1, updated_at = NOW()
+                UPDATE players SET money = money - $1, last_money_loss = $1, updated_at = NOW()
                 WHERE user_id = $2 AND money >= $1 RETURNING money
                 """,
                 self.current_bid, self.highest_bidder
             )
             if ok is None:
-                # 잔액 부족 시 유찰 처리
                 if self.message:
-                    await self.message.edit(
-                        content="낙찰자의 잔액이 부족하여 경매가 취소되었습니다.",
-                        embed=None, view=None
-                    )
+                    try:
+                        await self.message.edit(
+                            content="낙찰자 잔액 부족으로 경매가 취소되었습니다.",
+                            embed=None, view=None
+                        )
+                    except Exception:
+                        pass
                 return
+            # 낙찰금 일부(10%)를 잭팟에 적립
+            pool_add = self.current_bid // 10
+            mystery_jackpots[self.channel_id] = mystery_jackpots.get(self.channel_id, 0) + pool_add
         finally:
             await connection.close()
 
-        # 상자 결과 확률 (기획안 기준)
-        roll = random.random()
-        if roll < 0.01:
-            reward = 15_000_000 + random.randint(0, 5_000_000)  # 주작급
-            grade = "🏆 주작 (Wtf)!!!"
-        elif roll < 0.15:
-            reward = random.randint(5_000_000, 15_000_000)
-            grade = "💎 초대박 JACKPOT!"
-        elif roll < 0.50:
-            reward = random.randint(2_000_000, 4_000_000)
-            grade = "🎉 대박!"
-        elif roll < 0.80:
-            reward = random.randint(500_000, 1_500_000)
-            grade = "✨ 본전치기급"
-        else:
-            reward = random.randint(10, 1_000)
-            grade = "💣 대박 꽝 (Trap)..."
+        # 개봉 연출
+        if channel:
+            try:
+                await channel.send(
+                    f"🔨 **탕! 탕! 탕!** 낙찰!\n"
+                    f"🎉 최종 낙찰자: <@{self.highest_bidder}> (**{self.current_bid:,}** 코인)\n"
+                    f"📦 상자를 열어보는 중..."
+                )
+                await asyncio.sleep(2)
+            except Exception:
+                pass
+
+        grade, reward, jp_taken = roll_mystery_box(self.channel_id)
 
         connection = await get_db()
         try:
             new_money = await connection.fetchval(
-                "UPDATE players SET money = money + $1 WHERE user_id = $2 RETURNING money",
+                "UPDATE players SET money = money + $1, updated_at = NOW() WHERE user_id = $2 RETURNING money",
                 reward, self.highest_bidder
             )
         finally:
             await connection.close()
 
+        jp_line = f"\n💰 잭팟 **{jp_taken:,}** 포함!" if jp_taken > 0 else ""
+        net = reward - self.current_bid
+        net_txt = f"+{net:,}" if net >= 0 else f"{net:,}"
+
         embed = discord.Embed(
-            title="🔨 탕! 탕! 탕! 낙찰!",
+            title="🎁 미스터리 상자 개봉!",
             description=(
-                f"🎉 최종 낙찰자: <@{self.highest_bidder}> (**{self.current_bid:,}** 코인 차감)\n\n"
-                f"📦 상자를 열어보는 중...\n"
-                f"💥 상자 결과: **{grade}**\n"
-                f"🪙 **{reward:,}** 코인 획득!\n"
-                f"현재 보유: **{new_money:,}** 코인"
+                f"🎉 낙찰자: <@{self.highest_bidder}>\n"
+                f"💸 낙찰가: **{self.current_bid:,}** 코인\n\n"
+                f"💥 결과: **{grade}**\n"
+                f"🪙 획득: **{reward:,}** 코인{jp_line}\n"
+                f"📊 손익: **{net_txt}**\n"
+                f"🪙 현재 보유: **{new_money:,}**"
             ),
-            color=discord.Color.gold()
+            color=discord.Color.gold() if net >= 0 else discord.Color.dark_grey()
         )
         if self.message:
             try:
                 await self.message.edit(embed=embed, view=None)
             except Exception:
                 pass
-        # 채널에도 한 번 더
-        try:
-            ch = self.message.channel if self.message else None
-            if ch:
-                await ch.send(embed=embed)
-        except Exception:
-            pass
+        if channel:
+            try:
+                await channel.send(embed=embed)
+            except Exception:
+                pass
 
-    @discord.ui.button(label="+50,000 입찰", emoji="✋", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="+50,000 입찰", emoji="✋", style=discord.ButtonStyle.primary, row=0)
     async def bid_50k(self, interaction: discord.Interaction, button: discord.ui.Button):
-        new_bid = self.current_bid + 50_000
-        await self.place_bid(interaction, new_bid)
+        await self.place_bid(interaction, self.current_bid + self.STEP_SMALL)
 
-    @discord.ui.button(label="+200,000 찌르기", emoji="🚀", style=discord.ButtonStyle.danger)
+    @discord.ui.button(label="+200,000 찌르기", emoji="🚀", style=discord.ButtonStyle.danger, row=0)
     async def bid_200k(self, interaction: discord.Interaction, button: discord.ui.Button):
-        new_bid = self.current_bid + 200_000
-        await self.place_bid(interaction, new_bid)
+        await self.place_bid(interaction, self.current_bid + self.STEP_BIG)
+
+    @discord.ui.button(label="현재가 확인", emoji="📊", style=discord.ButtonStyle.secondary, row=1)
+    async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(embed=self.build_embed(), ephemeral=True)
 
 
 # ============================================================
