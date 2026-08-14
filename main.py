@@ -466,13 +466,14 @@ async def eliminate_lowest_players(game_id: int, channel: discord.TextChannel, c
 
 
 async def check_and_end_game(game_id: int, channel: discord.TextChannel):
-game = await get_game_by_id(game_id)
+    game = await get_game_by_id(game_id)
     if not game:
         return False
 
     # 테스트 게임은 강제종료 전까지 계속 진행
     if game["game_type"] == "money_battle_royale_test":
         return False
+
     alive_count = await get_alive_count(game_id)
 
     if alive_count > 1:
@@ -502,7 +503,6 @@ game = await get_game_by_id(game_id)
         )
 
         if winner:
-            # 다이아 보상 예시 (나중에 조정)
             await connection.execute(
                 """
                 UPDATE players
@@ -523,7 +523,6 @@ game = await get_game_by_id(game_id)
             )
             await channel.send(embed=embed)
 
-        # 코인/선행포인트 초기화는 여기서 처리 가능
         return True
     finally:
         await connection.close()
@@ -539,7 +538,7 @@ async def elimination_loop(game_id: int, channel: discord.TextChannel):
 
             # 다음 탈락 시간 확인
             game_data = parse_game_data(game["game_data"])
-next_elim_str = game_data.get("next_elimination_at")
+            next_elim_str = game_data.get("next_elimination_at")
             if not next_elim_str:
                 break
 
@@ -610,7 +609,6 @@ next_elim_str = game_data.get("next_elimination_at")
         pass
     except Exception as e:
         print(f"Elimination loop error: {type(e).__name__}: {e}")
-
 
 def start_elimination_task(game_id: int, channel: discord.TextChannel):
     if game_id in active_elimination_tasks:
@@ -778,18 +776,18 @@ async def build_main_embed(game_id: int, user_id: int, guild_id: int):
     game = await get_game_by_id(game_id)
 
     next_elim_text = "계산 중..."
-if game:
-    game_data = parse_game_data(game["game_data"])
-    next_str = game_data.get("next_elimination_at")
-    if next_str:
-        try:
-            next_time = datetime.fromisoformat(next_str)
-            remaining = max(0, int((next_time - datetime.utcnow()).total_seconds()))
-            minutes = remaining // 60
-            seconds = remaining % 60
-            next_elim_text = f"{minutes:02d}:{seconds:02d}"
-        except Exception:
-            next_elim_text = "오류"
+    if game:
+        game_data = parse_game_data(game["game_data"])
+        next_str = game_data.get("next_elimination_at")
+        if next_str:
+            try:
+                next_time = datetime.fromisoformat(next_str)
+                remaining = max(0, int((next_time - datetime.utcnow()).total_seconds()))
+                minutes = remaining // 60
+                seconds = remaining % 60
+                next_elim_text = f"{minutes:02d}:{seconds:02d}"
+            except Exception:
+                next_elim_text = "오류"
 
     money = player["money"] if player else 0
     diamonds = player["diamonds"] if player else 0
