@@ -44,6 +44,91 @@ def action_lock(user_id: int):
 
 
 # ============================================================
+# 상점 / 아이템 정의
+# ============================================================
+
+# 일반 상점 아이템 (코인 구매, 게임 중)
+SHOP_ITEMS = {
+    "정찰권": {
+        "emoji": "👁️",
+        "price": 300_000,
+        "desc": "상대의 특정 정보를 확인합니다. (게임 시작 전 10초 사용)",
+        "type": "consumable"
+    },
+    "빨대 쪼옵": {
+        "emoji": "🪣",
+        "price": 600_000,
+        "desc": "원하는 상대의 돈을 랜덤 소액 가져옵니다.",
+        "type": "consumable"
+    },
+    "이벤트 참가권": {
+        "emoji": "🎟️",
+        "price": 500_000,
+        "desc": "보물찾기 등 이벤트에 참가할 수 있습니다.",
+        "type": "consumable"
+    },
+    "시간 연장권": {
+        "emoji": "⏳",
+        "price": 1_000_000,
+        "desc": "다음 탈락 판정을 3분 연장합니다. (같은 구간 중복 불가)",
+        "type": "consumable"
+    },
+    "랜덤박스": {
+        "emoji": "🎁",
+        "price": 400_000,
+        "desc": "개봉 시 코인/다이아/아이템/꽝이 나옵니다. (0~3배)",
+        "type": "consumable"
+    },
+    "밑장빼기권": {
+        "emoji": "🎭",
+        "price": 800_000,
+        "desc": "게임 시작 전 패 하나를 랜덤으로 교체합니다.",
+        "type": "consumable"
+    },
+    "경매 주최권": {
+        "emoji": "🔨",
+        "price": 1_500_000,
+        "desc": "구매 즉시 미스터리 코인 상자 경매를 10초 후 시작합니다.",
+        "type": "consumable"
+    },
+}
+
+# 다이아 상점 (게임 시작 전 전용, /다이아상점)
+DIAMOND_SHOP_ITEMS = {
+    "시작자금_1만": {
+        "emoji": "🪙",
+        "price": 5,
+        "bonus_money": 10_000,
+        "desc": "시작 자금 +10,000 코인"
+    },
+    "시작자금_5만": {
+        "emoji": "🪙",
+        "price": 20,
+        "bonus_money": 50_000,
+        "desc": "시작 자금 +50,000 코인"
+    },
+    "시작자금_10만": {
+        "emoji": "🪙",
+        "price": 35,
+        "bonus_money": 100_000,
+        "desc": "시작 자금 +100,000 코인"
+    },
+    "시작자금_30만": {
+        "emoji": "🪙",
+        "price": 90,
+        "bonus_money": 300_000,
+        "desc": "시작 자금 +300,000 코인"
+    },
+    "시작자금_80만": {
+        "emoji": "🪙",
+        "price": 200,
+        "bonus_money": 800_000,
+        "desc": "시작 자금 +800,000 코인"
+    },
+}
+
+
+# ============================================================
 # Render HTTP 서버
 # ============================================================
 
@@ -87,6 +172,30 @@ async def get_db():
     return await asyncpg.connect(database_url)
 
 
+async def init_db():
+    """필요한 컬럼이 없으면 추가 (idempotent)"""
+    connection = await get_db()
+    try:
+        await connection.execute("""
+            ALTER TABLE players
+            ADD COLUMN IF NOT EXISTS inventory JSONB DEFAULT '{}'::jsonb;
+        """)
+        await connection.execute("""
+            ALTER TABLE players
+            ADD COLUMN IF NOT EXISTS bonus_starting_money INTEGER DEFAULT 0;
+        """)
+        # points 컬럼이 없을 수도 있으니 안전하게
+        await connection.execute("""
+            ALTER TABLE players
+            ADD COLUMN IF NOT EXISTS points INTEGER DEFAULT 0;
+        """)
+        print("DB schema check completed (inventory, bonus_starting_money)")
+    except Exception as e:
+        print(f"DB init warning: {type(e).__name__}: {e}")
+    finally:
+        await connection.close()
+
+
 # ============================================================
 # 플레이어
 # ============================================================
@@ -101,9 +210,10 @@ async def get_or_create_player(user: discord.User, guild: discord.Guild):
             """
             INSERT INTO players (
                 server_id, user_id, discord_id, username,
-                money, diamonds, points, good_deed, alive, eliminated
+                money, diamonds, points, good_deed, alive, eliminated,
+                inventory, bonus_starting_money
             )
-            VALUES ($1, $2, $2, $3, $4, 0, 0, 0, TRUE, FALSE)
+            VALUES ($1, $2, $2, $3, $4, 0, 0, 0, TRUE, FALSE, '{}'::jsonb, 0)
             ON CONFLICT (server_id, discord_id)
             DO UPDATE SET
                 username = EXCLUDED.username,
@@ -127,6 +237,99 @@ async def get_player(user_id: str, server_id: str = None):
         return await connection.fetchrow(
             "SELECT * FROM players WHERE user_id = $1 LIMIT 1",
             str(user_id)
+        )
+    finally:
+        await connection.close()
+
+
+def parse_inventory(inv):
+    """inventory 컬럼을 dict로 안전하게 변환"""
+    if inv is None:
+        return {}
+    if isinstance(inv, dict):
+        return inv
+    if isinstance(inv, str):
+        try:
+            return json.loads(inv)
+        except Exception:
+            return {}
+    return {}
+
+
+async def get_player_inventory(user_id: str, server_id: str):
+    player = await get_player(user_id, server_id)
+    if not player:
+        return {}
+    return parse_inventory(player.get("inventory"))
+
+
+async def add_item_to_inventory(user_id: str, server_id: str, item_name: str, amount: int = 1):
+    """아이템 추가. 성공 시 새 inventory dict 반환"""
+    connection = await get_db()
+    try:
+        player = await connection.fetchrow(
+            "SELECT inventory FROM players WHERE user_id = $1 AND server_id = $2",
+            str(user_id), str(server_id)
+        )
+        if not player:
+            return None
+        inv = parse_inventory(player["inventory"])
+        inv[item_name] = inv.get(item_name, 0) + amount
+        await connection.execute(
+            """
+            UPDATE players
+            SET inventory = $1::jsonb, updated_at = NOW()
+            WHERE user_id = $2 AND server_id = $3
+            """,
+            json.dumps(inv), str(user_id), str(server_id)
+        )
+        return inv
+    finally:
+        await connection.close()
+
+
+async def remove_item_from_inventory(user_id: str, server_id: str, item_name: str, amount: int = 1):
+    """아이템 제거. 성공 시 True"""
+    connection = await get_db()
+    try:
+        player = await connection.fetchrow(
+            "SELECT inventory FROM players WHERE user_id = $1 AND server_id = $2",
+            str(user_id), str(server_id)
+        )
+        if not player:
+            return False
+        inv = parse_inventory(player["inventory"])
+        current = inv.get(item_name, 0)
+        if current < amount:
+            return False
+        inv[item_name] = current - amount
+        if inv[item_name] <= 0:
+            del inv[item_name]
+        await connection.execute(
+            """
+            UPDATE players
+            SET inventory = $1::jsonb, updated_at = NOW()
+            WHERE user_id = $2 AND server_id = $3
+            """,
+            json.dumps(inv), str(user_id), str(server_id)
+        )
+        return True
+    finally:
+        await connection.close()
+
+
+async def add_bonus_starting_money(user_id: str, server_id: str, amount: int):
+    """다이아 상점에서 시작 자금 보너스 추가"""
+    connection = await get_db()
+    try:
+        await connection.execute(
+            """
+            UPDATE players
+            SET bonus_starting_money = COALESCE(bonus_starting_money, 0) + $1,
+                updated_at = NOW()
+            WHERE user_id = $2 AND server_id = $3
+            """,
+            amount, str(user_id), str(server_id)
         )
     finally:
         await connection.close()
@@ -407,11 +610,17 @@ async def start_survival_game(game_id):
             )
 
             for player in players:
+                # 다이아 상점에서 구매한 시작 자금 보너스 적용 후 초기화
                 await connection.execute(
                     """
                     UPDATE players
-                    SET money = $1, alive = TRUE, eliminated = FALSE,
-                        good_deed = 0, updated_at = NOW()
+                    SET money = $1 + COALESCE(bonus_starting_money, 0),
+                        bonus_starting_money = 0,
+                        alive = TRUE,
+                        eliminated = FALSE,
+                        good_deed = 0,
+                        inventory = '{}'::jsonb,
+                        updated_at = NOW()
                     WHERE user_id = $2
                     """,
                     STARTING_MONEY, str(player["user_id"])
@@ -793,8 +1002,18 @@ async def build_main_embed(game_id: int, user_id: int, guild_id: int):
     diamonds = player["diamonds"] if player else 0
     good_deed = player["good_deed"] if player else 0
     is_alive = player["alive"] if player else False
+    bonus = player.get("bonus_starting_money") or 0 if player else 0
+    inv = parse_inventory(player.get("inventory") if player else None)
 
     status = "🟢 생존 중" if is_alive else "☠️ 탈락"
+
+    inv_text = "없음"
+    if inv:
+        parts = []
+        for name, cnt in inv.items():
+            emoji = SHOP_ITEMS.get(name, {}).get("emoji", "📦")
+            parts.append(f"{emoji}{name}×{cnt}")
+        inv_text = " ".join(parts) if parts else "없음"
 
     embed = discord.Embed(
         title="💰 MONEY BATTLE ROYALE",
@@ -806,6 +1025,9 @@ async def build_main_embed(game_id: int, user_id: int, guild_id: int):
     embed.add_field(name="👥 생존자", value=f"**{alive_count}명**", inline=True)
     embed.add_field(name="📊 순위", value=f"**{rank}위**" if rank else "탈락", inline=True)
     embed.add_field(name="⏰ 다음 탈락", value=f"**{next_elim_text}**", inline=True)
+    if bonus > 0:
+        embed.add_field(name="🪙 시작 보너스(미적용)", value=f"**+{bonus:,}**", inline=False)
+    embed.add_field(name="🎒 보유 아이템", value=inv_text, inline=False)
     embed.add_field(name="상태", value=status, inline=False)
     embed.set_footer(text="버튼을 눌러 행동을 선택하세요")
 
@@ -944,6 +1166,315 @@ class JobView(discord.ui.View):
 
 
 # ============================================================
+# 일반 상점 View
+# ============================================================
+
+class ShopView(discord.ui.View):
+    def __init__(self, game_id):
+        super().__init__(timeout=180)
+        self.game_id = game_id
+        # Select 메뉴 추가
+        options = []
+        for name, item in SHOP_ITEMS.items():
+            options.append(discord.SelectOption(
+                label=f"{name} - {item['price']:,}코인",
+                value=name,
+                description=item["desc"][:50],
+                emoji=item["emoji"]
+            ))
+        self.select = discord.ui.Select(
+            placeholder="구매할 아이템을 선택하세요",
+            options=options,
+            min_values=1,
+            max_values=1
+        )
+        self.select.callback = self.on_select
+        self.add_item(self.select)
+
+    async def interaction_check(self, interaction):
+        game = await get_game_by_id(self.game_id)
+        if not game or game["status"] != "playing":
+            await interaction.response.send_message("🔒 게임이 진행 중이 아닙니다.", ephemeral=True)
+            return False
+        return True
+
+    async def on_select(self, interaction: discord.Interaction):
+        item_name = self.select.values[0]
+        item = SHOP_ITEMS.get(item_name)
+        if not item:
+            await interaction.response.send_message("존재하지 않는 아이템입니다.", ephemeral=True)
+            return
+
+        user_id = interaction.user.id
+        lock = action_lock(user_id)
+        if lock.locked():
+            await interaction.response.send_message("⏳ 처리 중입니다.", ephemeral=True)
+            return
+
+        async with lock:
+            player = await get_or_create_player(interaction.user, interaction.guild)
+            if player["money"] < item["price"]:
+                await interaction.response.send_message(
+                    f"🔴 코인이 부족합니다.\n필요: **{item['price']:,}** / 보유: **{player['money']:,}**",
+                    ephemeral=True
+                )
+                return
+
+            # 코인 차감 + 아이템 지급
+            connection = await get_db()
+            try:
+                new_money = await connection.fetchval(
+                    """
+                    UPDATE players
+                    SET money = money - $1, updated_at = NOW()
+                    WHERE server_id = $2 AND user_id = $3 AND money >= $1
+                    RETURNING money
+                    """,
+                    item["price"], str(interaction.guild.id), str(interaction.user.id)
+                )
+                if new_money is None:
+                    await interaction.response.send_message("🔴 구매 실패 (잔액 부족)", ephemeral=True)
+                    return
+            finally:
+                await connection.close()
+
+            inv = await add_item_to_inventory(
+                str(interaction.user.id), str(interaction.guild.id), item_name, 1
+            )
+
+            await interaction.response.send_message(
+                f"{item['emoji']} **{item_name}** 구매 완료!\n"
+                f"💰 -**{item['price']:,}** 코인\n"
+                f"🪙 현재: **{new_money:,}** 코인\n"
+                f"🎒 보유: **{inv.get(item_name, 0)}개**",
+                ephemeral=True
+            )
+
+
+# ============================================================
+# 기부 View
+# ============================================================
+
+class DonateAmountModal(discord.ui.Modal, title="😇 기부하기"):
+    def __init__(self, game_id, target_user_id, target_name):
+        super().__init__()
+        self.game_id = game_id
+        self.target_user_id = target_user_id
+        self.target_name = target_name
+        self.amount = discord.ui.TextInput(
+            label="기부할 코인 금액",
+            placeholder="예: 50000",
+            min_length=1,
+            max_length=12,
+            required=True
+        )
+        self.add_item(self.amount)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            amount = int(self.amount.value.replace(",", "").strip())
+            if amount <= 0:
+                await interaction.response.send_message("금액은 1 이상이어야 합니다.", ephemeral=True)
+                return
+        except ValueError:
+            await interaction.response.send_message("올바른 숫자를 입력해주세요.", ephemeral=True)
+            return
+
+        user_id = interaction.user.id
+        lock = action_lock(user_id)
+        if lock.locked():
+            await interaction.response.send_message("⏳ 처리 중입니다.", ephemeral=True)
+            return
+
+        async with lock:
+            # 기부자 확인
+            donor = await get_player(str(user_id), str(interaction.guild.id))
+            if not donor or not donor["alive"] or donor["eliminated"]:
+                await interaction.response.send_message("탈락자는 기부할 수 없습니다.", ephemeral=True)
+                return
+            if donor["money"] < amount:
+                await interaction.response.send_message(
+                    f"코인이 부족합니다. 보유: **{donor['money']:,}**", ephemeral=True
+                )
+                return
+
+            # 대상이 아직 꼴등인지 재확인 (간단히 진행)
+            connection = await get_db()
+            try:
+                async with connection.transaction():
+                    # 기부자 차감 + 선행 포인트 증가 (1:1)
+                    new_donor_money = await connection.fetchval(
+                        """
+                        UPDATE players
+                        SET money = money - $1,
+                            good_deed = COALESCE(good_deed, 0) + $1,
+                            updated_at = NOW()
+                        WHERE user_id = $2 AND server_id = $3 AND money >= $1
+                        RETURNING money
+                        """,
+                        amount, str(user_id), str(interaction.guild.id)
+                    )
+                    if new_donor_money is None:
+                        await interaction.response.send_message("기부 실패 (잔액 부족)", ephemeral=True)
+                        return
+
+                    # 수혜자 증가
+                    new_target_money = await connection.fetchval(
+                        """
+                        UPDATE players
+                        SET money = money + $1, updated_at = NOW()
+                        WHERE user_id = $2 AND server_id = $3
+                        RETURNING money
+                        """,
+                        amount, str(self.target_user_id), str(interaction.guild.id)
+                    )
+            finally:
+                await connection.close()
+
+            # 공개 알림 (원래 채널)
+            embed = discord.Embed(
+                title="😇 기부 발생!",
+                description=(
+                    f"<@{user_id}> 님이 <@{self.target_user_id}> 님에게\n"
+                    f"**{amount:,}** 코인을 기부했습니다!\n\n"
+                    f"😇 선행 포인트 +**{amount:,}**"
+                ),
+                color=discord.Color.green()
+            )
+            await interaction.channel.send(embed=embed)
+
+            await interaction.response.send_message(
+                f"😇 기부 완료!\n"
+                f"→ <@{self.target_user_id}> 에게 **{amount:,}** 코인\n"
+                f"🪙 내 잔액: **{new_donor_money:,}**\n"
+                f"😇 선행 포인트 +**{amount:,}**",
+                ephemeral=True
+            )
+
+
+class DonateView(discord.ui.View):
+    def __init__(self, game_id):
+        super().__init__(timeout=120)
+        self.game_id = game_id
+
+    async def interaction_check(self, interaction):
+        game = await get_game_by_id(self.game_id)
+        if not game or game["status"] != "playing":
+            await interaction.response.send_message("🔒 게임이 진행 중이 아닙니다.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="꼴등에게 기부하기", emoji="😇", style=discord.ButtonStyle.success)
+    async def donate_to_lowest(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # 현재 생존자 중 코인 최저 찾기
+        players = await get_game_players(self.game_id)
+        alive = [p for p in players if p["alive"] and not p["eliminated"]]
+        if not alive:
+            await interaction.response.send_message("생존자가 없습니다.", ephemeral=True)
+            return
+
+        # 자신 제외한 최저
+        others = [p for p in alive if str(p["user_id"]) != str(interaction.user.id)]
+        if not others:
+            await interaction.response.send_message("기부할 대상이 없습니다 (혼자입니다).", ephemeral=True)
+            return
+
+        lowest = min(others, key=lambda p: p["money"])
+        modal = DonateAmountModal(self.game_id, lowest["user_id"], lowest["username"])
+        await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="닫기", emoji="❌", style=discord.ButtonStyle.secondary)
+    async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="기부 메뉴를 닫았습니다.", embed=None, view=None)
+
+
+# ============================================================
+# 다이아 상점 View
+# ============================================================
+
+class DiamondShopView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+        options = []
+        for key, item in DIAMOND_SHOP_ITEMS.items():
+            options.append(discord.SelectOption(
+                label=f"{item['desc']} ({item['price']}💎)",
+                value=key,
+                description=f"+{item['bonus_money']:,} 시작 자금",
+                emoji=item["emoji"]
+            ))
+        self.select = discord.ui.Select(
+            placeholder="구매할 시작 자금 패키지를 선택하세요",
+            options=options,
+            min_values=1,
+            max_values=1
+        )
+        self.select.callback = self.on_select
+        self.add_item(self.select)
+
+    async def on_select(self, interaction: discord.Interaction):
+        key = self.select.values[0]
+        item = DIAMOND_SHOP_ITEMS.get(key)
+        if not item:
+            await interaction.response.send_message("존재하지 않는 상품입니다.", ephemeral=True)
+            return
+
+        # 진행 중 게임인지 확인 → 진행 중이면 구매 불가
+        playing = await get_playing_game(interaction.channel.id)
+        if playing:
+            await interaction.response.send_message(
+                "🔒 게임이 이미 시작된 후에는 다이아 상점을 이용할 수 없습니다.\n"
+                "다음 서바이벌 시작 전에 이용해주세요.",
+                ephemeral=True
+            )
+            return
+
+        user_id = interaction.user.id
+        lock = action_lock(user_id)
+        if lock.locked():
+            await interaction.response.send_message("⏳ 처리 중입니다.", ephemeral=True)
+            return
+
+        async with lock:
+            player = await get_or_create_player(interaction.user, interaction.guild)
+            if player["diamonds"] < item["price"]:
+                await interaction.response.send_message(
+                    f"🔴 다이아가 부족합니다.\n필요: **{item['price']}** / 보유: **{player['diamonds']}**",
+                    ephemeral=True
+                )
+                return
+
+            connection = await get_db()
+            try:
+                new_diamonds = await connection.fetchval(
+                    """
+                    UPDATE players
+                    SET diamonds = diamonds - $1,
+                        bonus_starting_money = COALESCE(bonus_starting_money, 0) + $2,
+                        updated_at = NOW()
+                    WHERE server_id = $3 AND user_id = $4 AND diamonds >= $1
+                    RETURNING diamonds
+                    """,
+                    item["price"], item["bonus_money"],
+                    str(interaction.guild.id), str(interaction.user.id)
+                )
+                if new_diamonds is None:
+                    await interaction.response.send_message("구매 실패 (다이아 부족)", ephemeral=True)
+                    return
+            finally:
+                await connection.close()
+
+            await interaction.response.send_message(
+                f"{item['emoji']} **시작 자금 보너스 구매 완료!**\n"
+                f"💎 -**{item['price']}** 다이아\n"
+                f"🪙 다음 게임 시작 시 **+{item['bonus_money']:,}** 코인 추가\n"
+                f"💎 남은 다이아: **{new_diamonds}**\n\n"
+                f"※ 게임 시작 시 자동 적용되며, 보너스는 초기화됩니다.",
+                ephemeral=True
+            )
+
+
+# ============================================================
 # 메인 게임 View (SurvivalGameView)
 # ============================================================
 
@@ -997,11 +1528,56 @@ class SurvivalGameView(discord.ui.View):
 
     @discord.ui.button(label="상점", emoji="🏪", style=discord.ButtonStyle.primary, row=1)
     async def shop(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message("🏪 상점 기능은 Phase 2에서 구현됩니다.", ephemeral=True)
+        player = await get_or_create_player(interaction.user, interaction.guild)
+        embed = discord.Embed(
+            title="🏪 일반 상점",
+            description=(
+                "서바이벌 중 아이템을 구매할 수 있습니다.\n"
+                "아이템은 **미니게임 시작 전 10초** 동안만 사용 여부를 결정할 수 있습니다.\n\n"
+                f"🪙 현재 코인: **{player['money']:,}**"
+            ),
+            color=discord.Color.blue()
+        )
+        for name, item in SHOP_ITEMS.items():
+            embed.add_field(
+                name=f"{item['emoji']} {name}",
+                value=f"**{item['price']:,}** 코인\n{item['desc']}",
+                inline=False
+            )
+        await interaction.response.send_message(
+            embed=embed, view=ShopView(self.game_id), ephemeral=True
+        )
 
     @discord.ui.button(label="기부", emoji="😇", style=discord.ButtonStyle.primary, row=1)
     async def donate(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message("😇 기부 기능은 Phase 2에서 구현됩니다.", ephemeral=True)
+        player = await get_or_create_player(interaction.user, interaction.guild)
+        if not player["alive"] or player["eliminated"]:
+            await interaction.response.send_message("탈락자는 기부할 수 없습니다.", ephemeral=True)
+            return
+
+        # 현재 꼴등 미리 보여주기
+        players = await get_game_players(self.game_id)
+        alive = [p for p in players if p["alive"] and not p["eliminated"]]
+        others = [p for p in alive if str(p["user_id"]) != str(interaction.user.id)]
+        lowest_text = "없음"
+        if others:
+            lowest = min(others, key=lambda p: p["money"])
+            lowest_text = f"<@{lowest['user_id']}> (**{lowest['money']:,}** 코인)"
+
+        embed = discord.Embed(
+            title="😇 기부 시스템",
+            description=(
+                "현재 **꼴등**에게 코인을 기부하면 선행 포인트를 얻습니다.\n"
+                "부자가 꼴등을 살려주는 전략이 가능합니다.\n\n"
+                f"🎯 현재 꼴등: {lowest_text}\n"
+                f"🪙 내 코인: **{player['money']:,}**\n"
+                f"😇 내 선행 포인트: **{player['good_deed']:,}**"
+            ),
+            color=discord.Color.green()
+        )
+        await interaction.response.send_message(
+            embed=embed, view=DonateView(self.game_id), ephemeral=True
+        )
 
     @discord.ui.button(label="내 정보", emoji="👤", style=discord.ButtonStyle.secondary, row=1)
     async def myinfo(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1094,10 +1670,12 @@ async def test_game(interaction: discord.Interaction):
                 await connection.execute(
                     """
                     UPDATE players
-                    SET money = $1,
+                    SET money = $1 + COALESCE(bonus_starting_money, 0),
+                        bonus_starting_money = 0,
                         alive = TRUE,
                         eliminated = FALSE,
                         good_deed = 0,
+                        inventory = '{}'::jsonb,
                         updated_at = NOW()
                     WHERE user_id = $2
                     """,
@@ -1217,6 +1795,50 @@ async def force_end(interaction: discord.Interaction):
     await interaction.response.send_message("🛑 게임이 강제 종료되었습니다.")
 
 
+@bot.tree.command(name="다이아상점", description="다이아로 시작 자금을 강화합니다 (게임 시작 전 전용)")
+async def diamond_shop(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("서버에서만 사용할 수 있습니다.", ephemeral=True)
+        return
+
+    # 진행 중인 게임이 있으면 차단
+    playing = await get_playing_game(interaction.channel.id)
+    if playing:
+        await interaction.response.send_message(
+            "🔒 **게임이 이미 시작된 후에는 다이아 상점을 이용할 수 없습니다.**\n"
+            "다음 서바이벌이 시작되기 전에 `/다이아상점` 을 이용해주세요.",
+            ephemeral=True
+        )
+        return
+
+    player = await get_or_create_player(interaction.user, interaction.guild)
+    bonus = player.get("bonus_starting_money") or 0
+
+    embed = discord.Embed(
+        title="💎 다이아 상점",
+        description=(
+            "게임 **시작 전**에만 이용 가능합니다.\n"
+            "다이아를 사용해 이번 서바이벌의 **시작 자금**을 강화하세요.\n\n"
+            f"💎 보유 다이아: **{player['diamonds']}**\n"
+            f"🪙 현재 누적 시작 보너스: **+{bonus:,}** 코인\n\n"
+            "구매한 보너스는 게임 시작 시 기본 10,000에 더해지며,\n"
+            "적용 후 보너스는 0으로 초기화됩니다."
+        ),
+        color=discord.Color.purple()
+    )
+    for key, item in DIAMOND_SHOP_ITEMS.items():
+        embed.add_field(
+            name=f"{item['emoji']} {item['desc']}",
+            value=f"💎 **{item['price']}** 다이아 → +**{item['bonus_money']:,}** 코인",
+            inline=False
+        )
+    embed.set_footer(text="게임 시작 후에는 이용 불가")
+
+    await interaction.response.send_message(
+        embed=embed, view=DiamondShopView(), ephemeral=True
+    )
+
+
 # ============================================================
 # 봇 이벤트
 # ============================================================
@@ -1224,6 +1846,11 @@ async def force_end(interaction: discord.Interaction):
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+    # DB 스키마 보정 (inventory, bonus_starting_money)
+    try:
+        await init_db()
+    except Exception as e:
+        print(f"init_db error: {e}")
     try:
         synced = await bot.tree.sync()
         print(f"Synced {len(synced)} slash command(s)")
