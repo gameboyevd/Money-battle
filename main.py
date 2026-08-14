@@ -728,37 +728,41 @@ async def eliminate_lowest_players(game_id: int, channel: discord.TextChannel, c
             # 2차: 실제 탈락 처리 + 큐피트 연쇄
             extra_from_cupid = []
             for player in final_targets:
+                # 탈락 전에 이 사람의 cupid_link_user_id 확인 (꼴등이 탈락할 때 연결된 사람)
+                linked_id = player.get("cupid_link_user_id")
+
                 await connection.execute(
                     """
                     UPDATE players
-                    SET alive = FALSE, eliminated = TRUE, updated_at = NOW()
+                    SET alive = FALSE, eliminated = TRUE, cupid_link_user_id = NULL, updated_at = NOW()
                     WHERE user_id = $1
                     """,
                     str(player["user_id"])
                 )
                 eliminated_list.append(player)
 
-                # 이 플레이어를 cupid_link로 연결한 사람이 있으면 같이 탈락
-                linked = await connection.fetch(
-                    """
-                    SELECT user_id, username, money
-                    FROM players
-                    WHERE cupid_link_user_id = $1
-                      AND alive = TRUE AND eliminated = FALSE
-                    """,
-                    str(player["user_id"])
-                )
-                for link_p in linked:
-                    await connection.execute(
+                # 큐피트: 꼴등이 탈락하면 연결된 사람도 탈락
+                if linked_id:
+                    linked_player = await connection.fetchrow(
                         """
-                        UPDATE players
-                        SET alive = FALSE, eliminated = TRUE, cupid_link_user_id = NULL, updated_at = NOW()
+                        SELECT user_id, username, money
+                        FROM players
                         WHERE user_id = $1
+                          AND alive = TRUE AND eliminated = FALSE
                         """,
-                        str(link_p["user_id"])
+                        str(linked_id)
                     )
-                    extra_from_cupid.append(link_p)
-                    eliminated_list.append(link_p)
+                    if linked_player:
+                        await connection.execute(
+                            """
+                            UPDATE players
+                            SET alive = FALSE, eliminated = TRUE, cupid_link_user_id = NULL, updated_at = NOW()
+                            WHERE user_id = $1
+                            """,
+                            str(linked_id)
+                        )
+                        extra_from_cupid.append(linked_player)
+                        eliminated_list.append(linked_player)
 
             # 구원 알림은 호출 측에서 처리하기 위해 반환
             return {
@@ -1632,45 +1636,62 @@ class AngelShopView(discord.ui.View):
             )
 
     async def _activate_cupid(self, interaction, buyer_id: str) -> str:
-        """큐피트 소환권: 꼴등 포함 랜덤 생존자와 연결"""
+        """
+        큐피트 소환권 (수정됨):
+        - 현재 꼴등과 '자기 포함 랜덤한 사람'을 이어줌
+        - 꼴등이 탈락하면 연결된 사람도 같이 탈락
+        """
         players = await get_game_players(self.game_id)
         alive = [p for p in players if p["alive"] and not p["eliminated"]]
-        others = [p for p in alive if str(p["user_id"]) != buyer_id]
-        if not others:
-            return "⚠️ 연결할 대상이 없어 효과가 발동되지 않았습니다."
+        if len(alive) < 2:
+            return "⚠️ 연결할 대상이 부족합니다."
 
-        # 꼴등을 우선적으로 포함하되, 랜덤 선택
-        lowest = min(others, key=lambda p: p["money"])
-        # 50% 확률로 꼴등, 아니면 랜덤
-        if random.random() < 0.5 or len(others) == 1:
-            target = lowest
-        else:
-            target = random.choice(others)
+        # 현재 꼴등 찾기
+        lowest = min(alive, key=lambda p: p["money"])
+        lowest_id = str(lowest["user_id"])
+
+        # 꼴등을 제외한 나머지 중에서 랜덤 선택 (자기 자신 포함 가능)
+        candidates = [p for p in alive if str(p["user_id"]) != lowest_id]
+        if not candidates:
+            return "⚠️ 연결할 대상이 없습니다."
+
+        linked = random.choice(candidates)  # 자기 자신 포함 랜덤
+        linked_id = str(linked["user_id"])
 
         connection = await get_db()
         try:
+            # 꼴등 → 연결된 사람 방향으로 저장
+            # (꼴등이 탈락할 때 linked_id가 같이 탈락되도록)
             await connection.execute(
                 """
                 UPDATE players
                 SET cupid_link_user_id = $1, updated_at = NOW()
                 WHERE user_id = $2
                 """,
-                str(target["user_id"]), buyer_id
+                linked_id, lowest_id
             )
-            # 양방향 연결 (선택사항, 여기선 구매자 → 대상만)
+            # 구매자에게도 표시용으로 기록 (선택)
+            await connection.execute(
+                """
+                UPDATE players
+                SET cupid_link_user_id = $1, updated_at = NOW()
+                WHERE user_id = $2
+                """,
+                lowest_id, buyer_id
+            )
         finally:
             await connection.close()
 
         public = discord.Embed(
             title="🏹 큐피트가 소환되었습니다!",
             description=(
-                f"<@{buyer_id}> 님과 <@{target['user_id']}> 님이 **강제 연결**되었습니다!\n"
-                f"연결된 대상이 탈락하면 구매자도 함께 탈락합니다."
+                f"**꼴등** <@{lowest_id}> 님과 <@{linked_id}> 님이 **강제 연결**되었습니다!\n\n"
+                f"☠️ 꼴등이 탈락하면 연결된 사람도 **함께 탈락**합니다."
             ),
             color=discord.Color.pink()
         )
         await interaction.channel.send(embed=public)
-        return f"🏹 <@{target['user_id']}> 님과 연결되었습니다!"
+        return f"🏹 꼴등 <@{lowest_id}> ↔ <@{linked_id}> 연결 완료!"
 
     async def _activate_angel_relief(self, interaction) -> str:
         """천사의 구제: 1~3등 돈의 30%를 4등 이하에게 분배"""
@@ -1858,6 +1879,241 @@ class DiamondShopView(discord.ui.View):
 
 
 # ============================================================
+# 아이템 가방 View
+# ============================================================
+
+class ItemBagView(discord.ui.View):
+    def __init__(self, game_id, inventory: dict):
+        super().__init__(timeout=120)
+        self.game_id = game_id
+        self.inventory = inventory
+
+        options = []
+        for name, count in inventory.items():
+            if count <= 0:
+                continue
+            item = SHOP_ITEMS.get(name, {})
+            emoji = item.get("emoji", "📦")
+            options.append(discord.SelectOption(
+                label=f"{name} ×{count}",
+                value=name,
+                description=item.get("desc", "아이템")[:50],
+                emoji=emoji
+            ))
+
+        if options:
+            self.select = discord.ui.Select(
+                placeholder="사용할 아이템을 선택하세요",
+                options=options[:25],  # Discord 제한
+                min_values=1,
+                max_values=1
+            )
+            self.select.callback = self.on_select
+            self.add_item(self.select)
+        else:
+            # 아이템이 없을 때 더미
+            pass
+
+    async def interaction_check(self, interaction):
+        game = await get_game_by_id(self.game_id)
+        if not game or game["status"] != "playing":
+            await interaction.response.send_message("🔒 게임이 진행 중이 아닙니다.", ephemeral=True)
+            return False
+        return True
+
+    async def on_select(self, interaction: discord.Interaction):
+        item_name = self.select.values[0]
+        item = SHOP_ITEMS.get(item_name)
+        if not item:
+            await interaction.response.send_message("알 수 없는 아이템입니다.", ephemeral=True)
+            return
+
+        user_id = str(interaction.user.id)
+        lock = action_lock(interaction.user.id)
+        if lock.locked():
+            await interaction.response.send_message("⏳ 처리 중입니다.", ephemeral=True)
+            return
+
+        async with lock:
+            # 보유 확인
+            inv = await get_player_inventory(user_id, str(interaction.guild.id))
+            if inv.get(item_name, 0) <= 0:
+                await interaction.response.send_message("해당 아이템을 보유하고 있지 않습니다.", ephemeral=True)
+                return
+
+            # 아이템별 사용 처리
+            result_msg = await self._use_item(interaction, item_name, item)
+
+            if result_msg is None:
+                return  # 이미 response 보낸 경우
+
+            # 성공 시 아이템 1개 소모
+            await remove_item_from_inventory(user_id, str(interaction.guild.id), item_name, 1)
+
+            await interaction.response.send_message(
+                f"{item.get('emoji', '📦')} **{item_name}** 사용 완료!\n{result_msg}",
+                ephemeral=True
+            )
+
+    async def _use_item(self, interaction, item_name: str, item: dict) -> str | None:
+        """아이템 효과 발동. 성공 메시지 반환 또는 None (직접 response한 경우)"""
+        game_id = self.game_id
+        user_id = str(interaction.user.id)
+        guild_id = str(interaction.guild.id)
+
+        if item_name == "시간 연장권":
+            # 다음 탈락을 3분 연장
+            game = await get_game_by_id(game_id)
+            if not game:
+                await interaction.response.send_message("게임 정보를 찾을 수 없습니다.", ephemeral=True)
+                return None
+            game_data = parse_game_data(game["game_data"])
+            next_str = game_data.get("next_elimination_at")
+            if not next_str:
+                await interaction.response.send_message("탈락 시간 정보가 없습니다.", ephemeral=True)
+                return None
+            try:
+                next_time = datetime.fromisoformat(next_str)
+                new_time = next_time + timedelta(minutes=3)
+                connection = await get_db()
+                try:
+                    await connection.execute(
+                        """
+                        UPDATE games
+                        SET game_data = jsonb_set(
+                            COALESCE(game_data, '{}'::jsonb),
+                            '{next_elimination_at}',
+                            to_jsonb($2::text),
+                            TRUE
+                        )
+                        WHERE id = $1
+                        """,
+                        game_id, new_time.isoformat()
+                    )
+                finally:
+                    await connection.close()
+
+                # 공개 알림
+                embed = discord.Embed(
+                    title="⏳ 시간 연장권 사용!",
+                    description=f"<@{user_id}> 님이 다음 탈락 판정을 **3분 연장**했습니다!",
+                    color=discord.Color.blue()
+                )
+                await interaction.channel.send(embed=embed)
+                return "다음 탈락 판정이 **3분** 연장되었습니다."
+            except Exception as e:
+                await interaction.response.send_message(f"연장 실패: {e}", ephemeral=True)
+                return None
+
+        elif item_name == "정찰권":
+            # 간단한 정보 제공 (현재는 꼴등 정보 정도)
+            players = await get_game_players(game_id)
+            alive = [p for p in players if p["alive"] and not p["eliminated"]]
+            if not alive:
+                return "생존자가 없습니다."
+            lowest = min(alive, key=lambda p: p["money"])
+            highest = max(alive, key=lambda p: p["money"])
+            return (
+                f"👁️ 정찰 결과\n"
+                f"현재 꼴등: <@{lowest['user_id']}> (**{lowest['money']:,}**)\n"
+                f"현재 1등: <@{highest['user_id']}> (**{highest['money']:,}**)"
+            )
+
+        elif item_name == "빨대 쪼옵":
+            # 랜덤 생존자 소액 갈취
+            players = await get_game_players(game_id)
+            others = [p for p in players if p["alive"] and not p["eliminated"] and str(p["user_id"]) != user_id]
+            if not others:
+                return "가져올 대상이 없습니다."
+            target = random.choice(others)
+            steal = random.randint(10_000, min(100_000, max(10_000, target["money"] // 10)))
+            if target["money"] < steal:
+                steal = target["money"]
+            if steal <= 0:
+                return "상대에게 가져올 돈이 없습니다."
+
+            connection = await get_db()
+            try:
+                await connection.execute(
+                    "UPDATE players SET money = money - $1 WHERE user_id = $2",
+                    steal, str(target["user_id"])
+                )
+                await connection.execute(
+                    "UPDATE players SET money = money + $1 WHERE user_id = $2",
+                    steal, user_id
+                )
+            finally:
+                await connection.close()
+
+            embed = discord.Embed(
+                title="🪣 빨대 쪼옵!",
+                description=f"<@{user_id}> 님이 <@{target['user_id']}> 님에게서 **{steal:,}** 코인을 가져갔습니다!",
+                color=discord.Color.orange()
+            )
+            await interaction.channel.send(embed=embed)
+            return f"<@{target['user_id']}> 에게서 **{steal:,}** 코인을 가져왔습니다."
+
+        elif item_name == "랜덤박스":
+            # 간단 랜덤박스 개봉
+            roll = random.random()
+            if roll < 0.05:
+                reward = random.randint(800_000, 1_200_000)
+                msg = f"🎉 대박! **{reward:,}** 코인 획득!"
+            elif roll < 0.25:
+                reward = random.randint(300_000, 600_000)
+                msg = f"✨ 성공! **{reward:,}** 코인 획득!"
+            elif roll < 0.55:
+                reward = random.randint(100_000, 250_000)
+                msg = f"보통... **{reward:,}** 코인 획득"
+            elif roll < 0.80:
+                reward = random.randint(10_000, 80_000)
+                msg = f"아쉬움... **{reward:,}** 코인"
+            else:
+                reward = 0
+                msg = "💥 꽝... 아무것도 없습니다."
+
+            if reward > 0:
+                connection = await get_db()
+                try:
+                    await connection.execute(
+                        "UPDATE players SET money = money + $1 WHERE user_id = $2",
+                        reward, user_id
+                    )
+                finally:
+                    await connection.close()
+            return msg
+
+        elif item_name == "밑장빼기권":
+            return (
+                "🎭 밑장빼기권은 **카드 게임(블랙잭, 에이스 브레이커, 인디언 포커 등) 시작 전 10초**에 "
+                "자동으로 사용 여부를 선택할 수 있습니다.\n"
+                "지금은 가방에서 미리 준비만 해두세요. (아이템은 소모되지 않았습니다)"
+            )
+
+        elif item_name == "이벤트 참가권":
+            return (
+                "🎟️ 이벤트 참가권은 **보물찾기 등 이벤트**가 열렸을 때 사용됩니다.\n"
+                "현재 진행 중인 이벤트가 없어 사용할 수 없습니다. (아이템은 소모되지 않았습니다)"
+            )
+
+        elif item_name == "경매 주최권":
+            # 간단 버전: 알림만
+            embed = discord.Embed(
+                title="🔨 미스터리 코인 상자 경매 시작!",
+                description=(
+                    f"<@{user_id}> 님이 경매를 주최했습니다!\n"
+                    "⚠️ 경매 상세 시스템(입찰 버튼 등)은 추후 업데이트 예정입니다."
+                ),
+                color=discord.Color.gold()
+            )
+            await interaction.channel.send(embed=embed)
+            return "경매가 시작되었습니다! (상세 기능 추후 업데이트)"
+
+        else:
+            return "이 아이템은 아직 사용 기능이 구현되지 않았습니다."
+
+
+# ============================================================
 # 메인 게임 View (SurvivalGameView)
 # ============================================================
 
@@ -1996,6 +2252,36 @@ class SurvivalGameView(discord.ui.View):
     async def myinfo(self, interaction: discord.Interaction, button: discord.ui.Button):
         embed = await build_main_embed(self.game_id, interaction.user.id, interaction.guild.id)
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="가방", emoji="🎒", style=discord.ButtonStyle.primary, row=2)
+    async def bag(self, interaction: discord.Interaction, button: discord.ui.Button):
+        player = await get_or_create_player(interaction.user, interaction.guild)
+        inv = parse_inventory(player.get("inventory"))
+        angel = player.get("angel_item")
+
+        if not inv and not angel:
+            await interaction.response.send_message(
+                "🎒 가방이 비어 있습니다.\n상점에서 아이템을 구매하세요!",
+                ephemeral=True
+            )
+            return
+
+        lines = []
+        if inv:
+            for name, cnt in inv.items():
+                emoji = SHOP_ITEMS.get(name, {}).get("emoji", "📦")
+                lines.append(f"{emoji} **{name}** ×{cnt}")
+        if angel:
+            emoji = ANGEL_SHOP_ITEMS.get(angel, {}).get("emoji", "🪽")
+            lines.append(f"{emoji} **{angel}** (천사 아이템 - 자동 발동)")
+
+        embed = discord.Embed(
+            title="🎒 아이템 가방",
+            description="\n".join(lines) + "\n\n사용할 아이템을 아래에서 선택하세요.",
+            color=discord.Color.teal()
+        )
+        view = ItemBagView(self.game_id, inv) if inv else None
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
     @discord.ui.button(label="랭킹", emoji="🏆", style=discord.ButtonStyle.secondary, row=2)
     async def ranking(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -2253,6 +2539,208 @@ async def diamond_shop(interaction: discord.Interaction):
     await interaction.response.send_message(
         embed=embed, view=DiamondShopView(), ephemeral=True
     )
+
+
+@bot.tree.command(name="설명서", description="머니 배틀로얄 전체 규칙 / 게임 / 아이템 / 알바 상세 설명서")
+async def manual_command(interaction: discord.Interaction):
+    """매우 자세한 통합 설명서"""
+    embeds = []
+
+    # 1. 기본 규칙
+    e1 = discord.Embed(
+        title="📖 머니 배틀로얄 설명서 - 기본 규칙",
+        description=(
+            "**💰 머니 배틀로얄**은 Discord에서 즐기는 가상 재화 기반 멀티 서바이벌 게임입니다.\n\n"
+            "돈을 벌고 → 게임을 선택하고 → 아이템을 사고 → 다른 플레이어와 경쟁하고 → 탈락을 피하고 → **최후의 1인**이 되는 것이 목표입니다.\n\n"
+            "실제 현금은 사용하지 않으며 모든 경제 활동은 봇 내부 가상 재화로만 이루어집니다.\n"
+            f"**최소 플레이어: {MIN_PLAYERS}명**"
+        ),
+        color=discord.Color.gold()
+    )
+    e1.add_field(
+        name="🏆 게임 시작 방법",
+        value=(
+            "`/메인` 명령어로 대기실을 열거나 참가합니다.\n"
+            "방장이 설정을 완료한 뒤 **시작** 버튼을 누르면 3초 후 게임이 시작됩니다.\n"
+            f"기본 시작 자금: **{STARTING_MONEY:,}** 코인"
+        ),
+        inline=False
+    )
+    e1.add_field(
+        name="☠️ 탈락 시스템",
+        value=(
+            "설정된 주기마다 **보유 코인이 가장 적은 플레이어**가 탈락합니다.\n"
+            "기본: 5분마다 1명 탈락 (방장이 변경 가능)\n"
+            "동점 시 랜덤 처리\n"
+            "탈락자의 코인은 잭팟으로 이동합니다.\n"
+            "마지막 1명이 우승하며 다이아 등 보상을 받습니다.\n"
+            "게임 종료 후 코인과 선행 포인트는 초기화됩니다."
+        ),
+        inline=False
+    )
+    e1.add_field(
+        name="🪙 재화 설명",
+        value=(
+            "**코인**: 이번 서바이벌에서만 사용하는 핵심 재화. 게임/알바/이벤트로 획득, 배팅/상점에 사용.\n"
+            "**다이아**: 게임을 넘어 유지되는 장기 재화. 출석/우승 등으로 획득. `/다이아상점`에서 시작 자금 강화에 사용.\n"
+            "**선행 포인트**: 기부하면 획득. 천사의 상점에서 사용. 게임 종료 시 사라짐."
+        ),
+        inline=False
+    )
+    embeds.append(e1)
+
+    # 2. 기부 & 천사의 상점
+    e2 = discord.Embed(title="📖 기부 & 천사의 상점", color=discord.Color.purple())
+    e2.add_field(
+        name="😇 기부 시스템",
+        value=(
+            "현재 **꼴등**에게 코인을 기부할 수 있습니다.\n"
+            "기부자 코인 감소 → 수혜자 코인 증가 → 기부자 선행 포인트 증가 (1:1)\n"
+            "부자가 꼴등을 살려주는 전략이 가능합니다."
+        ),
+        inline=False
+    )
+    e2.add_field(
+        name="🪽 천사의 상점 (한 게임당 1개만 구매 가능)",
+        value=(
+            "🪽 **천사의 구원** (3,000,000P) : 탈락 대상이 되었을 때 1회 생존\n"
+            "🏹 **큐피트 소환권** (6,000,000P) : 꼴등과 랜덤한 사람(자기 포함)을 연결. 꼴등 탈락 시 연결된 사람도 탈락\n"
+            "⏳ **신의 모래시계** (7,000,000P) : 방금 전 잃은 돈을 1회 복구\n"
+            "🕊️ **천사의 구제** (8,000,000P) : 1~3등 재산 30%를 4등 이하에게 분배 (소수 인원 시 규칙 변경)\n"
+            "🏛️ **승천궁** (10,000,000P) : 최고급 아이템 (탈락자 임시 부활 등 복잡한 효과)"
+        ),
+        inline=False
+    )
+    embeds.append(e2)
+
+    # 3. 일반 상점 & 아이템
+    e3 = discord.Embed(title="📖 일반 상점 & 아이템", color=discord.Color.blue())
+    e3.add_field(
+        name="🏪 일반 상점 아이템",
+        value=(
+            "👁️ **정찰권** 300,000 : 상대/현재 순위 정보 확인\n"
+            "🪣 **빨대 쪼옵** 600,000 : 원하는 상대의 돈을 랜덤 소액 가져옴\n"
+            "🎟️ **이벤트 참가권** 500,000 : 보물찾기 등 이벤트 참가\n"
+            "⏳ **시간 연장권** 1,000,000 : 다음 탈락 판정 3분 연장\n"
+            "🎁 **랜덤박스** 400,000~ : 개봉 시 코인/다이아/아이템/꽝\n"
+            "🎭 **밑장빼기권** 800,000 : 카드 게임 시작 전 패 하나 랜덤 교체\n"
+            "🔨 **경매 주최권** 1,500,000 : 미스터리 코인 상자 경매 시작"
+        ),
+        inline=False
+    )
+    e3.add_field(
+        name="🎒 아이템 사용 규칙",
+        value=(
+            "대부분의 아이템은 **미니게임 시작 전 10초** 동안 사용 여부를 결정합니다.\n"
+            "가방(`🎒 가방` 버튼)에서 미리 사용하거나 확인할 수 있습니다.\n"
+            "시간 연장권, 빨대 쪼옵, 정찰권, 랜덤박스 등은 가방에서 바로 사용 가능합니다.\n"
+            "아이템 사용 사실은 기본적으로 숨겨지며, 효과가 발생하면 결과가 공개될 수 있습니다."
+        ),
+        inline=False
+    )
+    embeds.append(e3)
+
+    # 4. 알바
+    e4 = discord.Embed(title="📖 알바 시스템", color=discord.Color.green())
+    e4.add_field(
+        name="🧑‍💼 알바 목록 (참가비 없음, 미니게임으로 코인 획득)",
+        value=(
+            "🧹 **청소** - 20,000 : 오염물 빠르게 클릭\n"
+            "📦 **택배** - 22,000 : 주소 확인 후 상자 분류\n"
+            "🎯 **과녁** - 22,000 : 화면에 나오는 과녁 클릭\n"
+            "🍔 **패스트푸드** - 25,000 : 주문서 보고 재료 순서 맞추기\n"
+            "🏃 **배달** - 25,000 : 주어진 경로 순서대로 방문\n"
+            "🍳 **주방** - 28,000 : 레시피 암기 후 요리 제작\n"
+            "🧠 **데이터 입력** - 30,000 : 제시된 문자/숫자 정확히 입력\n"
+            "🎣 **낚시** - 30,000 : 타이밍 맞춰 낚아채기\n\n"
+            "한 판 약 10~30초, 성공도에 따라 보상 증가.\n"
+            "무한 파밍 방지를 위해 **5분 쿨타임**이 적용됩니다."
+        ),
+        inline=False
+    )
+    embeds.append(e4)
+
+    # 5. 주요 게임 규칙
+    e5 = discord.Embed(title="📖 주요 미니게임 규칙 (1)", color=discord.Color.orange())
+    e5.add_field(
+        name="🃏 블랙잭 / 마스터 블랙잭",
+        value="HIT, STAND, DOUBLE, SURRENDER 가능. 마스터 모드는 SPLIT 등 추가 규칙 포함.",
+        inline=False
+    )
+    e5.add_field(
+        name="🃏 에이스 브레이커 (핵심 심리전)",
+        value=(
+            "카드: 2~9, ACE, JOKER (여러 덱 취급)\n"
+            "3장씩 들고 높음→낮음→높음 순서로 비교.\n"
+            "ACE는 무조건 승리, 단 상대 JOKER가 있으면 ACE 패배.\n"
+            "JOKER는 ACE를 막는 용도. 멀리건 1회 가능.\n"
+            "배팅은 랜덤 순서, 후공자는 선배팅 이상 금액 제시."
+        ),
+        inline=False
+    )
+    e5.add_field(
+        name="🎲 미니 친치로",
+        value=(
+            "주사위 3개. 부모/자식 결정 후 배팅.\n"
+            "즉시 승리 조건, 족보(핀조로 10배, 고조로 5배, 아라시 3배, 시고로 2배, 히후미 손실 등) 존재."
+        ),
+        inline=False
+    )
+    e5.add_field(
+        name="🧠 인디언 포커",
+        value="자신의 카드가 자신에게 안 보이고 상대에게만 보임. BET / RAISE / FOLD 심리전.",
+        inline=False
+    )
+    embeds.append(e5)
+
+    e6 = discord.Embed(title="📖 주요 미니게임 규칙 (2)", color=discord.Color.orange())
+    e6.add_field(
+        name="🎡 룰렛 / 💣 폭탄 룰렛",
+        value=(
+            "숫자, 홀짝, 색상, 구간 등 다양한 배팅.\n"
+            "폭탄 룰렛은 안전한 칸이 점점 줄어들며 배율이 상승하는 고위험 버전."
+        ),
+        inline=False
+    )
+    e6.add_field(
+        name="🔢 홀짝 / 🎭 야바위 / 🏇 경마",
+        value=(
+            "홀짝: 최대 7라운드, 맞으면 +0.3배 / 틀리면 -0.3배 후 수수료.\n"
+            "야바위: 컵 중 당첨 보상 찾기. 난이도 조절 가능.\n"
+            "경마: 말마다 확률/배율 다름. 실시간 진행."
+        ),
+        inline=False
+    )
+    e6.add_field(
+        name="🎟️ 잭팟 복권 / 🎫 즉석복권 / 🎁 랜덤박스",
+        value=(
+            "잭팟 복권: 탈락 1분 전 추첨. 미리 번호 구매.\n"
+            "즉석복권: 구매 즉시 결과.\n"
+            "복권/상점 수익은 JACKPOT 풀로 누적.\n"
+            "랜덤박스는 0~3배 보상 가능."
+        ),
+        inline=False
+    )
+    embeds.append(e6)
+
+    # 마지막
+    e7 = discord.Embed(
+        title="📖 기타 / 명령어",
+        description=(
+            "**주요 명령어**\n"
+            "`/메인` - 게임 메인 메뉴 / 참가\n"
+            "`/다이아상점` - 시작 전 시작자금 강화 (다이아 사용)\n"
+            "`/설명서` - 이 설명서\n"
+            "`/강제종료` - 관리자용 강제 종료\n"
+            "`/테스트게임` - 혼자 테스트용 즉시 시작\n\n"
+            "**중요 알림**은 원래 채널에 공개됩니다 (탈락, 우승, 잭팟, 천사 아이템 등).\n"
+            "서버별 옵션으로 일부 시스템을 ON/OFF 할 수 있습니다."
+        ),
+        color=discord.Color.dark_grey()
+    )
+    embeds.append(e7)
+
+    await interaction.response.send_message(embeds=embeds[:10], ephemeral=True)  # Discord max 10 embeds
 
 
 # ============================================================
