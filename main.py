@@ -466,6 +466,13 @@ async def eliminate_lowest_players(game_id: int, channel: discord.TextChannel, c
 
 
 async def check_and_end_game(game_id: int, channel: discord.TextChannel):
+game = await get_game_by_id(game_id)
+    if not game:
+        return False
+
+    # 테스트 게임은 강제종료 전까지 계속 진행
+    if game["game_type"] == "money_battle_royale_test":
+        return False
     alive_count = await get_alive_count(game_id)
 
     if alive_count > 1:
