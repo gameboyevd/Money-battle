@@ -98,6 +98,7 @@ def default_game_settings():
         "elimination_interval": DEFAULT_ELIMINATION_INTERVAL,
         "job_cooldown": JOB_COOLDOWN_SECONDS,
         "treasure_hunt_enabled": True,
+        "timeout_penalty": TIMEOUT_PENALTY_SECONDS,
     }
 
 
@@ -106,14 +107,22 @@ def merge_game_settings(game_data) -> dict:
     data = parse_game_data(game_data)
     base = default_game_settings()
     for k in ("elimination_interval", "job_cooldown", "treasure_hunt_enabled",
-              "starting_money", "min_players", "next_elimination_at", "ascension"):
+              "starting_money", "min_players", "next_elimination_at", "ascension",
+              "timeout_penalty"):
         if k in data:
             base[k] = data[k]
-    # 원본의 기타 키도 보존
     for k, v in data.items():
         if k not in base:
             base[k] = v
     return base
+
+
+async def get_timeout_penalty_seconds(game_id: int) -> int:
+    game = await get_game_by_id(game_id)
+    if not game:
+        return TIMEOUT_PENALTY_SECONDS
+    settings = merge_game_settings(game["game_data"])
+    return int(settings.get("timeout_penalty", TIMEOUT_PENALTY_SECONDS))
 
 
 # ============================================================
@@ -1104,19 +1113,32 @@ class RoomSettingsModal(discord.ui.Modal, title="⚙️ 방 설정 변경"):
             max_length=3,
             required=True
         )
+        self.penalty = discord.ui.TextInput(
+            label="중퇴 패널티 시간 (분, 1~30)",
+            placeholder="예: 5",
+            default=str(max(1, int(settings.get("timeout_penalty", 300)) // 60)),
+            min_length=1,
+            max_length=2,
+            required=True
+        )
         self.add_item(self.elim)
         self.add_item(self.job_cd)
         self.add_item(self.treasure)
+        self.add_item(self.penalty)
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
             elim_m = int(self.elim.value.strip())
             job_m = int(self.job_cd.value.strip())
+            pen_m = int(self.penalty.value.strip())
             if not (1 <= elim_m <= 60):
                 await interaction.response.send_message("탈락 주기는 1~60분이어야 합니다.", ephemeral=True)
                 return
             if not (1 <= job_m <= 30):
                 await interaction.response.send_message("알바 쿨타임은 1~30분이어야 합니다.", ephemeral=True)
+                return
+            if not (1 <= pen_m <= 30):
+                await interaction.response.send_message("패널티는 1~30분이어야 합니다.", ephemeral=True)
                 return
             th_raw = self.treasure.value.strip().lower()
             if th_raw not in ("on", "off", "온", "오프", "o", "x"):
@@ -1142,6 +1164,7 @@ class RoomSettingsModal(discord.ui.Modal, title="⚙️ 방 설정 변경"):
             data["elimination_interval"] = elim_m * 60
             data["job_cooldown"] = job_m * 60
             data["treasure_hunt_enabled"] = th
+            data["timeout_penalty"] = pen_m * 60
             await connection.execute(
                 "UPDATE games SET game_data = $1::jsonb WHERE id = $2",
                 json.dumps(data), self.game_id
@@ -1154,7 +1177,8 @@ class RoomSettingsModal(discord.ui.Modal, title="⚙️ 방 설정 변경"):
             f"⚙️ 설정 저장 완료!\n"
             f"⏰ 탈락 주기: **{elim_m}분**\n"
             f"🧑‍💼 알바 충전 쿨: **{job_m}분**\n"
-            f"🗺️ 보물찾기: **{th_txt}**",
+            f"🗺️ 보물찾기: **{th_txt}**\n"
+            f"🚫 중퇴 패널티: **{pen_m}분**",
             ephemeral=True
         )
 
@@ -1294,12 +1318,14 @@ class WaitingView(discord.ui.View):
         settings = merge_game_settings(game["game_data"])
         elim_m = int(settings["elimination_interval"]) // 60
         job_m = int(settings["job_cooldown"]) // 60
+        pen_m = int(settings.get("timeout_penalty", TIMEOUT_PENALTY_SECONDS)) // 60
         th = "✅ ON" if settings.get("treasure_hunt_enabled", True) else "❌ OFF"
         embed = discord.Embed(
             title="⚙️ 방 설정",
             description=(
                 f"⏰ 탈락 주기: **{elim_m}분**\n"
                 f"🧑‍💼 알바 충전 쿨타임: **{job_m}분**\n"
+                f"🚫 중퇴 패널티: **{pen_m}분**\n"
                 f"🗺️ 보물찾기 이벤트: **{th}**\n\n"
                 f"💎 개인 추가자금은 `/다이아상점`에서 각자 구매\n"
                 f"(기본 시작자금 {STARTING_MONEY:,} + 보너스)"
@@ -3784,8 +3810,8 @@ class BlackjackView(discord.ui.View):
             return
         self.finished = True
         clear_gamble(self.user_id)
-        apply_timeout_penalty(self.user_id)
-        pen_sec = TIMEOUT_PENALTY_SECONDS
+        pen_sec = await get_timeout_penalty_seconds(self.game_id)
+        apply_timeout_penalty(self.user_id, pen_sec)
         connection = await get_db()
         try:
             await connection.execute(
@@ -4244,8 +4270,8 @@ class AceBreakerView(discord.ui.View):
         self.finished = True
         bet = self.bet
         clear_gamble(self.user_id)
-        apply_timeout_penalty(self.user_id)
-        pen_sec = TIMEOUT_PENALTY_SECONDS
+        pen_sec = await get_timeout_penalty_seconds(self.game_id)
+        apply_timeout_penalty(self.user_id, pen_sec)
         msg = "⏰ **시간 초과 중퇴!**"
         if bet > 0:
             connection = await get_db()
@@ -4694,6 +4720,866 @@ class AceBreakerStartView(discord.ui.View):
 
 
 # ============================================================
+# 멀티 게임 (블랙잭 2~4인 / 에이스브레이커 1v1)
+# ============================================================
+
+active_multi_lobbies = {}  # channel_id -> lobby view
+
+
+class MultiLobbyView(discord.ui.View):
+    """채널 모집 → 15초 후 스레드 생성 → 스레드에서 준비"""
+
+    def __init__(self, game_id, host_id, guild_id, channel_id, mode: str, min_bet: int):
+        super().__init__(timeout=20)
+        self.game_id = game_id
+        self.host_id = int(host_id)
+        self.guild_id = guild_id
+        self.channel_id = int(channel_id)
+        self.mode = mode  # "bj" | "ab"
+        self.min_bet = min_bet
+        self.max_players = 4 if mode == "bj" else 2
+        self.min_players = 2
+        self.players = []  # [{user_id, name, bet}]
+        self.started = False
+        self.cancelled = False
+        self.message = None
+        self.ends_at = datetime.utcnow() + timedelta(seconds=15)
+
+    def player_list_text(self):
+        if not self.players:
+            return "없음"
+        lines = []
+        for i, p in enumerate(self.players, 1):
+            lines.append(f"{i}. <@{p['user_id']}>")
+        return "\n".join(lines)
+
+    def build_embed(self):
+        left = max(0, int((self.ends_at - datetime.utcnow()).total_seconds()))
+        title = "🃏 멀티 블랙잭 모집" if self.mode == "bj" else "🅰️ 에이스 브레이커 1v1 모집"
+        embed = discord.Embed(
+            title=title,
+            description=(
+                f"호스트: <@{self.host_id}>\n"
+                f"인원: **{len(self.players)}/{self.max_players}** (최소 {self.min_players})\n"
+                f"⏱️ 모집 종료: **{left}초**\n"
+                f"최소 배팅: **{self.min_bet:,}**\n\n"
+                f"**참가자**\n{self.player_list_text()}"
+            ),
+            color=discord.Color.blurple()
+        )
+        embed.set_footer(text="15초 후 자동 진행 · 2명 미만이면 취소 · 인원 가득 차면 즉시 진행")
+        return embed
+
+    async def run_timer(self):
+        try:
+            while not self.started and not self.cancelled:
+                await asyncio.sleep(1)
+                left = (self.ends_at - datetime.utcnow()).total_seconds()
+                if left <= 0:
+                    await self.try_start()
+                    break
+                if self.message:
+                    try:
+                        await self.message.edit(embed=self.build_embed(), view=self)
+                    except Exception:
+                        pass
+        except asyncio.CancelledError:
+            pass
+
+    async def try_start(self):
+        if self.started or self.cancelled:
+            return
+        if len(self.players) < self.min_players:
+            self.cancelled = True
+            self.stop()
+            active_multi_lobbies.pop(self.channel_id, None)
+            if self.message:
+                try:
+                    await self.message.edit(
+                        embed=discord.Embed(
+                            title="❌ 모집 취소",
+                            description=f"인원 부족 ({len(self.players)}/{self.min_players})",
+                            color=discord.Color.dark_grey()
+                        ),
+                        view=None
+                    )
+                except Exception:
+                    pass
+            return
+        self.started = True
+        self.stop()
+        active_multi_lobbies.pop(self.channel_id, None)
+        for child in self.children:
+            child.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(embed=self.build_embed(), view=None)
+            except Exception:
+                pass
+        await self.open_thread_phase()
+
+    async def open_thread_phase(self):
+        channel = self.message.channel if self.message else None
+        if not channel:
+            return
+        mentions = " ".join(f"<@{p['user_id']}>" for p in self.players)
+        try:
+            thread = await channel.create_thread(
+                name=f"{'멀티BJ' if self.mode == 'bj' else 'AB1v1'}-{self.game_id}-{random.randint(100,999)}",
+                type=discord.ChannelType.public_thread,
+                auto_archive_duration=60
+            )
+        except Exception as e:
+            await channel.send(f"스레드 생성 실패: {e}")
+            return
+
+        ready_view = MultiThreadReadyView(
+            self.game_id, self.guild_id, self.mode, self.players, self.min_bet, thread
+        )
+        await thread.send(
+            content=(
+                f"{mentions}\n"
+                f"🎮 **멀티 게임 스레드**\n"
+                f"15초 안에 **준비완료**를 눌러주세요!\n"
+                f"전원이 준비하면 즉시 시작됩니다.\n"
+                f"_(코인·선행 등 개인 정보는 본인에게만 표시)_"
+            ),
+            embed=ready_view.build_embed(),
+            view=ready_view
+        )
+        asyncio.create_task(ready_view.run_timer())
+
+    @discord.ui.button(label="참가", emoji="✅", style=discord.ButtonStyle.success)
+    async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.started or self.cancelled:
+            await interaction.response.send_message("이미 종료된 모집입니다.", ephemeral=True)
+            return
+        uid = interaction.user.id
+        if is_user_gambling(uid) or is_timeout_penalized(uid):
+            await interaction.response.send_message("도박 중이거나 패널티 상태입니다.", ephemeral=True)
+            return
+        if any(p["user_id"] == uid for p in self.players):
+            await interaction.response.send_message("이미 참가 중입니다.", ephemeral=True)
+            return
+        if len(self.players) >= self.max_players:
+            await interaction.response.send_message("인원이 가득 찼습니다.", ephemeral=True)
+            return
+        player = await get_or_create_player(interaction.user, interaction.guild)
+        if not player["alive"] or player["eliminated"]:
+            await interaction.response.send_message("탈락자는 참가할 수 없습니다.", ephemeral=True)
+            return
+        if (player["money"] or 0) < self.min_bet:
+            await interaction.response.send_message(
+                f"코인 부족 (최소 {self.min_bet:,}). 보유: **{player['money']:,}**",
+                ephemeral=True
+            )
+            return
+        self.players.append({
+            "user_id": uid,
+            "name": interaction.user.display_name,
+            "bet": self.min_bet,
+        })
+        await interaction.response.send_message(
+            f"참가 완료! (보유 코인 **{player['money']:,}** — 본인만 확인)",
+            ephemeral=True
+        )
+        if self.message:
+            try:
+                await self.message.edit(embed=self.build_embed(), view=self)
+            except Exception:
+                pass
+        if len(self.players) >= self.max_players:
+            await self.try_start()
+
+    @discord.ui.button(label="나가기", emoji="🚪", style=discord.ButtonStyle.secondary)
+    async def leave(self, interaction: discord.Interaction, button: discord.ui.Button):
+        uid = interaction.user.id
+        before = len(self.players)
+        self.players = [p for p in self.players if p["user_id"] != uid]
+        if len(self.players) == before:
+            await interaction.response.send_message("참가 중이 아닙니다.", ephemeral=True)
+            return
+        await interaction.response.send_message("모집에서 나갔습니다.", ephemeral=True)
+        if self.message:
+            try:
+                await self.message.edit(embed=self.build_embed(), view=self)
+            except Exception:
+                pass
+
+
+class MultiThreadReadyView(discord.ui.View):
+    def __init__(self, game_id, guild_id, mode, players, min_bet, thread):
+        super().__init__(timeout=20)
+        self.game_id = game_id
+        self.guild_id = guild_id
+        self.mode = mode
+        self.players = players  # list of dicts
+        self.min_bet = min_bet
+        self.thread = thread
+        self.ready = set()
+        self.started = False
+        self.ends_at = datetime.utcnow() + timedelta(seconds=15)
+
+    def build_embed(self):
+        left = max(0, int((self.ends_at - datetime.utcnow()).total_seconds()))
+        lines = []
+        for p in self.players:
+            mark = "✅" if p["user_id"] in self.ready else "⏳"
+            lines.append(f"{mark} <@{p['user_id']}>")
+        return discord.Embed(
+            title="🎮 준비 확인",
+            description=(
+                f"⏱️ **{left}초** 남음\n"
+                f"전원 준비 시 즉시 시작\n\n" + "\n".join(lines)
+            ),
+            color=discord.Color.green()
+        )
+
+    async def run_timer(self):
+        try:
+            while not self.started:
+                await asyncio.sleep(1)
+                if (self.ends_at - datetime.utcnow()).total_seconds() <= 0:
+                    await self.begin_game()
+                    break
+        except asyncio.CancelledError:
+            pass
+
+    async def begin_game(self):
+        if self.started:
+            return
+        # 준비 안 한 사람은 제외 — 단 최소 인원 미달 시 취소
+        ready_players = [p for p in self.players if p["user_id"] in self.ready]
+        if len(ready_players) < 2:
+            # 시간 초과 시 전원 참가 가정 (입장한 것으로 간주)
+            ready_players = list(self.players)
+        if len(ready_players) < 2:
+            self.started = True
+            self.stop()
+            await self.thread.send("❌ 준비 인원 부족으로 멀티 게임이 취소되었습니다.")
+            return
+        self.started = True
+        self.stop()
+        for p in ready_players:
+            register_gamble(p["user_id"], f"멀티-{self.mode}", self.min_bet, self.thread.id, self.game_id)
+
+        if self.mode == "bj":
+            await start_multi_blackjack(self.thread, self.game_id, self.guild_id, ready_players, self.min_bet)
+        else:
+            await start_multi_ace_breaker(self.thread, self.game_id, self.guild_id, ready_players, self.min_bet)
+
+    @discord.ui.button(label="준비완료", emoji="✅", style=discord.ButtonStyle.success)
+    async def ready_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        uid = interaction.user.id
+        if not any(p["user_id"] == uid for p in self.players):
+            await interaction.response.send_message("이 게임 참가자가 아닙니다.", ephemeral=True)
+            return
+        self.ready.add(uid)
+        player = await get_player(str(uid), str(self.guild_id))
+        money = player["money"] if player else 0
+        await interaction.response.send_message(
+            f"준비 완료! (보유 **{money:,}** 코인 — 본인만 확인)",
+            ephemeral=True
+        )
+        try:
+            await interaction.message.edit(embed=self.build_embed(), view=self)
+        except Exception:
+            pass
+        if len(self.ready) >= len(self.players):
+            await self.begin_game()
+
+
+async def start_multi_blackjack(thread, game_id, guild_id, players, min_bet):
+    """멀티 블랙잭: 공통 딜러, 플레이어 순차 행동, 배팅은 min_bet 고정(선차감)"""
+    deck = create_deck(4)
+    random.shuffle(deck)
+    dealer = [deck.pop(), deck.pop()]
+    seats = []
+    connection = await get_db()
+    try:
+        for p in players:
+            ok = await connection.fetchval(
+                "UPDATE players SET money = money - $1 WHERE user_id = $2 AND money >= $1 RETURNING money",
+                min_bet, str(p["user_id"])
+            )
+            if ok is None:
+                await thread.send(f"<@{p['user_id']}> 코인 부족으로 제외됩니다.")
+                clear_gamble(p["user_id"])
+                continue
+            seats.append({
+                "user_id": p["user_id"],
+                "name": p["name"],
+                "bet": min_bet,
+                "hand": [deck.pop(), deck.pop()],
+                "done": False,
+                "bust": False,
+                "stand": False,
+            })
+    finally:
+        await connection.close()
+
+    if len(seats) < 2:
+        await thread.send("유효 플레이어 부족으로 취소. 차감된 배팅은 반환됩니다.")
+        for s in seats:
+            connection = await get_db()
+            try:
+                await connection.execute(
+                    "UPDATE players SET money = money + $1 WHERE user_id = $2",
+                    s["bet"], str(s["user_id"])
+                )
+            finally:
+                await connection.close()
+            clear_gamble(s["user_id"])
+        return
+
+    view = MultiBlackjackTableView(game_id, guild_id, deck, dealer, seats, thread)
+    msg = await thread.send(embed=view.build_embed(), view=view)
+    view.message = msg
+
+
+class MultiBlackjackTableView(discord.ui.View):
+    def __init__(self, game_id, guild_id, deck, dealer, seats, thread):
+        super().__init__(timeout=90)
+        self.game_id = game_id
+        self.guild_id = guild_id
+        self.deck = deck
+        self.dealer = dealer
+        self.seats = seats
+        self.thread = thread
+        self.turn = 0  # seat index
+        self.finished = False
+        self.message = None
+        self._sync_buttons()
+
+    def current(self):
+        while self.turn < len(self.seats) and self.seats[self.turn]["done"]:
+            self.turn += 1
+        if self.turn >= len(self.seats):
+            return None
+        return self.seats[self.turn]
+
+    def _sync_buttons(self):
+        self.clear_items()
+        hit = discord.ui.Button(label="HIT", emoji="🃏", style=discord.ButtonStyle.primary)
+        stand = discord.ui.Button(label="STAND", emoji="✋", style=discord.ButtonStyle.secondary)
+        hit.callback = self.on_hit
+        stand.callback = self.on_stand
+        self.add_item(hit)
+        self.add_item(stand)
+
+    def build_embed(self, reveal=False):
+        cur = self.current()
+        embed = discord.Embed(
+            title="🃏 멀티 블랙잭",
+            description="공개 진행 · 본인 차례에만 버튼 사용",
+            color=discord.Color.dark_green()
+        )
+        if reveal:
+            embed.add_field(
+                name=f"딜러 (합 {hand_value(self.dealer)})",
+                value=f"**{format_hand(self.dealer)}**",
+                inline=False
+            )
+        else:
+            embed.add_field(
+                name="딜러",
+                value=f"**{self.dealer[0]}** + 🂠",
+                inline=False
+            )
+        for i, s in enumerate(self.seats):
+            status = ""
+            if s["bust"]:
+                status = " — 💥버스트"
+            elif s["stand"] or s["done"]:
+                status = " — ✋스탠드"
+            elif cur and cur["user_id"] == s["user_id"]:
+                status = " — ▶️ 차례"
+            val = hand_value(s["hand"])
+            embed.add_field(
+                name=f"{s['name']}{status}",
+                value=f"**{format_hand(s['hand'])}** (합 {val}) · 배팅 {s['bet']:,}",
+                inline=False
+            )
+        if cur and not reveal:
+            embed.set_footer(text=f"현재 차례: {cur['name']}")
+        return embed
+
+    async def on_hit(self, interaction: discord.Interaction):
+        cur = self.current()
+        if not cur or interaction.user.id != cur["user_id"]:
+            await interaction.response.send_message("당신 차례가 아닙니다.", ephemeral=True)
+            return
+        cur["hand"].append(self.deck.pop())
+        if hand_value(cur["hand"]) > 21:
+            cur["bust"] = True
+            cur["done"] = True
+            self.turn += 1
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+        if self.current() is None:
+            await self.finish(interaction)
+
+    async def on_stand(self, interaction: discord.Interaction):
+        cur = self.current()
+        if not cur or interaction.user.id != cur["user_id"]:
+            await interaction.response.send_message("당신 차례가 아닙니다.", ephemeral=True)
+            return
+        cur["stand"] = True
+        cur["done"] = True
+        self.turn += 1
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+        if self.current() is None:
+            await self.finish(interaction)
+
+    async def on_timeout(self):
+        if self.finished:
+            return
+        # 현재 턴 플레이어 자동 스탠드/패, 패널티
+        cur = self.current()
+        while cur:
+            cur["done"] = True
+            cur["stand"] = True
+            pen = await get_timeout_penalty_seconds(self.game_id)
+            apply_timeout_penalty(cur["user_id"], pen)
+            self.turn += 1
+            cur = self.current()
+        await self.finish(None)
+
+    async def finish(self, interaction):
+        if self.finished:
+            return
+        self.finished = True
+        self.stop()
+        # 딜러 플레이
+        while hand_value(self.dealer) < 17:
+            self.dealer.append(self.deck.pop())
+        d_val = hand_value(self.dealer)
+        d_bust = d_val > 21
+        results = []
+        connection = await get_db()
+        try:
+            for s in self.seats:
+                clear_gamble(s["user_id"])
+                p_val = hand_value(s["hand"])
+                if s["bust"]:
+                    outcome = "패"
+                    payout = 0
+                elif d_bust or p_val > d_val:
+                    outcome = "승"
+                    payout = s["bet"] * 2
+                elif p_val == d_val:
+                    outcome = "무"
+                    payout = s["bet"]
+                else:
+                    outcome = "패"
+                    payout = 0
+                if payout > 0:
+                    await connection.execute(
+                        "UPDATE players SET money = money + $1 WHERE user_id = $2",
+                        payout, str(s["user_id"])
+                    )
+                else:
+                    await connection.execute(
+                        "UPDATE players SET last_money_loss = $1 WHERE user_id = $2",
+                        s["bet"], str(s["user_id"])
+                    )
+                results.append(f"<@{s['user_id']}> {outcome} (합{p_val}) → {'+'+format(payout,',') if payout else '-'+format(s['bet'],',')}")
+        finally:
+            await connection.close()
+
+        embed = self.build_embed(reveal=True)
+        embed.add_field(name="정산", value="\n".join(results), inline=False)
+        if interaction:
+            try:
+                await interaction.edit_original_response(embed=embed, view=None)
+            except Exception:
+                try:
+                    await interaction.message.edit(embed=embed, view=None)
+                except Exception:
+                    await self.thread.send(embed=embed)
+        elif self.message:
+            try:
+                await self.message.edit(embed=embed, view=None)
+            except Exception:
+                await self.thread.send(embed=embed)
+
+
+async def start_multi_ace_breaker(thread, game_id, guild_id, players, min_bet):
+    """1v1: 선 랜덤 → 선 3장+멀리건 → 후 3장+멀리건 → 선배팅 → 후배팅(이상)"""
+    if len(players) < 2:
+        await thread.send("인원 부족")
+        return
+    a, b = players[0], players[1]
+    if random.random() < 0.5:
+        first, second = a, b
+    else:
+        first, second = b, a
+
+    view = MultiAceBreakerView(game_id, guild_id, first, second, min_bet, thread)
+    msg = await thread.send(
+        content=(
+            f"🅰️ **에이스 브레이커 1v1**\n"
+            f"선(먼저 뽑기·선배팅): <@{first['user_id']}>\n"
+            f"후: <@{second['user_id']}>\n"
+            f"상대 패는 비공개입니다."
+        ),
+        embed=view.build_embed(),
+        view=view
+    )
+    view.message = msg
+
+
+class MultiAceBreakerView(discord.ui.View):
+    """
+    phase: first_draw → first_mull → second_draw → second_mull → first_bet → second_bet → resolve
+    """
+    def __init__(self, game_id, guild_id, first, second, min_bet, thread):
+        super().__init__(timeout=180)
+        self.game_id = game_id
+        self.guild_id = guild_id
+        self.first = first
+        self.second = second
+        self.min_bet = min_bet
+        self.thread = thread
+        self.message = None
+        self.phase = "first_draw"
+        self.draw_i = 0
+        self.pool = _ab_make_pool()
+        self.cards = {
+            first["user_id"]: [None, None, None],
+            second["user_id"]: [None, None, None],
+        }
+        self.joker = {first["user_id"]: False, second["user_id"]: False}
+        self.mull_used = {first["user_id"]: False, second["user_id"]: False}
+        self.bets = {first["user_id"]: 0, second["user_id"]: 0}
+        self.finished = False
+        self._rebuild()
+
+    def _active_uid(self):
+        if self.phase.startswith("first"):
+            return self.first["user_id"]
+        if self.phase.startswith("second"):
+            return self.second["user_id"]
+        return None
+
+    def _rebuild(self):
+        self.clear_items()
+        if self.phase in ("first_draw", "second_draw"):
+            n = self.draw_i + 1
+            btn = discord.ui.Button(label=f"{n}번째 카드 뽑기", emoji="🃏", style=discord.ButtonStyle.primary)
+            btn.callback = self.on_draw
+            self.add_item(btn)
+        elif self.phase in ("first_mull", "second_mull"):
+            y = discord.ui.Button(label="멀리건", emoji="🔄", style=discord.ButtonStyle.danger)
+            n = discord.ui.Button(label="이 패로", emoji="✅", style=discord.ButtonStyle.success)
+            y.callback = self.on_mull_yes
+            n.callback = self.on_mull_no
+            self.add_item(y)
+            self.add_item(n)
+        elif self.phase in ("first_bet", "second_bet"):
+            btn = discord.ui.Button(label="배팅하기", emoji="💰", style=discord.ButtonStyle.success)
+            btn.callback = self.on_bet_click
+            self.add_item(btn)
+
+    def build_embed(self):
+        embed = discord.Embed(title="🅰️ 에이스 브레이커 1v1", color=discord.Color.purple())
+        for uid, label in ((self.first["user_id"], "선"), (self.second["user_id"], "후")):
+            cards = self.cards[uid]
+            # 본인/공개 전에는 상대 패 숨김 — 공개 임베드에서는 진행 중인 사람만 표시
+            if uid == self._active_uid() or self.phase == "resolve":
+                shown = self._hand_str(cards, self.joker[uid], hide=False)
+            else:
+                shown = "🂠 | 🂠 | 🂠" if any(c is None for c in cards) else "🂠 | 🂠 | 🂠 (비공개)"
+                # 자기 패는 뽑은 만큼만 본인에게 ephemeral로 알려줌
+                if all(c is not None for c in cards) and self.phase not in ("first_bet", "second_bet", "resolve"):
+                    shown = "🂠 | 🂠 | 🂠 (비공개)"
+            bet = self.bets[uid]
+            embed.add_field(
+                name=f"{label} <@{uid}>" + (f" · 배팅 {bet:,}" if bet else ""),
+                value=shown,
+                inline=False
+            )
+        embed.add_field(name="단계", value=self.phase, inline=True)
+        embed.set_footer(text="상대 패 비공개 · 선배팅 후 후자는 그 이상만 배팅")
+        return embed
+
+    def _hand_str(self, cards, has_joker, hide=False):
+        if hide:
+            return "🂠 | 🂠 | 🂠"
+        parts = []
+        for c in cards:
+            if c is None:
+                parts.append("?")
+            else:
+                parts.append(_ab_card_str(c))
+        s = " | ".join(parts)
+        if has_joker:
+            s += " + 🃏"
+        return s
+
+    async def _only_active(self, interaction):
+        uid = self._active_uid()
+        if interaction.user.id != uid:
+            await interaction.response.send_message("당신 차례가 아닙니다.", ephemeral=True)
+            return False
+        return True
+
+    async def on_draw(self, interaction: discord.Interaction):
+        if not await self._only_active(interaction):
+            return
+        uid = interaction.user.id
+        card, got_joker = _ab_draw_one_normal(self.pool, self.joker[uid])
+        if got_joker:
+            self.joker[uid] = True
+        self.cards[uid][self.draw_i] = card
+        self.draw_i += 1
+        private = self._hand_str(self.cards[uid], self.joker[uid])
+        if self.draw_i >= 3:
+            self.draw_i = 0
+            if self.phase == "first_draw":
+                self.phase = "first_mull"
+            else:
+                self.phase = "second_mull"
+            self._rebuild()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+        await interaction.followup.send(f"당신의 패: **{private}**", ephemeral=True)
+
+    async def on_mull_yes(self, interaction: discord.Interaction):
+        if not await self._only_active(interaction):
+            return
+        uid = interaction.user.id
+        if self.mull_used[uid]:
+            await interaction.response.send_message("이미 멀리건 사용", ephemeral=True)
+            return
+        self.mull_used[uid] = True
+        self.cards[uid] = [None, None, None]
+        self.joker[uid] = False
+        self.pool = _ab_make_pool()
+        self.draw_i = 0
+        self.phase = "first_draw" if uid == self.first["user_id"] else "second_draw"
+        self._rebuild()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def on_mull_no(self, interaction: discord.Interaction):
+        if not await self._only_active(interaction):
+            return
+        uid = interaction.user.id
+        if uid == self.first["user_id"]:
+            self.phase = "second_draw"
+            self.draw_i = 0
+        else:
+            self.phase = "first_bet"
+        self._rebuild()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def on_bet_click(self, interaction: discord.Interaction):
+        if not await self._only_active(interaction):
+            return
+        min_req = self.min_bet
+        if self.phase == "second_bet":
+            min_req = max(self.min_bet, self.bets[self.first["user_id"]])
+        modal = MultiABBetModal(self, min_req)
+        await interaction.response.send_modal(modal)
+
+    async def apply_bet(self, interaction, amount: int):
+        uid = interaction.user.id
+        connection = await get_db()
+        try:
+            ok = await connection.fetchval(
+                "UPDATE players SET money = money - $1 WHERE user_id = $2 AND money >= $1 RETURNING money",
+                amount, str(uid)
+            )
+            if ok is None:
+                await interaction.response.send_message("코인 부족", ephemeral=True)
+                return
+        finally:
+            await connection.close()
+        self.bets[uid] = amount
+        if uid in active_gambles:
+            active_gambles[uid]["bet"] = amount
+        if self.phase == "first_bet":
+            self.phase = "second_bet"
+            self._rebuild()
+            await interaction.response.edit_message(embed=self.build_embed(), view=self)
+            await interaction.followup.send(f"선배팅 **{amount:,}** 확정 (보유는 본인만)", ephemeral=True)
+        else:
+            await self.resolve(interaction)
+
+    async def resolve(self, interaction):
+        self.finished = True
+        self.phase = "resolve"
+        self.stop()
+        f_uid, s_uid = self.first["user_id"], self.second["user_id"]
+        # 비교: 3라운드 높낮높
+        want = [True, False, True]
+        fw = fl = 0
+        detail = []
+        f_j, s_j = self.joker[f_uid], self.joker[s_uid]
+        for i in range(3):
+            fc, sc = self.cards[f_uid][i], self.cards[s_uid][i]
+            # ACE / JOKER
+            if sc == "A" and f_j:
+                f_j = False
+                out = "first"
+            elif fc == "A" and s_j:
+                s_j = False
+                out = "second"
+            elif fc == "A" and sc == "A":
+                out = "draw"
+            elif fc == "A":
+                out = "first"
+            elif sc == "A":
+                out = "second"
+            elif fc == sc:
+                out = "draw"
+            elif want[i]:
+                out = "first" if int(fc) > int(sc) else "second"
+            else:
+                out = "first" if int(fc) < int(sc) else "second"
+            if out == "first":
+                fw += 1
+            elif out == "second":
+                fl += 1
+            detail.append(f"{i+1}R: {_ab_card_str(fc)} vs {_ab_card_str(sc)} → {out}")
+
+        # 정산: 각자 배팅. 승자가 상대 배팅만큼 획득 (간단 포트)
+        pot = self.bets[f_uid] + self.bets[s_uid]
+        if fw > fl:
+            winner, loser = f_uid, s_uid
+        elif fl > fw:
+            winner, loser = s_uid, f_uid
+        else:
+            winner = None
+
+        connection = await get_db()
+        try:
+            if winner is None:
+                # 환불
+                for uid in (f_uid, s_uid):
+                    await connection.execute(
+                        "UPDATE players SET money = money + $1 WHERE user_id = $2",
+                        self.bets[uid], str(uid)
+                    )
+                result = "🤝 동점 — 배팅 반환"
+            else:
+                await connection.execute(
+                    "UPDATE players SET money = money + $1 WHERE user_id = $2",
+                    pot, str(winner)
+                )
+                await connection.execute(
+                    "UPDATE players SET last_money_loss = $1 WHERE user_id = $2",
+                    self.bets[loser], str(loser)
+                )
+                result = f"🎉 승자: <@{winner}> (팟 **{pot:,}**)"
+        finally:
+            await connection.close()
+
+        clear_gamble(f_uid)
+        clear_gamble(s_uid)
+        embed = discord.Embed(
+            title="🅰️ 1v1 결과",
+            description=result + "\n\n" + "\n".join(detail),
+            color=discord.Color.gold()
+        )
+        embed.add_field(
+            name=f"선 <@{f_uid}>",
+            value=self._hand_str(self.cards[f_uid], self.joker[f_uid]),
+            inline=False
+        )
+        embed.add_field(
+            name=f"후 <@{s_uid}>",
+            value=self._hand_str(self.cards[s_uid], self.joker[s_uid]),
+            inline=False
+        )
+        try:
+            await interaction.response.edit_message(content=None, embed=embed, view=None)
+        except Exception:
+            await self.thread.send(embed=embed)
+
+    async def on_timeout(self):
+        if self.finished:
+            return
+        self.finished = True
+        pen = await get_timeout_penalty_seconds(self.game_id)
+        for uid in (self.first["user_id"], self.second["user_id"]):
+            apply_timeout_penalty(uid, pen)
+            clear_gamble(uid)
+            if self.bets.get(uid, 0) == 0:
+                continue
+            # 배팅된 금액은 이미 차감됨 → 몰수
+        if self.message:
+            try:
+                await self.message.edit(
+                    content="⏰ 시간 초과로 멀티 AB 종료 (중퇴 패널티 적용)",
+                    view=None
+                )
+            except Exception:
+                pass
+
+
+class MultiABBetModal(discord.ui.Modal, title="💰 멀티 AB 배팅"):
+    def __init__(self, parent: MultiAceBreakerView, min_req: int):
+        super().__init__()
+        self.parent = parent
+        self.min_req = min_req
+        self.amount = discord.ui.TextInput(
+            label=f"배팅액 (최소 {min_req:,})",
+            placeholder=str(min_req),
+            required=True
+        )
+        self.add_item(self.amount)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            bet = int(self.amount.value.replace(",", "").strip())
+            if bet < self.min_req:
+                await interaction.response.send_message(
+                    f"최소 **{self.min_req:,}** 이상이어야 합니다.", ephemeral=True
+                )
+                return
+        except ValueError:
+            await interaction.response.send_message("숫자만 입력", ephemeral=True)
+            return
+        await self.parent.apply_bet(interaction, bet)
+
+
+class MultiMenuView(discord.ui.View):
+    def __init__(self, game_id):
+        super().__init__(timeout=60)
+        self.game_id = game_id
+
+    @discord.ui.button(label="멀티 블랙잭 (2~4인)", emoji="🃏", style=discord.ButtonStyle.primary)
+    async def multi_bj(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._open_lobby(interaction, "bj", 10_000)
+
+    @discord.ui.button(label="에이스 브레이커 1v1", emoji="🅰️", style=discord.ButtonStyle.primary)
+    async def multi_ab(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._open_lobby(interaction, "ab", 20_000)
+
+    async def _open_lobby(self, interaction, mode, min_bet):
+        ch_id = interaction.channel.id
+        if active_multi_lobbies.get(ch_id):
+            await interaction.response.send_message("이미 모집 중인 멀티 게임이 있습니다.", ephemeral=True)
+            return
+        if is_user_gambling(interaction.user.id) or is_timeout_penalized(interaction.user.id):
+            await interaction.response.send_message("도박 중이거나 패널티 상태입니다.", ephemeral=True)
+            return
+        lobby = MultiLobbyView(
+            self.game_id, interaction.user.id, interaction.guild.id, ch_id, mode, min_bet
+        )
+        # 호스트 자동 참가
+        lobby.players.append({
+            "user_id": interaction.user.id,
+            "name": interaction.user.display_name,
+            "bet": min_bet,
+        })
+        active_multi_lobbies[ch_id] = lobby
+        msg = await interaction.channel.send(embed=lobby.build_embed(), view=lobby)
+        lobby.message = msg
+        asyncio.create_task(lobby.run_timer())
+        await interaction.response.send_message("멀티 모집을 시작했습니다. (채널 공개)", ephemeral=True)
+
+
+# ============================================================
 # 게임 선택 메뉴
 # ============================================================
 
@@ -4702,7 +5588,7 @@ class GameSelectView(discord.ui.View):
         super().__init__(timeout=120)
         self.game_id = game_id
 
-    @discord.ui.button(label="블랙잭", emoji="🃏", style=discord.ButtonStyle.primary, row=0)
+    @discord.ui.button(label="블랙잭 (싱글)", emoji="🃏", style=discord.ButtonStyle.primary, row=0)
     async def blackjack(self, interaction: discord.Interaction, button: discord.ui.Button):
         if is_user_gambling(interaction.user.id):
             sess = active_gambles[int(interaction.user.id)]
@@ -4721,6 +5607,25 @@ class GameSelectView(discord.ui.View):
             return
         modal = BlackjackBetModal(self.game_id)
         await interaction.response.send_modal(modal)
+
+    @discord.ui.button(label="멀티 게임", emoji="👥", style=discord.ButtonStyle.success, row=1)
+    async def multi(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if is_user_gambling(interaction.user.id) or is_timeout_penalized(interaction.user.id):
+            await interaction.response.send_message(
+                "도박 중이거나 패널티 상태에서는 멀티 모집을 열 수 없습니다.",
+                ephemeral=True
+            )
+            return
+        embed = discord.Embed(
+            title="👥 멀티 게임",
+            description=(
+                "**멀티 블랙잭** — 2~4인, 15초 모집 후 스레드에서 진행\n"
+                "**에이스 브레이커 1v1** — 선/후 랜덤, 상대 패 비공개, 선배팅\n\n"
+                "모집 완료 → 스레드 생성 → 15초 준비 → 전원 준비 시 즉시 시작"
+            ),
+            color=discord.Color.blurple()
+        )
+        await interaction.response.send_message(embed=embed, view=MultiMenuView(self.game_id), ephemeral=True)
 
     @discord.ui.button(label="에이스 브레이커", emoji="🅰️", style=discord.ButtonStyle.primary, row=0)
     async def ace_breaker(self, interaction: discord.Interaction, button: discord.ui.Button):
