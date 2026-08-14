@@ -44,22 +44,227 @@ active_elimination_tasks = {}  # game_id: asyncio.Task
 active_gambles = {}
 
 
-def is_user_gambling(user_id: int) -> bool:
-    return int(user_id) in active_gambles
+def _gamble_key(user_id, guild_id=None) -> str:
+    """서버별 도박 세션 키. guild 없으면 user만 (레거시)."""
+    if guild_id is not None:
+        return f"{int(guild_id)}:{int(user_id)}"
+    return str(int(user_id))
 
 
-def register_gamble(user_id: int, gtype: str, bet: int, channel_id: int, game_id: int):
-    active_gambles[int(user_id)] = {
+def is_user_gambling(user_id: int, guild_id=None) -> bool:
+    if guild_id is not None:
+        return _gamble_key(user_id, guild_id) in active_gambles
+    uid = str(int(user_id))
+    if uid in active_gambles:
+        return True
+    return any(k.endswith(":" + uid) or k == uid for k in active_gambles)
+
+
+def get_gamble_session(user_id: int, guild_id=None):
+    if guild_id is not None:
+        return active_gambles.get(_gamble_key(user_id, guild_id))
+    uid = str(int(user_id))
+    if uid in active_gambles:
+        return active_gambles[uid]
+    for k, v in active_gambles.items():
+        if k.endswith(":" + uid) or k == uid:
+            return v
+    return None
+
+
+def register_gamble(user_id: int, gtype: str, bet: int, channel_id: int, game_id: int, state: dict = None, guild_id=None):
+    key = _gamble_key(user_id, guild_id)
+    active_gambles[key] = {
         "type": gtype,
-        "bet": bet,
-        "channel_id": int(channel_id),
+        "bet": int(bet or 0),
+        "channel_id": int(channel_id) if channel_id else 0,
         "game_id": game_id,
-        "started_at": datetime.utcnow(),
+        "guild_id": int(guild_id) if guild_id else None,
+        "user_id": int(user_id),
+        "started_at": datetime.utcnow().isoformat(),
+        "state": state or {},
     }
+    asyncio.create_task(persist_active_gambles())
 
 
-def clear_gamble(user_id: int):
-    active_gambles.pop(int(user_id), None)
+def update_gamble_state(user_id: int, guild_id=None, **kwargs):
+    sess = get_gamble_session(user_id, guild_id)
+    if not sess:
+        # try without guild
+        sess = get_gamble_session(user_id, None)
+    if not sess:
+        return
+    if "state" in kwargs and isinstance(kwargs["state"], dict):
+        sess["state"] = kwargs.pop("state")
+    for k, v in kwargs.items():
+        if k == "state_patch" and isinstance(v, dict):
+            sess.setdefault("state", {}).update(v)
+        else:
+            sess[k] = v
+    asyncio.create_task(persist_active_gambles())
+
+
+def clear_gamble(user_id: int, guild_id=None):
+    if guild_id is not None:
+        active_gambles.pop(_gamble_key(user_id, guild_id), None)
+    else:
+        uid = str(int(user_id))
+        active_gambles.pop(uid, None)
+        active_gambles.pop(int(user_id), None)
+        for k in list(active_gambles.keys()):
+            if str(k).endswith(":" + uid):
+                active_gambles.pop(k, None)
+    asyncio.create_task(persist_active_gambles())
+
+
+async def persist_active_gambles():
+    data = {}
+    for uid, s in active_gambles.items():
+        data[str(uid)] = {
+            "type": s.get("type"),
+            "bet": s.get("bet", 0),
+            "channel_id": s.get("channel_id"),
+            "game_id": s.get("game_id"),
+            "guild_id": s.get("guild_id"),
+            "started_at": s.get("started_at"),
+            "state": s.get("state") or {},
+        }
+    await kv_set("active_gambles", data)
+
+
+async def load_active_gambles():
+    data = await kv_get("active_gambles", {})
+    active_gambles.clear()
+    if not isinstance(data, dict):
+        return
+    for uid, s in data.items():
+        try:
+            active_gambles[int(uid)] = {
+                "type": s.get("type"),
+                "bet": int(s.get("bet") or 0),
+                "channel_id": int(s.get("channel_id") or 0),
+                "game_id": s.get("game_id"),
+                "guild_id": s.get("guild_id"),
+                "started_at": s.get("started_at"),
+                "state": s.get("state") or {},
+            }
+        except Exception:
+            continue
+
+
+class GambleReconnectView(discord.ui.View):
+    """싱글 도박 재접속: UI 복원 또는 포기"""
+    def __init__(self, user_id: int, game_id: int, guild_id=None):
+        super().__init__(timeout=90)
+        self.user_id = int(user_id)
+        self.game_id = game_id
+        self.guild_id = guild_id
+
+    @discord.ui.button(label="이어서 하기", emoji="▶️", style=discord.ButtonStyle.success)
+    async def resume(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("본인만 가능합니다.", ephemeral=True)
+            return
+        gid = self.guild_id or (interaction.guild.id if interaction.guild else None)
+        if not is_user_gambling(self.user_id, gid):
+            await interaction.response.edit_message(content="세션이 없습니다.", view=None)
+            return
+        sess = get_gamble_session(self.user_id, gid) or {}
+        ok = await resume_single_gamble(interaction, sess)
+        if not ok:
+            try:
+                await interaction.response.send_message(
+                    "이 유형은 자동 복원이 어렵습니다. **포기**를 사용하세요.",
+                    ephemeral=True
+                )
+            except Exception:
+                pass
+
+    @discord.ui.button(label="포기 (배팅 몰수)", emoji="🏳️", style=discord.ButtonStyle.danger)
+    async def forfeit(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("본인만 가능합니다.", ephemeral=True)
+            return
+        gid = self.guild_id or (interaction.guild.id if interaction.guild else None)
+        if not is_user_gambling(self.user_id, gid):
+            await interaction.response.edit_message(content="이미 종료된 세션입니다.", view=None)
+            return
+        sess = get_gamble_session(self.user_id, gid) or {}
+        bet = int(sess.get("bet") or 0)
+        ch = int(sess.get("channel_id") or (interaction.channel.id if interaction.channel else 0))
+        clear_gamble(self.user_id, gid)
+        if bet > 0:
+            await _lose_to_jackpot(self.user_id, bet, ch)
+        pen = await get_timeout_penalty_seconds(self.game_id)
+        apply_timeout_penalty(self.user_id, pen, gid)
+        await interaction.response.edit_message(
+            content=f"🏳️ 도박 포기. 배팅 {bet:,} → JACKPOT · 패널티 {format_seconds(pen)}",
+            view=None
+        )
+
+
+async def resume_single_gamble(interaction: discord.Interaction, sess: dict) -> bool:
+    """직렬화 상태로 싱글 UI 재생성. response 완료 시 True."""
+    gtype = sess.get("type") or ""
+    bet = int(sess.get("bet") or 0)
+    game_id = sess.get("game_id")
+    channel_id = int(sess.get("channel_id") or 0)
+    guild_id = interaction.guild.id if interaction.guild else 0
+    user_id = interaction.user.id
+    st = sess.get("state") or {}
+
+    try:
+        if gtype == "홀짝":
+            v = OddEvenView(game_id, user_id, guild_id, bet, channel_id)
+            v.rate = float(st.get("rate", 1.0))
+            v.round = int(st.get("round", 1))
+            v.win_streak = int(st.get("win_streak", 0))
+            v.lose_streak = int(st.get("lose_streak", 0))
+            await interaction.response.send_message(
+                content="▶️ 홀짝 재개", embed=v.build_embed(), view=v, ephemeral=True
+            )
+            return True
+        if gtype == "폭탄룰렛":
+            v = BombRouletteView(game_id, user_id, guild_id, bet, channel_id)
+            v.step = int(st.get("step", 0))
+            v.earned_mult = float(st.get("earned_mult", 1.0))
+            v._deal_round()
+            await interaction.response.send_message(
+                content="▶️ 폭탄 룰렛 재개", embed=v.build_embed(), view=v, ephemeral=True
+            )
+            return True
+        if gtype == "야바위":
+            cups = int(st.get("cups", 3))
+            mult = float(st.get("mult", 2.5))
+            v = YabawiView(game_id, user_id, guild_id, bet, channel_id, cups, mult)
+            await interaction.response.send_message(
+                content="▶️ 야바위 재개", view=v, ephemeral=True
+            )
+            return True
+        if gtype == "친치로":
+            v = ChinchiroView(game_id, user_id, guild_id, bet, channel_id)
+            await interaction.response.send_message(embed=v.build_embed(), view=v, ephemeral=True)
+            return True
+        if gtype == "인디언포커":
+            v = IndianPokerView(game_id, user_id, guild_id, bet, channel_id)
+            if st.get("my_card"):
+                v.my_card = int(st["my_card"])
+            if st.get("bot_card"):
+                v.bot_card = int(st["bot_card"])
+            await interaction.response.send_message(embed=v.build_embed(), view=v, ephemeral=True)
+            return True
+        if gtype == "룰렛":
+            v = RouletteBetSelect(game_id, user_id, guild_id, bet, channel_id)
+            await interaction.response.send_message("▶️ 룰렛 재개", view=v, ephemeral=True)
+            return True
+        if gtype == "경마":
+            v = HorseRaceView(game_id, user_id, guild_id, bet, channel_id)
+            await interaction.response.send_message("▶️ 경마 재개", view=v, ephemeral=True)
+            return True
+    except Exception as e:
+        print("resume_single_gamble", e)
+        return False
+    return False
 
 
 # 시간 초과 중퇴 패널티: user_id -> datetime (이 시각까지 도박/알바 불가)
@@ -67,28 +272,40 @@ TIMEOUT_PENALTY_SECONDS = 5 * 60  # 기본 5분
 timeout_penalties = {}
 
 
-def apply_timeout_penalty(user_id: int, seconds: int = None):
+def apply_timeout_penalty(user_id: int, seconds: int = None, guild_id=None):
     sec = seconds if seconds is not None else TIMEOUT_PENALTY_SECONDS
-    timeout_penalties[int(user_id)] = datetime.utcnow() + timedelta(seconds=sec)
+    key = f"{int(guild_id)}:{int(user_id)}" if guild_id is not None else int(user_id)
+    timeout_penalties[key] = datetime.utcnow() + timedelta(seconds=sec)
 
 
-def get_penalty_remaining(user_id: int) -> int:
-    until = timeout_penalties.get(int(user_id))
+def get_penalty_remaining(user_id: int, guild_id=None) -> int:
+    keys = []
+    if guild_id is not None:
+        keys.append(f"{int(guild_id)}:{int(user_id)}")
+    keys.append(int(user_id))
+    until = None
+    used_key = None
+    for k in keys:
+        if k in timeout_penalties:
+            until = timeout_penalties[k]
+            used_key = k
+            break
     if not until:
         return 0
     left = int((until - datetime.utcnow()).total_seconds())
     if left <= 0:
-        timeout_penalties.pop(int(user_id), None)
+        timeout_penalties.pop(used_key, None)
         return 0
     return left
 
 
-def is_timeout_penalized(user_id: int) -> bool:
-    return get_penalty_remaining(user_id) > 0
+def is_timeout_penalized(user_id: int, guild_id=None) -> bool:
+    return get_penalty_remaining(user_id, guild_id) > 0
 
 
-def action_lock(user_id: int):
-    return _user_locks[user_id]
+def action_lock(user_id: int, guild_id=None):
+    key = f"{guild_id}:{user_id}" if guild_id is not None else user_id
+    return _user_locks[key]
 
 
 def default_game_settings():
@@ -157,8 +374,20 @@ SHOP_ITEMS = {
     },
     "랜덤박스": {
         "emoji": "🎁",
-        "price": 400_000,
-        "desc": "개봉 시 코인/다이아/아이템/꽝이 나옵니다. (0~3배)",
+        "price": 200_000,
+        "desc": "개봉 시 0~3배 코인/다이아/아이템. 실패분 JACKPOT 적립.",
+        "type": "consumable"
+    },
+    "잭팟 복권": {
+        "emoji": "🎟️",
+        "price": 100_000,
+        "desc": "번호 5개 구매. 탈락 1분 전 추첨 (1~99 중 15개).",
+        "type": "consumable"
+    },
+    "즉석복권": {
+        "emoji": "🎫",
+        "price": 10_000,
+        "desc": "구매 후 가방에서 「긁기」. 결과 즉시 확인.",
         "type": "consumable"
     },
     "밑장빼기권": {
@@ -289,7 +518,7 @@ async def get_db():
 
 
 async def init_db():
-    """필요한 컬럼이 없으면 추가 (idempotent)"""
+    """필요한 컬럼/테이블이 없으면 추가 (idempotent)"""
     connection = await get_db()
     try:
         await connection.execute("""
@@ -300,12 +529,10 @@ async def init_db():
             ALTER TABLE players
             ADD COLUMN IF NOT EXISTS bonus_starting_money INTEGER DEFAULT 0;
         """)
-        # points 컬럼이 없을 수도 있으니 안전하게
         await connection.execute("""
             ALTER TABLE players
             ADD COLUMN IF NOT EXISTS points INTEGER DEFAULT 0;
         """)
-        # 천사의 상점 관련
         await connection.execute("""
             ALTER TABLE players
             ADD COLUMN IF NOT EXISTS angel_item TEXT DEFAULT NULL;
@@ -318,9 +545,51 @@ async def init_db():
             ALTER TABLE players
             ADD COLUMN IF NOT EXISTS cupid_link_user_id TEXT DEFAULT NULL;
         """)
-        print("DB schema check completed (inventory, bonus_starting_money, angel fields)")
+        # 영속 상태: JACKPOT / 복권 / 알바 / 싱글 도박 세션
+        await connection.execute("""
+            CREATE TABLE IF NOT EXISTS bot_kv (
+                key TEXT PRIMARY KEY,
+                value JSONB NOT NULL DEFAULT '{}'::jsonb,
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            );
+        """)
+        print("DB schema check completed (+ bot_kv)")
     except Exception as e:
         print(f"DB init warning: {type(e).__name__}: {e}")
+    finally:
+        await connection.close()
+
+
+async def kv_get(key: str, default=None):
+    connection = await get_db()
+    try:
+        row = await connection.fetchrow("SELECT value FROM bot_kv WHERE key = $1", key)
+        if not row:
+            return default if default is not None else {}
+        val = row["value"]
+        if isinstance(val, str):
+            return json.loads(val)
+        return val if val is not None else (default if default is not None else {})
+    except Exception as e:
+        print("kv_get", key, e)
+        return default if default is not None else {}
+    finally:
+        await connection.close()
+
+
+async def kv_set(key: str, value):
+    connection = await get_db()
+    try:
+        await connection.execute(
+            """
+            INSERT INTO bot_kv (key, value, updated_at)
+            VALUES ($1, $2::jsonb, NOW())
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+            """,
+            key, json.dumps(value, default=str)
+        )
+    except Exception as e:
+        print("kv_set", key, e)
     finally:
         await connection.close()
 
@@ -509,6 +778,8 @@ async def get_game_by_id(game_id: int):
 async def create_waiting_game(guild, channel, host_id):
     connection = await get_db()
     try:
+        settings = default_game_settings()
+        settings["guild_id"] = str(guild.id)
         return await connection.fetchrow(
             """
             INSERT INTO games (
@@ -522,10 +793,18 @@ async def create_waiting_game(guild, channel, host_id):
             RETURNING *
             """,
             str(host_id), str(channel.id),
-            json.dumps(default_game_settings())
+            json.dumps(settings)
         )
     finally:
         await connection.close()
+
+
+async def _game_guild_id(game_id) -> str:
+    game = await get_game_by_id(game_id)
+    if not game:
+        return None
+    gd = parse_game_data(game.get("game_data"))
+    return str(gd.get("guild_id") or "") or None
 
 
 async def get_or_create_waiting_game(guild, channel, user_id):
@@ -548,6 +827,17 @@ async def get_player_count(game_id):
 async def get_alive_count(game_id):
     connection = await get_db()
     try:
+        gid = await _game_guild_id(game_id)
+        if gid:
+            return await connection.fetchval(
+                """
+                SELECT COUNT(*)
+                FROM game_players gp
+                JOIN players p ON p.user_id = gp.user_id AND p.server_id = $2
+                WHERE gp.game_id = $1 AND p.alive = TRUE AND p.eliminated = FALSE
+                """,
+                game_id, str(gid)
+            )
         return await connection.fetchval(
             """
             SELECT COUNT(*)
@@ -564,6 +854,21 @@ async def get_alive_count(game_id):
 async def get_game_players(game_id):
     connection = await get_db()
     try:
+        gid = None
+        row = await connection.fetchrow("SELECT game_data FROM games WHERE id = $1", game_id)
+        if row:
+            gid = parse_game_data(row["game_data"]).get("guild_id")
+        if gid:
+            return await connection.fetch(
+                """
+                SELECT gp.*, p.money, p.alive, p.eliminated, p.username
+                FROM game_players gp
+                JOIN players p ON p.user_id = gp.user_id AND p.server_id = $2
+                WHERE gp.game_id = $1
+                ORDER BY p.money DESC
+                """,
+                game_id, str(gid)
+            )
         return await connection.fetch(
             """
             SELECT gp.*, p.money, p.alive, p.eliminated, p.username
@@ -784,17 +1089,30 @@ async def eliminate_lowest_players(game_id: int, channel: discord.TextChannel, c
             revived_money = int(ascension.get("revived_money") or 0)
             revived_id = str(ascension.get("revived_user_id") or "")
 
-            # 생존자 중 코인 낮은 순으로 조회
-            alive = await connection.fetch(
-                """
-                SELECT p.user_id, p.money, p.username, p.angel_item, p.cupid_link_user_id
-                FROM game_players gp
-                JOIN players p ON p.user_id = gp.user_id
-                WHERE gp.game_id = $1 AND p.alive = TRUE AND p.eliminated = FALSE
-                ORDER BY p.money ASC, RANDOM()
-                """,
-                game_id
-            )
+            # 생존자 중 코인 낮은 순으로 조회 (서버별 players 행 매칭)
+            server_id = str(game_data.get("guild_id") or "")
+            if server_id:
+                alive = await connection.fetch(
+                    """
+                    SELECT p.user_id, p.money, p.username, p.angel_item, p.cupid_link_user_id
+                    FROM game_players gp
+                    JOIN players p ON p.user_id = gp.user_id AND p.server_id = $2
+                    WHERE gp.game_id = $1 AND p.alive = TRUE AND p.eliminated = FALSE
+                    ORDER BY p.money ASC, RANDOM()
+                    """,
+                    game_id, server_id
+                )
+            else:
+                alive = await connection.fetch(
+                    """
+                    SELECT p.user_id, p.money, p.username, p.angel_item, p.cupid_link_user_id
+                    FROM game_players gp
+                    JOIN players p ON p.user_id = gp.user_id
+                    WHERE gp.game_id = $1 AND p.alive = TRUE AND p.eliminated = FALSE
+                    ORDER BY p.money ASC, RANDOM()
+                    """,
+                    game_id
+                )
 
             if len(alive) <= 1:
                 return None
@@ -837,10 +1155,15 @@ async def eliminate_lowest_players(game_id: int, channel: discord.TextChannel, c
                 linked_id = player.get("cupid_link_user_id")
                 uid = str(player["user_id"])
 
+                # 탈락자 코인 → JACKPOT 후 0
+                elim_money = int(player.get("money") or 0)
+                if elim_money > 0 and channel:
+                    add_to_game_jackpot(channel.id, elim_money)
                 await connection.execute(
                     """
                     UPDATE players
-                    SET alive = FALSE, eliminated = TRUE, cupid_link_user_id = NULL, updated_at = NOW()
+                    SET alive = FALSE, eliminated = TRUE, cupid_link_user_id = NULL,
+                        money = 0, updated_at = NOW()
                     WHERE user_id = $1
                     """,
                     uid
@@ -857,10 +1180,14 @@ async def eliminate_lowest_players(game_id: int, channel: discord.TextChannel, c
                         str(linked_id)
                     )
                     if linked_player:
+                        link_money = int(linked_player.get("money") or 0)
+                        if link_money > 0 and channel:
+                            add_to_game_jackpot(channel.id, link_money)
                         await connection.execute(
                             """
                             UPDATE players
-                            SET alive = FALSE, eliminated = TRUE, cupid_link_user_id = NULL, updated_at = NOW()
+                            SET alive = FALSE, eliminated = TRUE, cupid_link_user_id = NULL,
+                                money = 0, updated_at = NOW()
                             WHERE user_id = $1
                             """,
                             str(linked_id)
@@ -991,6 +1318,14 @@ async def elimination_loop(game_id: int, channel: discord.TextChannel):
                 await asyncio.sleep(min(30, remaining - 60))
                 continue
             elif remaining > 30:
+                # 탈락 1분 전 잭팟 복권 추첨
+                draw_key = f"{game_id}:{next_elim_str}"
+                if draw_key not in lottery_drawn_for:
+                    lottery_drawn_for.add(draw_key)
+                    try:
+                        await run_jackpot_lottery_draw(channel)
+                    except Exception as e:
+                        print("lottery draw error:", e)
                 await channel.send("⚠️ **탈락 판정까지 60초!**")
                 await asyncio.sleep(remaining - 30)
             elif remaining > 10:
@@ -1023,11 +1358,13 @@ async def elimination_loop(game_id: int, channel: discord.TextChannel):
                     for p in result.get("eliminated", []):
                         is_cupid = any(str(c["user_id"]) == str(p["user_id"]) for c in result.get("cupid_extra", []))
                         title = "🏹 큐피트 연쇄 탈락!" if is_cupid else "☠️ 탈락 판정!"
+                        lost = int(p.get("money") or 0)
                         embed = discord.Embed(
                             title=title,
                             description=(
                                 f"☠️ <@{p['user_id']}> 님이 탈락했습니다.\n"
-                                f"최종 보유 코인: **{p['money']:,}**"
+                                f"보유 코인 **{lost:,}** → 💰 **JACKPOT** 적립\n"
+                                f"현재 JACKPOT: **{get_game_jackpot(channel.id):,}**"
                             ),
                             color=discord.Color.red()
                         )
@@ -1403,11 +1740,33 @@ class WaitingView(discord.ui.View):
 # 메인 Embed 생성
 # ============================================================
 
-async def build_main_embed(game_id: int, user_id: int, guild_id: int):
-    player = await get_player(user_id, guild_id)
-    rank, alive_count = await get_player_rank(game_id, user_id)
-    game = await get_game_by_id(game_id)
+async def get_first_and_last_alive(game_id: int):
+    """생존자 중 1등 / 꼴등 (user_id, money) — 공개용. 동점 시 아무나."""
+    connection = await get_db()
+    try:
+        rows = await connection.fetch(
+            """
+            SELECT p.user_id, p.money, p.username
+            FROM game_players gp
+            JOIN players p ON p.user_id = gp.user_id
+            WHERE gp.game_id = $1 AND p.alive = TRUE AND p.eliminated = FALSE
+            ORDER BY p.money DESC
+            """,
+            game_id
+        )
+        if not rows:
+            return None, None, 0
+        first = rows[0]
+        last = rows[-1]
+        return first, last, len(rows)
+    finally:
+        await connection.close()
 
+
+async def build_main_embed(game_id: int, user_id: int = None, guild_id: int = None):
+    """공용 메인 임베드 — 개인 정보(코인/다이아/선행/아이템) 없음.
+    생존자 수, 탈락까지 시간, 1등·꼴등만 표시."""
+    game = await get_game_by_id(game_id)
     next_elim_text = "계산 중..."
     if game:
         game_data = parse_game_data(game["game_data"])
@@ -1422,46 +1781,96 @@ async def build_main_embed(game_id: int, user_id: int, guild_id: int):
             except Exception:
                 next_elim_text = "오류"
 
+    first, last, alive_count = await get_first_and_last_alive(game_id)
+
+    ch_id = 0
+    if game and game.get("channel_id"):
+        try:
+            ch_id = int(game["channel_id"])
+        except (TypeError, ValueError):
+            ch_id = 0
+    jackpot = get_game_jackpot(ch_id)
+
+    embed = discord.Embed(
+        title="💰 MONEY BATTLE ROYALE",
+        description="개인 정보(코인·아이템 등)는 **내 정보** 버튼으로만 확인합니다.",
+        color=discord.Color.gold()
+    )
+    embed.add_field(name="👥 생존자", value=f"**{alive_count}명**", inline=True)
+    embed.add_field(name="⏰ 다음 탈락까지", value=f"**{next_elim_text}**", inline=True)
+    embed.add_field(name="💰 JACKPOT", value=f"**{jackpot:,}**", inline=True)
+    if first:
+        embed.add_field(
+            name="🥇 1등",
+            value=f"<@{first['user_id']}>",
+            inline=True
+        )
+    if last and alive_count > 1:
+        embed.add_field(
+            name="💀 꼴등 (탈락 위험)",
+            value=f"<@{last['user_id']}>",
+            inline=True
+        )
+    elif last and alive_count == 1:
+        embed.add_field(name="🏆 최후 생존자", value=f"<@{last['user_id']}>", inline=True)
+    embed.set_footer(text="공개 정보만 표시 · 내 정보 / 새로고침 · JACKPOT은 복권·패배분 누적")
+    return embed
+
+
+async def build_private_status_embed(game_id: int, user_id: int, guild_id: int):
+    """본인만 보는 개인 현황 (ephemeral용)"""
+    player = await get_player(user_id, guild_id)
+    rank, alive_count = await get_player_rank(game_id, user_id)
     money = player["money"] if player else 0
     diamonds = player["diamonds"] if player else 0
     good_deed = player["good_deed"] if player else 0
     is_alive = player["alive"] if player else False
-    bonus = player.get("bonus_starting_money") or 0 if player else 0
     inv = parse_inventory(player.get("inventory") if player else None)
     angel_item = player.get("angel_item") if player else None
 
-    status = "🟢 생존 중" if is_alive else "☠️ 탈락"
-
     inv_text = "없음"
     if inv:
-        parts = []
-        for name, cnt in inv.items():
-            emoji = SHOP_ITEMS.get(name, {}).get("emoji", "📦")
-            parts.append(f"{emoji}{name}×{cnt}")
+        parts = [f"{SHOP_ITEMS.get(n, {}).get('emoji', '📦')}{n}×{c}" for n, c in inv.items()]
         inv_text = " ".join(parts) if parts else "없음"
-
     angel_text = "없음"
     if angel_item:
-        emoji = ANGEL_SHOP_ITEMS.get(angel_item, {}).get("emoji", "🪽")
-        angel_text = f"{emoji} {angel_item}"
+        angel_text = f"{ANGEL_SHOP_ITEMS.get(angel_item, {}).get('emoji', '🪽')} {angel_item}"
 
     embed = discord.Embed(
-        title="💰 MONEY BATTLE ROYALE",
-        color=discord.Color.gold() if is_alive else discord.Color.dark_grey()
+        title="🔒 내 정보 (본인만 보임)",
+        color=discord.Color.blue() if is_alive else discord.Color.dark_grey()
     )
     embed.add_field(name="🪙 코인", value=f"**{money:,}**", inline=True)
     embed.add_field(name="💎 다이아", value=f"**{diamonds}**", inline=True)
     embed.add_field(name="😇 선행", value=f"**{good_deed:,}**", inline=True)
-    embed.add_field(name="👥 생존자", value=f"**{alive_count}명**", inline=True)
-    embed.add_field(name="📊 순위", value=f"**{rank}위**" if rank else "탈락", inline=True)
-    embed.add_field(name="⏰ 다음 탈락", value=f"**{next_elim_text}**", inline=True)
-    if bonus > 0:
-        embed.add_field(name="🪙 시작 보너스(미적용)", value=f"**+{bonus:,}**", inline=False)
-    embed.add_field(name="🎒 보유 아이템", value=inv_text, inline=False)
-    embed.add_field(name="🪽 천사 아이템", value=angel_text, inline=False)
-    embed.add_field(name="상태", value=status, inline=False)
-    embed.set_footer(text="버튼을 눌러 행동을 선택하세요")
+    embed.add_field(name="📊 내 순위", value=f"**{rank}위** / {alive_count}명" if rank else "탈락", inline=True)
+    embed.add_field(name="상태", value="🟢 생존" if is_alive else "☠️ 탈락", inline=True)
+    embed.add_field(name="🎒 아이템", value=inv_text, inline=False)
+    embed.add_field(name="🪽 천사", value=angel_text, inline=False)
 
+    # 내 잭팟 복권 번호 (해당 채널)
+    my_tickets = []
+    try:
+        game = await get_game_by_id(game_id)
+        ch_id = int(game["channel_id"]) if game and game.get("channel_id") else 0
+        for t in lottery_tickets.get(ch_id, []):
+            if int(t["user_id"]) == int(user_id):
+                my_tickets.append(t["numbers"])
+    except Exception:
+        pass
+    if my_tickets:
+        ticket_lines = "\n".join(f"`{n}`" for n in my_tickets)
+        embed.add_field(name="🎟️ 내 잭팟 복권", value=ticket_lines, inline=False)
+    else:
+        embed.add_field(name="🎟️ 내 잭팟 복권", value="없음 (이번 탈락 라운드 1장까지)", inline=False)
+
+    if is_user_gambling(user_id):
+        sess = get_gamble_session(int(user_id)) or {}
+        embed.add_field(
+            name="🎲 진행 중 도박",
+            value=f"**{sess.get('type', '?')}** · 배팅 {sess.get('bet', 0):,}\n메인에서 **재접속** 가능",
+            inline=False
+        )
     return embed
 
 
@@ -1469,15 +1878,16 @@ async def build_main_embed(game_id: int, user_id: int, guild_id: int):
 # 알바 관련 (미니게임화)
 # ============================================================
 
+# 최소 배팅 10,000 기준: 실패~성공 보상 약 0.8x~3x 배팅
 JOBS = {
-    "청소": {"emoji": "🧹", "reward": 20_000, "base": 12_000},
-    "택배": {"emoji": "📦", "reward": 22_000, "base": 14_000},
-    "과녁": {"emoji": "🎯", "reward": 22_000, "base": 14_000},
-    "패스트푸드": {"emoji": "🍔", "reward": 25_000, "base": 16_000},
-    "배달": {"emoji": "🏃", "reward": 25_000, "base": 16_000},
-    "주방": {"emoji": "🍳", "reward": 28_000, "base": 18_000},
-    "데이터 입력": {"emoji": "🧠", "reward": 30_000, "base": 20_000},
-    "낚시": {"emoji": "🎣", "reward": 30_000, "base": 20_000},
+    "청소": {"emoji": "🧹", "reward": 18_000, "base": 8_000},
+    "택배": {"emoji": "📦", "reward": 20_000, "base": 9_000},
+    "과녁": {"emoji": "🎯", "reward": 22_000, "base": 10_000},
+    "패스트푸드": {"emoji": "🍔", "reward": 24_000, "base": 11_000},
+    "배달": {"emoji": "🏃", "reward": 25_000, "base": 12_000},
+    "주방": {"emoji": "🍳", "reward": 28_000, "base": 13_000},
+    "데이터 입력": {"emoji": "🧠", "reward": 30_000, "base": 14_000},
+    "낚시": {"emoji": "🎣", "reward": 32_000, "base": 15_000},
 }
 
 
@@ -1489,19 +1899,29 @@ def format_seconds(seconds: int):
     return f"{seconds}초"
 
 
-def _get_job_state(user_id: int) -> dict:
-    st = job_states.get(user_id)
+def _job_key(user_id, guild_id=None):
+    if guild_id is not None:
+        return f"{int(guild_id)}:{int(user_id)}"
+    return int(user_id)
+
+
+def _get_job_state(user_id: int, guild_id=None) -> dict:
+    key = _job_key(user_id, guild_id)
+    st = job_states.get(key)
     if st is None:
-        st = {"charges": MAX_JOB_CHARGES, "next_charge_at": None}
-        job_states[user_id] = st
+        # 레거시 int 키 호환
+        st = job_states.get(int(user_id)) if guild_id is None else None
+        if st is None:
+            st = {"charges": MAX_JOB_CHARGES, "next_charge_at": None}
+        job_states[key] = st
     return st
 
 
-def refresh_job_charges(user_id: int, cooldown_seconds: int = None) -> dict:
+def refresh_job_charges(user_id: int, cooldown_seconds: int = None, guild_id=None) -> dict:
     """쿨타임이 지났으면 기회 +1 (최대 MAX_JOB_CHARGES). 여러 번 충전 가능."""
     if cooldown_seconds is None:
         cooldown_seconds = JOB_COOLDOWN_SECONDS
-    st = _get_job_state(user_id)
+    st = _get_job_state(user_id, guild_id)
     now = datetime.utcnow()
     while st["charges"] < MAX_JOB_CHARGES and st.get("next_charge_at"):
         if now >= st["next_charge_at"]:
@@ -1516,20 +1936,20 @@ def refresh_job_charges(user_id: int, cooldown_seconds: int = None) -> dict:
     return st
 
 
-def get_job_charges(user_id: int, cooldown_seconds: int = None) -> tuple:
+def get_job_charges(user_id: int, cooldown_seconds: int = None, guild_id=None) -> tuple:
     """(charges, seconds_until_next_charge) — 3이면 remaining=0"""
-    st = refresh_job_charges(user_id, cooldown_seconds)
+    st = refresh_job_charges(user_id, cooldown_seconds, guild_id)
     if st["charges"] >= MAX_JOB_CHARGES or not st.get("next_charge_at"):
         return st["charges"], 0
     remaining = int((st["next_charge_at"] - datetime.utcnow()).total_seconds())
     return st["charges"], max(0, remaining)
 
 
-def consume_job_charge(user_id: int, cooldown_seconds: int = None) -> bool:
+def consume_job_charge(user_id: int, cooldown_seconds: int = None, guild_id=None) -> bool:
     """기회 1개 소모. 성공 시 True. 3→2가 되면 쿨타임 시작."""
     if cooldown_seconds is None:
         cooldown_seconds = JOB_COOLDOWN_SECONDS
-    st = refresh_job_charges(user_id, cooldown_seconds)
+    st = refresh_job_charges(user_id, cooldown_seconds, guild_id)
     if st["charges"] <= 0:
         return False
     st["charges"] -= 1
@@ -1537,11 +1957,14 @@ def consume_job_charge(user_id: int, cooldown_seconds: int = None) -> bool:
     if st["charges"] < MAX_JOB_CHARGES:
         if not st.get("next_charge_at") or st["next_charge_at"] <= datetime.utcnow():
             st["next_charge_at"] = datetime.utcnow() + timedelta(seconds=cooldown_seconds)
+    asyncio.create_task(persist_job_states())
     return True
 
 
-def reset_job_state(user_id: int):
-    job_states[user_id] = {"charges": MAX_JOB_CHARGES, "next_charge_at": None}
+def reset_job_state(user_id: int, guild_id=None):
+    key = _job_key(user_id, guild_id)
+    job_states[key] = {"charges": MAX_JOB_CHARGES, "next_charge_at": None}
+    asyncio.create_task(persist_job_states())
 
 
 async def get_job_cooldown_for_game(game_id: int) -> int:
@@ -2128,6 +2551,20 @@ class ShopView(discord.ui.View):
                 )
                 return
 
+            # 잭팟 복권: 라운드당 1장 — 이미 보유/등록 시 추가 구매 불가
+            if item_name == "잭팟 복권":
+                inv_chk = await get_player_inventory(str(interaction.user.id), str(interaction.guild.id))
+                if inv_chk.get("잭팟 복권", 0) >= 1:
+                    await interaction.response.send_message(
+                        "🎟️ 이미 잭팟 복권을 보유 중입니다. (사재기 불가 · 라운드당 1장)",
+                        ephemeral=True
+                    )
+                    return
+                ok, msg = await _can_register_lottery(interaction.channel.id, interaction.user.id)
+                if not ok:
+                    await interaction.response.send_message(msg, ephemeral=True)
+                    return
+
             # 코인 차감 + 아이템 지급
             connection = await get_db()
             try:
@@ -2150,9 +2587,14 @@ class ShopView(discord.ui.View):
                 str(interaction.user.id), str(interaction.guild.id), item_name, 1
             )
 
+            # 상점 매출의 75% → JACKPOT
+            jp_add = int(item["price"] * 0.75)
+            if jp_add > 0 and interaction.channel:
+                add_to_game_jackpot(interaction.channel.id, jp_add)
+
             await interaction.response.send_message(
                 f"{item['emoji']} **{item_name}** 구매 완료!\n"
-                f"💰 -**{item['price']:,}** 코인\n"
+                f"💰 -**{item['price']:,}** 코인 (JACKPOT +{jp_add:,})\n"
                 f"🪙 현재: **{new_money:,}** 코인\n"
                 f"🎒 보유: **{inv.get(item_name, 0)}개**",
                 ephemeral=True
@@ -3016,51 +3458,71 @@ class ItemBagView(discord.ui.View):
             return None  # 이미 response 함 (소모는 StrawSelectView에서)
 
         elif item_name == "랜덤박스":
+            price = SHOP_ITEMS["랜덤박스"]["price"]
+            # 구입가는 이미 지불됨(상점). 개봉 결과 0~3배
             roll = random.random()
             connection = await get_db()
             try:
-                if roll < 0.03:
-                    # 다이아
+                if roll < 0.02:
                     dia = random.randint(1, 5)
                     await connection.execute(
-                        "UPDATE players SET diamonds = diamonds + $1 WHERE user_id = $2",
-                        dia, user_id
+                        "UPDATE players SET diamonds = diamonds + $1 WHERE user_id = $2", dia, user_id
                     )
-                    msg = f"💎 대박! 다이아 **+{dia}** 획득!"
-                elif roll < 0.08:
-                    # 아이템
-                    gift = random.choice(["정찰권", "시간 연장권", "빨대 쪼옵"])
+                    msg = f"💎 희귀! 다이아 **+{dia}**"
+                elif roll < 0.06:
+                    gift = random.choice(["정찰권", "시간 연장권", "즉석복권", "잭팟 복권"])
                     await add_item_to_inventory(user_id, guild_id, gift, 1)
-                    msg = f"🎁 아이템 획득! **{gift}** ×1"
-                elif roll < 0.20:
-                    reward = random.randint(800_000, 1_200_000)
+                    msg = f"🎁 아이템 **{gift}** ×1"
+                elif roll < 0.12:
+                    reward = int(price * 3)
                     await connection.execute(
                         "UPDATE players SET money = money + $1 WHERE user_id = $2", reward, user_id
                     )
-                    msg = f"🎉 대박! **{reward:,}** 코인 획득! (약 2~3배)"
-                elif roll < 0.45:
-                    reward = random.randint(300_000, 600_000)
+                    msg = f"🏆 3배 대박! **+{reward:,}**"
+                elif roll < 0.30:
+                    reward = int(price * 2)
                     await connection.execute(
                         "UPDATE players SET money = money + $1 WHERE user_id = $2", reward, user_id
                     )
-                    msg = f"✨ 성공! **{reward:,}** 코인 획득!"
-                elif roll < 0.70:
-                    reward = random.randint(100_000, 250_000)
+                    msg = f"🎉 2배! **+{reward:,}**"
+                elif roll < 0.55:
+                    reward = int(price * 1.0)
                     await connection.execute(
                         "UPDATE players SET money = money + $1 WHERE user_id = $2", reward, user_id
                     )
-                    msg = f"보통... **{reward:,}** 코인 획득"
-                elif roll < 0.88:
-                    reward = random.randint(10_000, 80_000)
+                    msg = f"✨ 본전 **+{reward:,}**"
+                elif roll < 0.75:
+                    reward = int(price * 0.5)
                     await connection.execute(
                         "UPDATE players SET money = money + $1 WHERE user_id = $2", reward, user_id
                     )
-                    msg = f"아쉬움... **{reward:,}** 코인"
+                    msg = f"보통 **+{reward:,}**"
                 else:
-                    msg = "💥 꽝... 아무것도 없습니다."
+                    # 꽝 → 구매가 상당분 잭팟 (이미 상점에서 지불)
+                    add_to_game_jackpot(interaction.channel.id if interaction.channel else 0, price // 2)
+                    msg = f"💥 꽝... (JACKPOT 일부 적립)"
             finally:
                 await connection.close()
             return msg
+
+        elif item_name == "즉석복권":
+            # 긁기 버튼 UI
+            view = InstantScratchView(user_id, interaction.channel.id if interaction.channel else 0)
+            await interaction.response.send_message(
+                "🎫 즉석복권 — **긁기**를 누르세요!",
+                view=view, ephemeral=True
+            )
+            return None  # 소모는 긁기 시
+
+        elif item_name == "잭팟 복권":
+            view = JackpotTicketBuyView(user_id, interaction.channel.id if interaction.channel else 0)
+            await interaction.response.send_message(
+                "🎟️ 잭팟 복권 번호 5개 선택\n"
+                f"현재 JACKPOT: **{get_game_jackpot(interaction.channel.id if interaction.channel else 0):,}**\n"
+                "탈락 1분 전 추첨됩니다.",
+                view=view, ephemeral=True
+            )
+            return None  # 소모는 번호 확정 시
 
         elif item_name == "밑장빼기권":
             await interaction.response.send_message(
@@ -3478,6 +3940,179 @@ active_auctions = {}  # channel_id -> True
 # 채널별 미스터리 잭팟 누적 (메모리, 서버 재시작 시 초기화)
 mystery_jackpots = defaultdict(int)  # channel_id -> amount
 
+# 복권/도박 패배분 JACKPOT (채널별)
+game_jackpots = defaultdict(int)  # channel_id -> amount
+# 잭팟 복권 보유: channel_id -> list of {user_id, numbers}
+lottery_tickets = defaultdict(list)
+lottery_drawn_for = set()  # (game_id, elim_timestamp) 중복 추첨 방지
+# 탈락 라운드당 유저별 잭팟 복권 1장 제한: (channel_id, next_elim_iso, user_id)
+lottery_bought_round = set()
+
+
+def add_to_game_jackpot(channel_id: int, amount: int):
+    if amount > 0 and channel_id:
+        game_jackpots[int(channel_id)] = game_jackpots.get(int(channel_id), 0) + int(amount)
+        asyncio.create_task(persist_jackpots())
+
+
+def get_game_jackpot(channel_id: int) -> int:
+    return game_jackpots.get(int(channel_id), 0) if channel_id else 0
+
+
+async def persist_jackpots():
+    await kv_set("game_jackpots", {str(k): int(v) for k, v in game_jackpots.items()})
+
+
+async def load_jackpots():
+    data = await kv_get("game_jackpots", {})
+    game_jackpots.clear()
+    if isinstance(data, dict):
+        for k, v in data.items():
+            try:
+                game_jackpots[int(k)] = int(v)
+            except Exception:
+                pass
+
+
+async def persist_lottery():
+    # tickets: channel_id -> list; bought keys as list of lists
+    tickets = {str(k): v for k, v in lottery_tickets.items()}
+    bought = [list(x) if isinstance(x, tuple) else x for x in lottery_bought_round]
+    await kv_set("lottery_tickets", tickets)
+    await kv_set("lottery_bought_round", bought)
+
+
+async def load_lottery():
+    tickets = await kv_get("lottery_tickets", {})
+    lottery_tickets.clear()
+    if isinstance(tickets, dict):
+        for k, v in tickets.items():
+            try:
+                lottery_tickets[int(k)] = list(v) if isinstance(v, list) else []
+            except Exception:
+                pass
+    bought = await kv_get("lottery_bought_round", [])
+    lottery_bought_round.clear()
+    if isinstance(bought, list):
+        for item in bought:
+            if isinstance(item, list):
+                lottery_bought_round.add(tuple(item))
+            elif isinstance(item, (list, tuple)):
+                lottery_bought_round.add(tuple(item))
+
+
+async def persist_job_states():
+    data = {}
+    for uid, st in job_states.items():
+        data[str(uid)] = {
+            "charges": st.get("charges", MAX_JOB_CHARGES),
+            "next_charge_at": st.get("next_charge_at").isoformat()
+            if isinstance(st.get("next_charge_at"), datetime) else st.get("next_charge_at"),
+        }
+    await kv_set("job_states", data)
+
+
+async def load_job_states():
+    data = await kv_get("job_states", {})
+    job_states.clear()
+    if not isinstance(data, dict):
+        return
+    for uid, st in data.items():
+        try:
+            nca = st.get("next_charge_at")
+            if isinstance(nca, str) and nca:
+                try:
+                    nca = datetime.fromisoformat(nca)
+                except Exception:
+                    nca = None
+            job_states[int(uid)] = {
+                "charges": int(st.get("charges", MAX_JOB_CHARGES)),
+                "next_charge_at": nca,
+            }
+        except Exception:
+            continue
+
+
+async def run_jackpot_lottery_draw(channel: discord.TextChannel):
+    """로또식: 1~99 중 15개 추첨, 플레이어 번호 5개와 일치 개수로 등수.
+    5일치=1등(잭팟+750만), 4=2등(500만), 3=3등(50만), 2=4등(10만), 1=5등(5만)
+    동일 등수 n명이면 상금 n등분.
+    """
+    ch_id = channel.id
+    tickets = lottery_tickets.get(ch_id, [])
+    drawn = set(random.sample(range(1, 100), 15))
+    drawn_sorted = sorted(drawn)
+    prizes = {
+        5: get_game_jackpot(ch_id) + 7_500_000,  # 1등
+        4: 5_000_000,
+        3: 500_000,
+        2: 100_000,
+        1: 50_000,
+    }
+    rank_of_match = {5: 1, 4: 2, 3: 3, 2: 4, 1: 5}
+    winners = {1: [], 2: [], 3: [], 4: [], 5: []}
+    for t in tickets:
+        match = len(set(t["numbers"]) & drawn)
+        if match >= 1:
+            r = rank_of_match[match]
+            winners[r].append({**t, "match": match})
+
+    prize_by_rank = {
+        1: prizes[5],
+        2: prizes[4],
+        3: prizes[3],
+        4: prizes[2],
+        5: prizes[1],
+    }
+    connection = await get_db()
+    try:
+        for r in range(1, 6):
+            ws = winners[r]
+            if not ws:
+                continue
+            pool = prize_by_rank[r]
+            share = pool // len(ws)
+            for w in ws:
+                await connection.execute(
+                    "UPDATE players SET money = money + $1 WHERE user_id = $2",
+                    share, str(w["user_id"])
+                )
+            if r == 1:
+                game_jackpots[ch_id] = 0
+                await persist_jackpots()
+    finally:
+        await connection.close()
+
+    lottery_tickets[ch_id] = []
+    to_rm = [k for k in lottery_bought_round if isinstance(k, tuple) and len(k) >= 1 and k[0] == ch_id]
+    for k in to_rm:
+        lottery_bought_round.discard(k)
+    await persist_lottery()
+
+    lines = [
+        f"추첨 번호(15개): `{drawn_sorted}`",
+        "등수 = 내 번호 5개 중 **일치 개수** (5→1등 … 1→5등)",
+    ]
+    for r in range(1, 6):
+        match_n = 6 - r
+        if winners[r]:
+            n = len(winners[r])
+            share = prize_by_rank[r] // n
+            names = ", ".join(
+                f"<@{w['user_id']}> `{w['numbers']}`({w['match']}개)" for w in winners[r]
+            )
+            split = f"{prize_by_rank[r]:,} ÷{n} = **{share:,}**" if n > 1 else f"**{prize_by_rank[r]:,}**"
+            lines.append(f"**{r}등** ({match_n}개 일치, {split}): {names}")
+        else:
+            lines.append(f"**{r}등** ({match_n}개 일치): 당첨자 없음")
+    embed = discord.Embed(
+        title="🎟️ 잭팟 복권 추첨!",
+        description="\n".join(lines),
+        color=discord.Color.gold()
+    )
+    embed.set_footer(text=f"현재 JACKPOT 잔액: {get_game_jackpot(ch_id):,}")
+    await channel.send(embed=embed)
+
 
 def roll_mystery_box(channel_id: int):
     """상자 개봉 결과. (grade, reward, jackpot_taken)"""
@@ -3782,8 +4417,8 @@ class BlackjackView(discord.ui.View):
     def build_embed(self, reveal=False):
         p_val = hand_value(self.player_hand)
         embed = discord.Embed(
-            title="🃏 블랙잭 (공개 진행 · 중퇴 불가)",
-            description=f"플레이어: <@{self.user_id}>\n⚠️ 제한시간 내 미응답 시 **배팅액 몰수**",
+            title="🃏 블랙잭 (본인만 보임)",
+            description="⚠️ 제한시간 내 미응답 시 배팅 몰수 + 패널티",
             color=discord.Color.dark_green()
         )
         if reveal:
@@ -3851,20 +4486,18 @@ class BlackjackView(discord.ui.View):
         for child in self.children:
             child.disabled = True
 
-        payout = int(self.bet * payout_mult)
-        connection = await get_db()
-        try:
-            if payout > 0:
-                new_money = await connection.fetchval(
-                    "UPDATE players SET money = money + $1, updated_at = NOW() WHERE user_id = $2 RETURNING money",
-                    payout, str(self.user_id)
-                )
-            elif payout_mult == 1.0:
-                new_money = await connection.fetchval(
-                    "UPDATE players SET money = money + $1, updated_at = NOW() WHERE user_id = $2 RETURNING money",
-                    self.bet, str(self.user_id)
-                )
-            else:
+        gross = int(self.bet * payout_mult) if payout_mult > 0 else 0
+        if payout_mult == 1.0:
+            gross = self.bet
+        fee_note = ""
+        if gross > 0:
+            net, fee, new_money = await _payout_single(self.user_id, gross, self.channel_id or 0, getattr(self, "guild_id", None))
+            fee_note = f" (수수료 {fee:,})" if fee else ""
+            payout = net
+        else:
+            payout = 0
+            connection = await get_db()
+            try:
                 await connection.execute(
                     "UPDATE players SET last_money_loss = $1, updated_at = NOW() WHERE user_id = $2",
                     self.bet, str(self.user_id)
@@ -3872,17 +4505,19 @@ class BlackjackView(discord.ui.View):
                 new_money = await connection.fetchval(
                     "SELECT money FROM players WHERE user_id = $1", str(self.user_id)
                 )
-        finally:
-            await connection.close()
+            finally:
+                await connection.close()
+            if self.channel_id:
+                add_to_game_jackpot(self.channel_id, self.bet)
 
         embed = self.build_embed(reveal=True)
         embed.add_field(name="결과", value=result, inline=False)
         if payout > 0 and payout_mult > 1.0:
-            embed.add_field(name="획득", value=f"+**{payout:,}** 코인", inline=True)
+            embed.add_field(name="획득", value=f"+**{payout:,}**{fee_note}", inline=True)
         elif payout_mult == 1.0 or "무승부" in result:
-            embed.add_field(name="반환", value=f"**{self.bet:,}** 코인 반환", inline=True)
+            embed.add_field(name="반환", value=f"**{payout:,}**{fee_note}", inline=True)
         else:
-            embed.add_field(name="손실", value=f"-**{self.bet:,}** 코인", inline=True)
+            embed.add_field(name="손실", value=f"-**{self.bet:,}** → JACKPOT", inline=True)
         embed.add_field(name="현재 코인", value=f"**{new_money:,}**", inline=True)
 
         try:
@@ -4032,20 +4667,15 @@ class UnderdrawBlackjackView(discord.ui.View):
         new = self.bj.deck.pop()
         self.bj.player_hand[idx] = new
         if hand_value(self.bj.player_hand) == 21 and len(self.bj.player_hand) == 2:
-            payout = int(self.bj.bet * 2.5)
-            connection = await get_db()
-            try:
-                new_money = await connection.fetchval(
-                    "UPDATE players SET money = money + $1 WHERE user_id = $2 RETURNING money",
-                    payout, str(self.bj.user_id)
-                )
-            finally:
-                await connection.close()
+            gross = int(self.bj.bet * 2.5)
+            payout, fee, new_money = await _payout_single(
+                self.bj.user_id, gross, self.bj.channel_id or 0
+            )
             embed = self.bj.build_embed(reveal=True)
             embed.add_field(name="밑장빼기", value=f"{old} → {new}", inline=False)
             clear_gamble(self.bj.user_id)
             embed.add_field(name="결과", value="🎉 **블랙잭!** (×2.5)", inline=False)
-            embed.add_field(name="획득", value=f"+**{payout:,}**", inline=True)
+            embed.add_field(name="획득", value=f"+**{payout:,}** (수수료 {fee:,})", inline=True)
             embed.add_field(name="현재 코인", value=f"**{new_money:,}**", inline=True)
             await interaction.response.edit_message(content=None, embed=embed, view=None)
             return
@@ -4116,8 +4746,8 @@ class BlackjackBetModal(discord.ui.Modal, title="🃏 블랙잭 배팅"):
         connection = await get_db()
         try:
             ok = await connection.fetchval(
-                "UPDATE players SET money = money - $1 WHERE user_id = $2 AND money >= $1 RETURNING money",
-                bet, str(interaction.user.id)
+                "UPDATE players SET money = money - $1 WHERE user_id = $2 AND server_id = $3 AND money >= $1 RETURNING money",
+                bet, str(interaction.user.id), str(interaction.guild.id)
             )
             if ok is None:
                 await interaction.response.send_message("배팅 실패 (잔액 부족)", ephemeral=True)
@@ -4129,53 +4759,36 @@ class BlackjackBetModal(discord.ui.Modal, title="🃏 블랙잭 배팅"):
             self.game_id, interaction.user.id, interaction.guild.id, bet,
             channel_id=interaction.channel.id
         )
-        # 자연 블랙잭
+        # 자연 블랙잭 — 결과도 본인만
         if hand_value(view.player_hand) == 21:
-            payout = int(bet * 2.5)
-            connection = await get_db()
-            try:
-                new_money = await connection.fetchval(
-                    "UPDATE players SET money = money + $1 WHERE user_id = $2 RETURNING money",
-                    payout, str(interaction.user.id)
-                )
-            finally:
-                await connection.close()
+            gross = int(bet * 2.5)
+            payout, fee, new_money = await _payout_single(
+                interaction.user.id, gross, interaction.channel.id
+            )
             embed = view.build_embed(reveal=True)
             embed.add_field(name="결과", value="🎉 **블랙잭!** (×2.5)", inline=False)
-            embed.add_field(name="획득", value=f"+**{payout:,}**", inline=True)
+            embed.add_field(name="획득", value=f"+**{payout:,}** (수수료 {fee:,})", inline=True)
             embed.add_field(name="현재 코인", value=f"**{new_money:,}**", inline=True)
-            await interaction.response.send_message(
-                content=f"🃏 <@{interaction.user.id}> 블랙잭 결과",
-                embed=embed
-            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
             return
 
-        # 세션 등록 (중퇴 방지)
-        register_gamble(interaction.user.id, "블랙잭", bet, interaction.channel.id, self.game_id)
+        register_gamble(interaction.user.id, "블랙잭", bet, interaction.channel.id, self.game_id, guild_id=interaction.guild.id if interaction.guild else None)
 
         inv = await get_player_inventory(str(interaction.user.id), str(interaction.guild.id))
         if inv.get("밑장빼기권", 0) > 0:
             under_view = UnderdrawBlackjackView(view)
-            msg = await interaction.channel.send(
-                content=f"🃏 <@{interaction.user.id}> 블랙잭 시작! (공개 진행 · 중퇴 시 배팅 몰수)",
-                embed=view.build_embed(),
-                view=under_view
-            )
-            view.public_message = msg
             await interaction.response.send_message(
-                "블랙잭이 채널에 **공개**로 시작되었습니다. (지워도 세션 유지)",
+                content="🎭 밑장빼기권 보유 · **본인만** 보이는 블랙잭",
+                embed=view.build_embed(),
+                view=under_view,
                 ephemeral=True
             )
             return
 
-        msg = await interaction.channel.send(
-            content=f"🃏 <@{interaction.user.id}> 블랙잭 시작! (공개 진행 · 중퇴 시 배팅 몰수)",
-            embed=view.build_embed(),
-            view=view
-        )
-        view.public_message = msg
         await interaction.response.send_message(
-            "블랙잭이 채널에 **공개**로 시작되었습니다. 제한시간 내 미응답 시 배팅 몰수.",
+            content="🃏 블랙잭 시작 (본인만 보임 · 시간초과 시 배팅 몰수+패널티)",
+            embed=view.build_embed(),
+            view=view,
             ephemeral=True
         )
 
@@ -4335,8 +4948,8 @@ class AceBreakerView(discord.ui.View):
 
     def build_embed(self, reveal_bot=False):
         embed = discord.Embed(
-            title="🃏 에이스 브레이커 (공개 진행 · 중퇴 불가)",
-            description=f"플레이어: <@{self.user_id}>\n⚠️ 제한시간 내 미응답 시 중퇴 처리",
+            title="🃏 에이스 브레이커 (본인만 보임)",
+            description="⚠️ 제한시간 내 미응답 시 배팅 몰수 + 패널티",
             color=discord.Color.purple()
         )
         embed.add_field(
@@ -4532,17 +5145,15 @@ class AceBreakerView(discord.ui.View):
             payout = 0
             result = f"😢 패배 ({wins}승 {losses}패 {draws}무)"
 
-        connection = await get_db()
-        try:
-            if payout > 0:
-                new_money = await connection.fetchval(
-                    """
-                    UPDATE players SET money = money + $1, updated_at = NOW()
-                    WHERE user_id = $2 RETURNING money
-                    """,
-                    payout, str(self.user_id)
-                )
-            else:
+        ch = getattr(self, "channel_id", 0) or 0
+        if payout > 0:
+            net, fee, new_money = await _payout_single(self.user_id, payout, ch)
+            payout = net
+            fee_note = f" (수수료 {fee:,})" if fee else ""
+        else:
+            fee_note = ""
+            connection = await get_db()
+            try:
                 await connection.execute(
                     """
                     UPDATE players SET last_money_loss = $1, updated_at = NOW()
@@ -4553,8 +5164,10 @@ class AceBreakerView(discord.ui.View):
                 new_money = await connection.fetchval(
                     "SELECT money FROM players WHERE user_id = $1", str(self.user_id)
                 )
-        finally:
-            await connection.close()
+            finally:
+                await connection.close()
+            if ch:
+                add_to_game_jackpot(ch, self.bet)
 
         embed = self.build_embed(reveal_bot=True)
         detail = []
@@ -4573,11 +5186,11 @@ class AceBreakerView(discord.ui.View):
             embed.add_field(name="상대 JOKER", value="보유했음", inline=True)
         embed.add_field(name="최종", value=result, inline=False)
         if is_tie_game:
-            embed.add_field(name="반환", value=f"**{self.bet:,}** 코인 환불", inline=True)
+            embed.add_field(name="반환", value=f"**{payout:,}**{fee_note}", inline=True)
         elif payout > 0:
-            embed.add_field(name="획득", value=f"+**{payout:,}**", inline=True)
+            embed.add_field(name="획득", value=f"+**{payout:,}**{fee_note}", inline=True)
         else:
-            embed.add_field(name="손실", value=f"-**{self.bet:,}**", inline=True)
+            embed.add_field(name="손실", value=f"-**{self.bet:,}** → JACKPOT", inline=True)
         embed.add_field(name="현재 코인", value=f"**{new_money:,}**", inline=True)
 
         try:
@@ -4709,14 +5322,13 @@ class AceBreakerStartView(discord.ui.View):
             self.game_id, interaction.user.id, interaction.guild.id,
             channel_id=interaction.channel.id
         )
-        register_gamble(interaction.user.id, "에이스 브레이커", 0, interaction.channel.id, self.game_id)
-        msg = await interaction.channel.send(
-            content=f"🃏 <@{interaction.user.id}> 에이스 브레이커 시작! (공개 · 중퇴 불가)",
+        register_gamble(interaction.user.id, "에이스 브레이커", 0, interaction.channel.id, self.game_id, guild_id=interaction.guild.id if interaction.guild else None)
+        await interaction.response.send_message(
+            content="🃏 에이스 브레이커 (본인만 보임 · 시간초과 시 패널티)",
             embed=view.build_embed(),
-            view=view
+            view=view,
+            ephemeral=True
         )
-        view.public_message = msg
-        await interaction.response.send_message("공개 채널에서 시작되었습니다.", ephemeral=True)
 
 
 # ============================================================
@@ -4737,7 +5349,10 @@ class MultiLobbyView(discord.ui.View):
         self.channel_id = int(channel_id)
         self.mode = mode  # "bj" | "ab"
         self.min_bet = min_bet
-        self.max_players = 4 if mode == "bj" else 2
+        if mode in ("bj", "rl", "hr"):
+            self.max_players = 6 if mode != "bj" else 4
+        else:
+            self.max_players = 2  # 1v1
         self.min_players = 2
         self.players = []  # [{user_id, name, bet}]
         self.started = False
@@ -4755,7 +5370,15 @@ class MultiLobbyView(discord.ui.View):
 
     def build_embed(self):
         left = max(0, int((self.ends_at - datetime.utcnow()).total_seconds()))
-        title = "🃏 멀티 블랙잭 모집" if self.mode == "bj" else "🅰️ 에이스 브레이커 1v1 모집"
+        titles = {
+            "bj": "🃏 멀티 블랙잭 모집",
+            "ab": "🅰️ 에이스 브레이커 1v1 모집",
+            "cc": "🎲 친치로 1v1 모집",
+            "ip": "🧠 인디언 포커 1v1 모집",
+            "rl": "🎡 룰렛 단체 모집",
+            "hr": "🏇 경마 단체 모집",
+        }
+        title = titles.get(self.mode, "멀티 모집")
         embed = discord.Embed(
             title=title,
             description=(
@@ -4965,8 +5588,10 @@ class MultiThreadReadyView(discord.ui.View):
 
         if self.mode == "bj":
             await start_multi_blackjack(self.thread, self.game_id, self.guild_id, ready_players, self.min_bet)
-        else:
+        elif self.mode == "ab":
             await start_multi_ace_breaker(self.thread, self.game_id, self.guild_id, ready_players, self.min_bet)
+        else:
+            await start_multi_generic(self.thread, self.game_id, self.guild_id, ready_players, self.min_bet, self.mode)
 
     @discord.ui.button(label="준비완료", emoji="✅", style=discord.ButtonStyle.success)
     async def ready_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -5281,25 +5906,28 @@ class MultiAceBreakerView(discord.ui.View):
             self.add_item(btn)
 
     def build_embed(self):
-        embed = discord.Embed(title="🅰️ 에이스 브레이커 1v1", color=discord.Color.purple())
+        phase_kr = {
+            "first_draw": "선 카드 뽑기",
+            "first_mull": "선 멀리건 선택",
+            "second_draw": "후 카드 뽑기",
+            "second_mull": "후 멀리건 선택",
+            "first_bet": "선 배팅",
+            "second_bet": "후 배팅 (선배팅 이상)",
+            "resolve": "결과",
+        }.get(self.phase, self.phase)
+        active = self._active_uid()
+        desc = f"**단계:** {phase_kr}"
+        if active:
+            desc += f"\n**현재 행동 플레이어:** <@{active}>"
+        embed = discord.Embed(title="🅰️ 에이스 브레이커 1v1", description=desc, color=discord.Color.purple())
         for uid, label in ((self.first["user_id"], "선"), (self.second["user_id"], "후")):
-            cards = self.cards[uid]
-            # 본인/공개 전에는 상대 패 숨김 — 공개 임베드에서는 진행 중인 사람만 표시
-            if uid == self._active_uid() or self.phase == "resolve":
-                shown = self._hand_str(cards, self.joker[uid], hide=False)
-            else:
-                shown = "🂠 | 🂠 | 🂠" if any(c is None for c in cards) else "🂠 | 🂠 | 🂠 (비공개)"
-                # 자기 패는 뽑은 만큼만 본인에게 ephemeral로 알려줌
-                if all(c is not None for c in cards) and self.phase not in ("first_bet", "second_bet", "resolve"):
-                    shown = "🂠 | 🂠 | 🂠 (비공개)"
             bet = self.bets[uid]
-            embed.add_field(
-                name=f"{label} <@{uid}>" + (f" · 배팅 {bet:,}" if bet else ""),
-                value=shown,
-                inline=False
-            )
-        embed.add_field(name="단계", value=self.phase, inline=True)
-        embed.set_footer(text="상대 패 비공개 · 선배팅 후 후자는 그 이상만 배팅")
+            drawn = sum(1 for c in self.cards[uid] if c is not None)
+            status = f"카드 {drawn}/3"
+            if bet:
+                status += f" · 배팅 **{bet:,}**"
+            embed.add_field(name=f"{label} <@{uid}>", value=status, inline=False)
+        embed.set_footer(text="패 내용은 본인만 확인 · 아래 버튼으로 행동")
         return embed
 
     def _hand_str(self, cards, has_joker, hide=False):
@@ -5542,18 +6170,499 @@ class MultiABBetModal(discord.ui.Modal, title="💰 멀티 AB 배팅"):
         await self.parent.apply_bet(interaction, bet)
 
 
+class MultiChinchiroView(discord.ui.View):
+    """턴제 친치로: 부모 먼저 굴림→재굴림/확정 → 자식 굴림→비교"""
+    def __init__(self, thread, game_id, parent, child, bet):
+        super().__init__(timeout=120)
+        self.thread = thread
+        self.game_id = game_id
+        self.parent = parent  # dict user_id
+        self.child = child
+        self.bet = bet
+        self.phase = "parent"  # parent | child | done
+        self.parent_dice = None
+        self.child_dice = None
+        self.rerolls = 2
+        self.finished = False
+
+    def status_text(self):
+        pd = f"{self.parent_dice}" if self.parent_dice else "미굴림"
+        return (
+            f"🎲 **멀티 친치로**\n"
+            f"부모 <@{self.parent['user_id']}> : {pd} (재굴림 {self.rerolls})\n"
+            f"자식 <@{self.child['user_id']}> : "
+            f"{self.child_dice if self.child_dice else '대기'}\n"
+            f"배팅 각 {self.bet:,}"
+        )
+
+    async def interaction_check(self, interaction):
+        if self.finished:
+            return False
+        return True
+
+    @discord.ui.button(label="굴리기/재굴림", emoji="🎲", style=discord.ButtonStyle.primary)
+    async def roll_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        uid = interaction.user.id
+        if self.phase == "parent":
+            if uid != self.parent["user_id"]:
+                await interaction.response.send_message("부모 차례입니다.", ephemeral=True)
+                return
+            if self.parent_dice is not None and self.rerolls <= 0:
+                await interaction.response.send_message("재굴림 없음. 확정하세요.", ephemeral=True)
+                return
+            if self.parent_dice is not None:
+                self.rerolls -= 1
+            self.parent_dice = _cc_roll()
+            name, val, kind = _cc_eval(self.parent_dice)
+            if kind == "hifumi":
+                await self._resolve(interaction, winner=self.child["user_id"], note="부모 히후미")
+                return
+            if kind == "pair" and val == 6:
+                await self._resolve(interaction, winner=self.parent["user_id"], note="부모 눈6 즉시", mult=2)
+                return
+            await interaction.response.edit_message(content=self.status_text() + f"\n→ {name}", view=self)
+        elif self.phase == "child":
+            if uid != self.child["user_id"]:
+                await interaction.response.send_message("자식 차례입니다.", ephemeral=True)
+                return
+            self.child_dice = _cc_roll()
+            name, val, kind = _cc_eval(self.child_dice)
+            if kind == "hifumi":
+                await self._resolve(interaction, winner=self.parent["user_id"], note="자식 히후미", mult=2)
+                return
+            if kind == "pair" and val == 1:
+                await self._resolve(interaction, winner=self.child["user_id"], note="자식 눈1 즉시")
+                return
+            # 비교
+            pn, pv, pk = _cc_eval(self.parent_dice)
+            cn, cv, ck = _cc_eval(self.child_dice)
+            if pk == "special" or ck == "special":
+                if pk == "special" and (ck != "special" or pv >= cv):
+                    await self._resolve(interaction, winner=self.parent["user_id"], note=f"{pn} vs {cn}", mult=max(2, int(pv) if pk == "special" else 2))
+                else:
+                    await self._resolve(interaction, winner=self.child["user_id"], note=f"{pn} vs {cn}")
+            elif pk == "pair" and ck == "pair":
+                if pv > cv:
+                    await self._resolve(interaction, winner=self.parent["user_id"], note=f"눈{pv}>{cv}")
+                elif pv < cv:
+                    await self._resolve(interaction, winner=self.child["user_id"], note=f"눈{pv}<{cv}")
+                else:
+                    await self._resolve(interaction, winner=None, note="동점")
+            elif pk == "pair":
+                await self._resolve(interaction, winner=self.parent["user_id"], note="부모 페어")
+            elif ck == "pair":
+                await self._resolve(interaction, winner=self.child["user_id"], note="자식 페어")
+            else:
+                await self._resolve(interaction, winner=None, note="양측 무세")
+        else:
+            await interaction.response.defer()
+
+    @discord.ui.button(label="확정 (자식 차례)", emoji="✅", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.phase != "parent" or interaction.user.id != self.parent["user_id"]:
+            await interaction.response.send_message("부모만 확정 가능", ephemeral=True)
+            return
+        if not self.parent_dice:
+            await interaction.response.send_message("먼저 굴리세요", ephemeral=True)
+            return
+        self.phase = "child"
+        await interaction.response.edit_message(
+            content=self.status_text() + "\n→ 자식 차례! **굴리기**",
+            view=self
+        )
+
+    async def _resolve(self, interaction, winner, note="", mult=2):
+        self.finished = True
+        self.stop()
+        pot = self.bet * 2
+        if winner is None:
+            await _add_money(self.parent["user_id"], self.bet)
+            await _add_money(self.child["user_id"], self.bet)
+            msg = f"🤝 {note} 무승부 반환\n{self.status_text()}"
+        else:
+            await _add_money(winner, int(self.bet * mult) if mult > 2 else pot)
+            loser = self.child["user_id"] if winner == self.parent["user_id"] else self.parent["user_id"]
+            await _lose_to_jackpot(loser, self.bet, self.thread.id)
+            msg = f"🎉 <@{winner}> 승! ({note})\n{self.status_text()}"
+        clear_gamble(self.parent["user_id"])
+        clear_gamble(self.child["user_id"])
+        try:
+            await interaction.response.edit_message(content=msg, view=None)
+        except Exception:
+            await self.thread.send(msg)
+
+    async def on_timeout(self):
+        if self.finished:
+            return
+        self.finished = True
+        for p in (self.parent, self.child):
+            clear_gamble(p["user_id"])
+            await _lose_to_jackpot(p["user_id"], self.bet, self.thread.id)
+        try:
+            await self.thread.send("⏰ 친치로 시간초과 — 배팅 JACKPOT")
+        except Exception:
+            pass
+
+
+class MultiIndianView(discord.ui.View):
+    """턴제 인디언: 각자 상대 카드만 공개 → BET/RAISE/FOLD 순차"""
+    def __init__(self, thread, game_id, p1, p2, bet):
+        super().__init__(timeout=120)
+        self.thread = thread
+        self.game_id = game_id
+        self.p1, self.p2 = p1, p2
+        self.bet = bet
+        self.cards = {
+            p1["user_id"]: random.randint(1, 13),
+            p2["user_id"]: random.randint(1, 13),
+        }
+        self.acted = {}
+        self.pot = bet * 2
+        self.finished = False
+        self.turn = p1["user_id"]
+
+    def public_text(self):
+        return (
+            f"🧠 **멀티 인디언 포커**\n"
+            f"<@{self.p1['user_id']}> vs <@{self.p2['user_id']}>\n"
+            f"팟 **{self.pot:,}** · 차례 <@{self.turn}>\n"
+            f"(자신의 카드는 본인에게 안 보임 — DM/개인으로 상대 카드만 확인)"
+        )
+
+    async def send_private_hints(self):
+        # 스레드에 힌트: 각자에게 ephemeral은 불가하므로 공개로는 상대 카드만 각각 안 보이게 처리 어려움
+        # → 멘션으로 상대 카드 안내 (본인 카드 비공개 유지)
+        await self.thread.send(
+            f"<@{self.p1['user_id']}> 이 보는 상대 카드: **{self.cards[self.p2['user_id']]}**\n"
+            f"<@{self.p2['user_id']}> 이 보는 상대 카드: **{self.cards[self.p1['user_id']]}**"
+        )
+
+    async def _act(self, interaction, action):
+        if self.finished or interaction.user.id != self.turn:
+            await interaction.response.send_message("당신 차례가 아닙니다.", ephemeral=True)
+            return
+        uid = interaction.user.id
+        other = self.p2["user_id"] if uid == self.p1["user_id"] else self.p1["user_id"]
+        if action == "fold":
+            half = self.bet // 2
+            await _add_money(uid, half)
+            await _lose_to_jackpot(uid, self.bet - half, self.thread.id)
+            await _add_money(other, self.pot - half)
+            self.finished = True
+            self.stop()
+            clear_gamble(self.p1["user_id"])
+            clear_gamble(self.p2["user_id"])
+            await interaction.response.edit_message(
+                content=f"🏳️ <@{uid}> 폴드 → <@{other}> 승\n카드 {self.cards[self.p1['user_id']]} vs {self.cards[self.p2['user_id']]}",
+                view=None
+            )
+            return
+        if action == "raise":
+            if not await _deduct_money(uid, self.bet):
+                await interaction.response.send_message("코인 부족", ephemeral=True)
+                return
+            self.pot += self.bet
+            # 상대도 콜 강제 (간소화)
+            if await _deduct_money(other, self.bet):
+                self.pot += self.bet
+        self.acted[uid] = action
+        if len(self.acted) < 2:
+            self.turn = other
+            await interaction.response.edit_message(
+                content=self.public_text() + f"\n<@{uid}> → {action.upper()}",
+                view=self
+            )
+            return
+        # 쇼다운
+        c1, c2 = self.cards[self.p1["user_id"]], self.cards[self.p2["user_id"]]
+        if c1 > c2:
+            w, l = self.p1["user_id"], self.p2["user_id"]
+        elif c2 > c1:
+            w, l = self.p2["user_id"], self.p1["user_id"]
+        else:
+            w = None
+        self.finished = True
+        self.stop()
+        clear_gamble(self.p1["user_id"])
+        clear_gamble(self.p2["user_id"])
+        if w:
+            await _add_money(w, self.pot)
+            await _lose_to_jackpot(l, self.bet, self.thread.id)
+            msg = f"쇼다운 {c1} vs {c2} → <@{w}> 승 +{self.pot:,}"
+        else:
+            await _add_money(self.p1["user_id"], self.pot // 2)
+            await _add_money(self.p2["user_id"], self.pot // 2)
+            msg = f"무승부 {c1}={c2} 분할"
+        await interaction.response.edit_message(content=msg, view=None)
+
+    @discord.ui.button(label="BET", emoji="💰", style=discord.ButtonStyle.success)
+    async def bet_btn(self, i, b): await self._act(i, "bet")
+
+    @discord.ui.button(label="RAISE", emoji="📈", style=discord.ButtonStyle.danger)
+    async def raise_btn(self, i, b): await self._act(i, "raise")
+
+    @discord.ui.button(label="FOLD", emoji="🏳️", style=discord.ButtonStyle.secondary)
+    async def fold_btn(self, i, b): await self._act(i, "fold")
+
+
+class MultiRouletteSelectView(discord.ui.View):
+    """멀티 룰렛: 각자 배팅 종류 선택 후 일괄 스핀"""
+    PICKS = [
+        ("red", "빨강", 1.85), ("black", "검정", 1.85),
+        ("odd", "홀", 1.85), ("even", "짝", 1.85),
+        ("low", "1~18", 1.85), ("high", "19~36", 1.85),
+        ("dozen1", "1~12", 2.7), ("dozen2", "13~24", 2.7), ("dozen3", "25~36", 2.7),
+    ]
+
+    def __init__(self, thread, game_id, players, bet):
+        super().__init__(timeout=30)
+        self.thread = thread
+        self.game_id = game_id
+        self.players = players  # list of {user_id, pick}
+        self.bet = bet
+        self.finished = False
+        for key, label, mult in self.PICKS[:5]:
+            btn = discord.ui.Button(label=f"{label} ×{mult}", style=discord.ButtonStyle.primary, row=0 if key in ("red","black","odd") else 1)
+            btn.callback = self._mk(key, label, mult)
+            self.add_item(btn)
+        for key, label, mult in self.PICKS[5:]:
+            btn = discord.ui.Button(label=f"{label} ×{mult}", style=discord.ButtonStyle.secondary, row=2)
+            btn.callback = self._mk(key, label, mult)
+            self.add_item(btn)
+
+    def _mk(self, key, label, mult):
+        async def cb(interaction: discord.Interaction):
+            if self.finished:
+                return
+            uid = interaction.user.id
+            target = next((p for p in self.players if p["user_id"] == uid), None)
+            if not target:
+                await interaction.response.send_message("참가자가 아닙니다.", ephemeral=True)
+                return
+            target["pick"] = key
+            target["label"] = label
+            target["mult"] = mult
+            await interaction.response.send_message(f"선택: **{label}** ×{mult}", ephemeral=True)
+            if all(p.get("pick") for p in self.players):
+                await self._spin()
+        return cb
+
+    async def _spin(self):
+        if self.finished:
+            return
+        self.finished = True
+        self.stop()
+        n = random.randint(0, 36)
+        color = "green" if n == 0 else ("red" if n in ROULETTE_RED else "black")
+        lines = [f"🎡 결과 **{n}** ({color})"]
+        for p in self.players:
+            pick = p.get("pick")
+            mult = p.get("mult", 1.85)
+            label = p.get("label", pick)
+            win = False
+            if pick == "red" and color == "red":
+                win = True
+            elif pick == "black" and color == "black":
+                win = True
+            elif pick == "odd" and n and n % 2 == 1:
+                win = True
+            elif pick == "even" and n and n % 2 == 0:
+                win = True
+            elif pick == "low" and 1 <= n <= 18:
+                win = True
+            elif pick == "high" and 19 <= n <= 36:
+                win = True
+            elif pick == "dozen1" and 1 <= n <= 12:
+                win = True
+            elif pick == "dozen2" and 13 <= n <= 24:
+                win = True
+            elif pick == "dozen3" and 25 <= n <= 36:
+                win = True
+            if win:
+                payout = int(self.bet * mult)
+                await _add_money(p["user_id"], payout)
+                lines.append(f"<@{p['user_id']}> {label} 적중 +{payout:,}")
+            else:
+                await _lose_to_jackpot(p["user_id"], self.bet, self.thread.id)
+                lines.append(f"<@{p['user_id']}> {label or '미선택'} 실패 → JACKPOT")
+            clear_gamble(p["user_id"])
+        try:
+            await self.thread.send("\n".join(lines))
+        except Exception:
+            pass
+
+    async def on_timeout(self):
+        if self.finished:
+            return
+        # 미선택자는 랜덤 배정
+        for p in self.players:
+            if not p.get("pick"):
+                key, label, mult = random.choice(self.PICKS)
+                p["pick"], p["label"], p["mult"] = key, label, mult
+        await self._spin()
+
+
+class MultiHorseSelectView(discord.ui.View):
+    def __init__(self, thread, game_id, players, bet):
+        super().__init__(timeout=30)
+        self.thread = thread
+        self.game_id = game_id
+        self.players = players
+        self.bet = bet
+        self.finished = False
+        for i, h in enumerate(HORSES):
+            btn = discord.ui.Button(
+                label=f"{h['name']} ×{h['odds']}",
+                style=discord.ButtonStyle.primary,
+                row=i // 3
+            )
+            btn.callback = self._mk(i)
+            self.add_item(btn)
+
+    def _mk(self, idx):
+        async def cb(interaction: discord.Interaction):
+            if self.finished:
+                return
+            uid = interaction.user.id
+            target = next((p for p in self.players if p["user_id"] == uid), None)
+            if not target:
+                await interaction.response.send_message("참가자가 아닙니다.", ephemeral=True)
+                return
+            target["horse"] = idx
+            await interaction.response.send_message(
+                f"선택: **{HORSES[idx]['name']}** ×{HORSES[idx]['odds']}", ephemeral=True
+            )
+            if all(p.get("horse") is not None for p in self.players):
+                await self._race()
+        return cb
+
+    async def _race(self):
+        if self.finished:
+            return
+        self.finished = True
+        self.stop()
+        weights = [h["w"] for h in HORSES]
+        winner = random.choices(range(len(HORSES)), weights=weights, k=1)[0]
+        await self.thread.send("🏇 레이스 진행 중...")
+        await asyncio.sleep(2)
+        lines = [f"🏆 우승: **{HORSES[winner]['name']}** (×{HORSES[winner]['odds']})"]
+        for p in self.players:
+            hi = p.get("horse")
+            if hi is None:
+                hi = random.randrange(len(HORSES))
+            if hi == winner:
+                payout = int(self.bet * HORSES[winner]["odds"])
+                await _add_money(p["user_id"], payout)
+                lines.append(f"<@{p['user_id']}> {HORSES[hi]['name']} 적중 +{payout:,}")
+            else:
+                await _lose_to_jackpot(p["user_id"], self.bet, self.thread.id)
+                lines.append(f"<@{p['user_id']}> {HORSES[hi]['name']} 낙첨 → JACKPOT")
+            clear_gamble(p["user_id"])
+        await self.thread.send("\n".join(lines))
+
+    async def on_timeout(self):
+        if self.finished:
+            return
+        for p in self.players:
+            if p.get("horse") is None:
+                p["horse"] = random.randrange(len(HORSES))
+        await self._race()
+
+
+async def start_multi_generic(thread, game_id, guild_id, players, min_bet, mode):
+    """친치로/인디언 1v1 · 룰렛/경마 단체 — 스레드 공개 진행"""
+    if mode in ("cc", "ip") and len(players) >= 2:
+        a, b = players[0], players[1]
+        for p in (a, b):
+            ok = await _deduct_money(p["user_id"], min_bet)
+            if not ok:
+                await thread.send(f"<@{p['user_id']}> 코인 부족으로 취소")
+                for q in (a, b):
+                    clear_gamble(q["user_id"])
+                return
+            register_gamble(p["user_id"], f"멀티-{mode}", min_bet, thread.id, game_id)
+        if mode == "cc":
+            # 부모/자식 랜덤
+            if random.random() < 0.5:
+                parent, child = a, b
+            else:
+                parent, child = b, a
+            view = MultiChinchiroView(thread, game_id, parent, child, min_bet)
+            await thread.send(
+                content=view.status_text() + f"\n부모 <@{parent['user_id']}> 먼저 **굴리기**",
+                view=view
+            )
+        else:
+            view = MultiIndianView(thread, game_id, a, b, min_bet)
+            await view.send_private_hints()
+            await thread.send(content=view.public_text(), view=view)
+        return
+
+    if mode == "rl":
+        alive = []
+        for p in players:
+            if await _deduct_money(p["user_id"], min_bet):
+                alive.append({"user_id": p["user_id"], "pick": None})
+                register_gamble(p["user_id"], "멀티룰렛", min_bet, thread.id, game_id)
+        if len(alive) < 2:
+            await thread.send("인원 부족")
+            return
+        view = MultiRouletteSelectView(thread, game_id, alive, min_bet)
+        await thread.send(
+            "🎡 **멀티 룰렛** — 각자 배팅 종류를 고르세요 (30초)\n"
+            "빨강/검정/홀/짝 ×1.85 · 1~18/19~36 ×1.85 · 구간 ×2.7",
+            view=view
+        )
+        return
+
+    if mode == "hr":
+        alive = []
+        for p in players:
+            if await _deduct_money(p["user_id"], min_bet):
+                alive.append({"user_id": p["user_id"], "horse": None})
+                register_gamble(p["user_id"], "멀티경마", min_bet, thread.id, game_id)
+        if len(alive) < 2:
+            await thread.send("인원 부족")
+            return
+        view = MultiHorseSelectView(thread, game_id, alive, min_bet)
+        lines = " · ".join(f"{h['name']}×{h['odds']}" for h in HORSES)
+        await thread.send(
+            f"🏇 **멀티 경마** — 말을 고르세요 (30초)\n{lines}",
+            view=view
+        )
+        return
+
+    await thread.send(f"미구현 모드: {mode}")
+
+
 class MultiMenuView(discord.ui.View):
     def __init__(self, game_id):
         super().__init__(timeout=60)
         self.game_id = game_id
 
-    @discord.ui.button(label="멀티 블랙잭 (2~4인)", emoji="🃏", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="멀티 블랙잭", emoji="🃏", style=discord.ButtonStyle.primary, row=0)
     async def multi_bj(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._open_lobby(interaction, "bj", 10_000)
 
-    @discord.ui.button(label="에이스 브레이커 1v1", emoji="🅰️", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="AB 1v1", emoji="🅰️", style=discord.ButtonStyle.primary, row=0)
     async def multi_ab(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self._open_lobby(interaction, "ab", 20_000)
+
+    @discord.ui.button(label="친치로 1v1", emoji="🎲", style=discord.ButtonStyle.primary, row=0)
+    async def multi_cc(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._open_lobby(interaction, "cc", 10_000)
+
+    @discord.ui.button(label="인디언 1v1", emoji="🧠", style=discord.ButtonStyle.primary, row=1)
+    async def multi_ip(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._open_lobby(interaction, "ip", 10_000)
+
+    @discord.ui.button(label="룰렛 단체", emoji="🎡", style=discord.ButtonStyle.danger, row=1)
+    async def multi_rl(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._open_lobby(interaction, "rl", 10_000)
+
+    @discord.ui.button(label="경마 단체", emoji="🏇", style=discord.ButtonStyle.success, row=1)
+    async def multi_hr(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._open_lobby(interaction, "hr", 10_000)
 
     async def _open_lobby(self, interaction, mode, min_bet):
         ch_id = interaction.channel.id
@@ -5583,108 +6692,1075 @@ class MultiMenuView(discord.ui.View):
 # 게임 선택 메뉴
 # ============================================================
 
-class GameSelectView(discord.ui.View):
-    def __init__(self, game_id):
+# ============================================================
+# 추가 미니게임: 홀짝 / 야바위 / 폭탄룰렛 / 친치로 / 인디언 / 룰렛 / 경마
+# ============================================================
+
+async def _deduct_money(user_id, amount: int, server_id=None) -> bool:
+    """server_id 없으면 user_id만으로 갱신(레거시). 멀티서버에선 반드시 server_id 전달."""
+    connection = await get_db()
+    try:
+        if server_id is not None:
+            ok = await connection.fetchval(
+                """UPDATE players SET money = money - $1, updated_at = NOW()
+                   WHERE user_id = $2 AND server_id = $3 AND money >= $1 RETURNING money""",
+                amount, str(user_id), str(server_id)
+            )
+        else:
+            ok = await connection.fetchval(
+                "UPDATE players SET money = money - $1 WHERE user_id = $2 AND money >= $1 RETURNING money",
+                amount, str(user_id)
+            )
+        return ok is not None
+    finally:
+        await connection.close()
+
+
+async def _add_money(user_id, amount: int, server_id=None) -> int:
+    connection = await get_db()
+    try:
+        if server_id is not None:
+            return await connection.fetchval(
+                """UPDATE players SET money = money + $1, updated_at = NOW()
+                   WHERE user_id = $2 AND server_id = $3 RETURNING money""",
+                amount, str(user_id), str(server_id)
+            )
+        return await connection.fetchval(
+            "UPDATE players SET money = money + $1, updated_at = NOW() WHERE user_id = $2 RETURNING money",
+            amount, str(user_id)
+        )
+    finally:
+        await connection.close()
+
+
+SINGLE_FEE_RATE = 0.05  # 싱글 정산 5% → JACKPOT
+
+
+async def _payout_single(user_id, gross: int, channel_id: int, server_id=None) -> tuple:
+    """싱글 정산: 5% 수수료 JACKPOT, 95% 지급. returns (net, fee, new_money)"""
+    gross = int(gross or 0)
+    if gross <= 0:
+        connection = await get_db()
+        try:
+            if server_id is not None:
+                new_m = await connection.fetchval(
+                    "SELECT money FROM players WHERE user_id = $1 AND server_id = $2",
+                    str(user_id), str(server_id)
+                )
+            else:
+                new_m = await connection.fetchval(
+                    "SELECT money FROM players WHERE user_id = $1", str(user_id)
+                )
+        finally:
+            await connection.close()
+        return 0, 0, new_m or 0
+    fee = int(gross * SINGLE_FEE_RATE)
+    net = gross - fee
+    if fee > 0 and channel_id:
+        add_to_game_jackpot(channel_id, fee)
+    new_m = await _add_money(user_id, net, server_id)
+    return net, fee, new_m
+
+
+async def _guard_gamble(interaction, min_money: int = 10000) -> bool:
+    gid = interaction.guild.id if interaction.guild else None
+    if is_user_gambling(interaction.user.id, gid):
+        await interaction.response.send_message("이미 도박 진행 중입니다.", ephemeral=True)
+        return False
+    if is_timeout_penalized(interaction.user.id, gid):
+        pen = get_penalty_remaining(interaction.user.id, gid)
+        await interaction.response.send_message(
+            f"🚫 패널티 중 — **{format_seconds(pen)}** 남음", ephemeral=True
+        )
+        return False
+    player = await get_or_create_player(interaction.user, interaction.guild)
+    if not player["alive"] or player["eliminated"]:
+        await interaction.response.send_message("탈락자는 불가합니다.", ephemeral=True)
+        return False
+    if (player["money"] or 0) < min_money:
+        await interaction.response.send_message(
+            f"코인 부족 (최소 {min_money:,}). 보유: **{player['money']:,}**", ephemeral=True
+        )
+        return False
+    return True
+
+
+class SimpleBetModal(discord.ui.Modal):
+    def __init__(self, title: str, min_bet: int, callback):
+        super().__init__(title=title)
+        self.min_bet = min_bet
+        self._cb = callback
+        self.amount = discord.ui.TextInput(
+            label=f"배팅액 (최소 {min_bet:,})",
+            placeholder=str(min_bet),
+            required=True
+        )
+        self.add_item(self.amount)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            bet = int(self.amount.value.replace(",", "").strip())
+            if bet < self.min_bet:
+                await interaction.response.send_message(f"최소 {self.min_bet:,}", ephemeral=True)
+                return
+        except ValueError:
+            await interaction.response.send_message("숫자만 입력", ephemeral=True)
+            return
+        await self._cb(interaction, bet)
+
+
+
+# ---------- 즉석복권 / 잭팟복권 UI ----------
+class InstantScratchView(discord.ui.View):
+    def __init__(self, user_id, channel_id):
+        super().__init__(timeout=60)
+        self.user_id = str(user_id)
+        self.channel_id = channel_id
+        self.done = False
+
+    @discord.ui.button(label="긁기", emoji="🎫", style=discord.ButtonStyle.success)
+    async def scratch(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if str(interaction.user.id) != self.user_id or self.done:
+            await interaction.response.defer()
+            return
+        inv = await get_player_inventory(self.user_id, str(interaction.guild.id))
+        if inv.get("즉석복권", 0) <= 0:
+            await interaction.response.edit_message(content="즉석복권이 없습니다.", view=None)
+            return
+        await remove_item_from_inventory(self.user_id, str(interaction.guild.id), "즉석복권", 1)
+        self.done = True
+        self.stop()
+        roll = random.random()
+        price = SHOP_ITEMS["즉석복권"]["price"]
+        if roll < 0.005:
+            reward, grade = 5_000_000, "🏆 특등"
+        elif roll < 0.03:
+            reward, grade = 500_000, "💎 1등"
+        elif roll < 0.10:
+            reward, grade = 100_000, "🎉 2등"
+        elif roll < 0.25:
+            reward, grade = 30_000, "✨ 3등"
+        elif roll < 0.45:
+            reward, grade = price, "본전"
+        else:
+            reward, grade = 0, "💣 꽝"
+            add_to_game_jackpot(self.channel_id, price)
+        if reward:
+            await _add_money(self.user_id, reward)
+            msg = f"🎫 **{grade}**! +**{reward:,}** 코인"
+        else:
+            msg = f"🎫 **{grade}** (JACKPOT 적립)"
+        await interaction.response.edit_message(content=msg, view=None)
+
+
+async def _lottery_round_key(channel_id: int, user_id) -> tuple:
+    """탈락 라운드 식별 키 (channel, next_elim_iso, user)"""
+    elim = "none"
+    try:
+        connection = await get_db()
+        try:
+            row = await connection.fetchrow(
+                "SELECT id, game_data FROM games WHERE channel_id = $1 AND status = 'playing' ORDER BY id DESC LIMIT 1",
+                str(channel_id)
+            )
+            if row:
+                gd = parse_game_data(row["game_data"])
+                elim = gd.get("next_elimination_at") or "none"
+        finally:
+            await connection.close()
+    except Exception:
+        pass
+    return (int(channel_id), str(elim), int(user_id))
+
+
+async def _can_register_lottery(channel_id, user_id) -> tuple:
+    """(ok, message)"""
+    key = await _lottery_round_key(channel_id, user_id)
+    if key in lottery_bought_round:
+        return False, "이번 탈락 라운드에는 이미 잭팟 복권을 등록했습니다. (라운드당 1장)"
+    # 티켓 목록에도 있으면 중복
+    for t in lottery_tickets.get(int(channel_id), []):
+        if int(t["user_id"]) == int(user_id):
+            return False, "이미 이번 라운드 번호가 등록되어 있습니다."
+    return True, ""
+
+
+class JackpotTicketBuyView(discord.ui.View):
+    def __init__(self, user_id, channel_id):
+        super().__init__(timeout=120)
+        self.user_id = str(user_id)
+        self.channel_id = channel_id
+
+    async def _register(self, interaction, nums):
+        ok, msg = await _can_register_lottery(self.channel_id, self.user_id)
+        if not ok:
+            await interaction.response.send_message(msg, ephemeral=True)
+            return
+        inv = await get_player_inventory(self.user_id, str(interaction.guild.id))
+        if inv.get("잭팟 복권", 0) <= 0:
+            await interaction.response.send_message("잭팟 복권이 없습니다.", ephemeral=True)
+            return
+        await remove_item_from_inventory(self.user_id, str(interaction.guild.id), "잭팟 복권", 1)
+        lottery_tickets[self.channel_id].append({"user_id": int(self.user_id), "numbers": nums})
+        key = await _lottery_round_key(self.channel_id, self.user_id)
+        lottery_bought_round.add(key)
+        await persist_lottery()
+        await interaction.response.edit_message(
+            content=f"🎟️ 등록 완료! 번호 `{nums}`\n(이번 탈락 라운드 1장 한도 · 1분 전 추첨)",
+            view=None
+        )
+
+    @discord.ui.button(label="자동 (랜덤 5개)", emoji="🎲", style=discord.ButtonStyle.primary)
+    async def auto(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if str(interaction.user.id) != self.user_id:
+            return
+        nums = sorted(random.sample(range(1, 100), 5))
+        await self._register(interaction, nums)
+
+    @discord.ui.button(label="수동 입력", emoji="✏️", style=discord.ButtonStyle.secondary)
+    async def manual(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if str(interaction.user.id) != self.user_id:
+            return
+        await interaction.response.send_modal(JackpotManualModal(self.user_id, self.channel_id))
+
+
+class JackpotManualModal(discord.ui.Modal, title="🎟️ 번호 5개 (1~99)"):
+    def __init__(self, user_id, channel_id):
+        super().__init__()
+        self.user_id = str(user_id)
+        self.channel_id = channel_id
+        self.nums = discord.ui.TextInput(
+            label="번호 5개 (쉼표 구분)",
+            placeholder="예: 3,15,22,48,91",
+            required=True
+        )
+        self.add_item(self.nums)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            parts = [int(x.strip()) for x in self.nums.value.replace(" ", "").split(",")]
+            if len(parts) != 5 or len(set(parts)) != 5:
+                await interaction.response.send_message("서로 다른 숫자 5개 필요", ephemeral=True)
+                return
+            if any(n < 1 or n > 99 for n in parts):
+                await interaction.response.send_message("1~99만 가능", ephemeral=True)
+                return
+        except ValueError:
+            await interaction.response.send_message("형식 오류", ephemeral=True)
+            return
+        ok, msg = await _can_register_lottery(self.channel_id, self.user_id)
+        if not ok:
+            await interaction.response.send_message(msg, ephemeral=True)
+            return
+        inv = await get_player_inventory(self.user_id, str(interaction.guild.id))
+        if inv.get("잭팟 복권", 0) <= 0:
+            await interaction.response.send_message("잭팟 복권 없음", ephemeral=True)
+            return
+        await remove_item_from_inventory(self.user_id, str(interaction.guild.id), "잭팟 복권", 1)
+        nums = sorted(parts)
+        lottery_tickets[self.channel_id].append({"user_id": int(self.user_id), "numbers": nums})
+        key = await _lottery_round_key(self.channel_id, self.user_id)
+        lottery_bought_round.add(key)
+        await persist_lottery()
+        await interaction.response.send_message(
+            f"🎟️ 등록 `{nums}` (이번 라운드 1장 한도)", ephemeral=True
+        )
+
+
+async def _lose_to_jackpot(user_id, bet, channel_id):
+    """패배 배팅액 잭팟 적립 + last_money_loss"""
+    connection = await get_db()
+    try:
+        await connection.execute(
+            "UPDATE players SET last_money_loss = $1, updated_at = NOW() WHERE user_id = $2",
+            bet, str(user_id)
+        )
+    finally:
+        await connection.close()
+    add_to_game_jackpot(channel_id, bet)
+
+
+# ---------- 홀짝 (기획: 7라운드, 연승/연패 배율 보정, 5% 수수료) ----------
+class OddEvenView(discord.ui.View):
+    """
+    배율(rate) 시작 1.0
+    맞춤: rate += 0.3 + 0.1*n  (n=연승 수)
+    틀림: rate -= 0.3 + 0.1*n  (n=연패 수), 최소 0
+    최대 7라운드 · 종료 시 5% 수수료 → JACKPOT
+    """
+    def __init__(self, game_id, user_id, guild_id, bet: int, channel_id: int):
         super().__init__(timeout=120)
         self.game_id = game_id
+        self.user_id = user_id
+        self.guild_id = guild_id
+        self.channel_id = channel_id
+        self.base_bet = bet
+        self.rate = 1.0
+        self.round = 1
+        self.win_streak = 0
+        self.lose_streak = 0
+        self.finished = False
 
-    @discord.ui.button(label="블랙잭 (싱글)", emoji="🃏", style=discord.ButtonStyle.primary, row=0)
-    async def blackjack(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if is_user_gambling(interaction.user.id):
-            sess = active_gambles[int(interaction.user.id)]
-            await interaction.response.send_message(
-                f"🔒 이미 **{sess['type']}** 진행 중입니다. 종료 후 다시 시도하세요.",
-                ephemeral=True
-            )
-            return
-        pen = get_penalty_remaining(interaction.user.id)
-        if pen > 0:
-            await interaction.response.send_message(
-                f"🚫 시간 초과 패널티 중입니다.\n"
-                f"도박·알바 이용 불가 — 남은 시간: **{format_seconds(pen)}**",
-                ephemeral=True
-            )
-            return
-        modal = BlackjackBetModal(self.game_id)
-        await interaction.response.send_modal(modal)
+    def _potential(self):
+        return max(0, int(self.base_bet * self.rate))
 
-    @discord.ui.button(label="멀티 게임", emoji="👥", style=discord.ButtonStyle.success, row=1)
-    async def multi(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if is_user_gambling(interaction.user.id) or is_timeout_penalized(interaction.user.id):
-            await interaction.response.send_message(
-                "도박 중이거나 패널티 상태에서는 멀티 모집을 열 수 없습니다.",
-                ephemeral=True
-            )
-            return
-        embed = discord.Embed(
-            title="👥 멀티 게임",
+    def build_embed(self):
+        n_win = self.win_streak
+        n_lose = self.lose_streak
+        next_up = 0.3 + 0.1 * (n_win + 1)
+        next_dn = 0.3 + 0.1 * (n_lose + 1)
+        return discord.Embed(
+            title="🔢 홀짝",
             description=(
-                "**멀티 블랙잭** — 2~4인, 15초 모집 후 스레드에서 진행\n"
-                "**에이스 브레이커 1v1** — 선/후 랜덤, 상대 패 비공개, 선배팅\n\n"
-                "모집 완료 → 스레드 생성 → 15초 준비 → 전원 준비 시 즉시 시작"
+                f"라운드 **{self.round}/7**\n"
+                f"현재 배율 **×{self.rate:.2f}** · 예상 **{self._potential():,}**\n"
+                f"연승 **{n_win}** / 연패 **{n_lose}**\n"
+                f"다음 성공 시 +{next_up:.1f} · 실패 시 -{next_dn:.1f}\n"
+                f"종료 시 5% 수수료 제외 후 지급"
             ),
-            color=discord.Color.blurple()
+            color=discord.Color.teal()
         )
-        await interaction.response.send_message(embed=embed, view=MultiMenuView(self.game_id), ephemeral=True)
 
-    @discord.ui.button(label="에이스 브레이커", emoji="🅰️", style=discord.ButtonStyle.primary, row=0)
+    async def _play(self, interaction, choice):
+        if self.finished or interaction.user.id != self.user_id:
+            return
+        roll = random.randint(1, 100)
+        result = "홀" if roll % 2 else "짝"
+        if choice == result:
+            self.win_streak += 1
+            self.lose_streak = 0
+            n = self.win_streak
+            delta = 0.3 + 0.1 * n
+            self.rate += delta
+            msg = f"✅ {result}! 연승 {n} · 배율 +{delta:.1f} → **×{self.rate:.2f}**"
+        else:
+            self.lose_streak += 1
+            self.win_streak = 0
+            n = self.lose_streak
+            delta = 0.3 + 0.1 * n
+            self.rate = max(0.0, self.rate - delta)
+            msg = f"❌ {result}... 연패 {n} · 배율 -{delta:.1f} → **×{self.rate:.2f}**"
+        self.round += 1
+        update_gamble_state(self.user_id, state={
+            "rate": self.rate, "round": self.round,
+            "win_streak": self.win_streak, "lose_streak": self.lose_streak,
+        })
+        if self.round > 7 or self.rate <= 0:
+            await self._finish(interaction, msg)
+            return
+        await interaction.response.edit_message(content=msg, embed=self.build_embed(), view=self)
+
+    async def _finish(self, interaction, extra=""):
+        if self.finished:
+            return
+        self.finished = True
+        self.stop()
+        clear_gamble(self.user_id)
+        gross = self._potential()
+        if gross > 0:
+            payout, fee, new_m = await _payout_single(self.user_id, gross, self.channel_id, getattr(self, "guild_id", None))
+        else:
+            payout, fee = 0, 0
+            await _lose_to_jackpot(self.user_id, self.base_bet, self.channel_id)
+            connection = await get_db()
+            try:
+                new_m = await connection.fetchval(
+                    "SELECT money FROM players WHERE user_id=$1", str(self.user_id)
+                )
+            finally:
+                await connection.close()
+        embed = discord.Embed(
+            title="🔢 홀짝 정산",
+            description=(
+                f"{extra}\n"
+                f"최종 배율 ×{self.rate:.2f} → 총액 {gross:,}\n"
+                f"지급 **{payout:,}** (수수료 {fee:,}→JACKPOT)\n"
+                f"보유 **{new_m:,}**"
+            ),
+            color=discord.Color.gold()
+        )
+        try:
+            await interaction.response.edit_message(content=None, embed=embed, view=None)
+        except Exception:
+            try:
+                await interaction.edit_original_response(content=None, embed=embed, view=None)
+            except Exception:
+                pass
+
+    @discord.ui.button(label="홀", emoji="1️⃣", style=discord.ButtonStyle.primary)
+    async def odd(self, i, b): await self._play(i, "홀")
+
+    @discord.ui.button(label="짝", emoji="2️⃣", style=discord.ButtonStyle.primary)
+    async def even(self, i, b): await self._play(i, "짝")
+
+    @discord.ui.button(label="중단·정산", emoji="💰", style=discord.ButtonStyle.success)
+    async def stop_btn(self, i, b):
+        if i.user.id != self.user_id:
+            return
+        await self._finish(i, "중단")
+
+    async def on_timeout(self):
+        if self.finished:
+            return
+        self.finished = True
+        clear_gamble(self.user_id)
+        await _lose_to_jackpot(self.user_id, self.base_bet, self.channel_id)
+        pen = await get_timeout_penalty_seconds(self.game_id)
+        apply_timeout_penalty(self.user_id, pen)
+
+
+# ---------- 야바위 난이도 1~5 ----------
+class YabawiDiffView(discord.ui.View):
+    def __init__(self, game_id, user_id, guild_id, bet, channel_id):
+        super().__init__(timeout=60)
+        self.args = (game_id, user_id, guild_id, bet, channel_id)
+        for d in range(1, 6):
+            cups = d + 2
+            mult = round(1.5 + d * 0.7, 1)
+            btn = discord.ui.Button(label=f"난이도{d} (컵{cups} ×{mult})", style=discord.ButtonStyle.primary, row=(d-1)//3)
+            btn.callback = self._mk(d, cups, mult)
+            self.add_item(btn)
+
+    def _mk(self, diff, cups, mult):
+        async def cb(interaction):
+            if interaction.user.id != self.args[1]: return
+            v = YabawiView(*self.args, cups, mult)
+            update_gamble_state(self.args[1], state={"cups": cups, "mult": mult})
+            await interaction.response.edit_message(content=f"🎭 난이도 {diff} — 컵을 고르세요", view=v)
+        return cb
+
+
+class YabawiView(discord.ui.View):
+    def __init__(self, game_id, user_id, guild_id, bet, channel_id, cups, mult):
+        super().__init__(timeout=60)
+        self.game_id, self.user_id, self.guild_id = game_id, user_id, guild_id
+        self.bet, self.channel_id, self.mult = bet, channel_id, mult
+        self.answer = random.randint(0, cups - 1)
+        self.finished = False
+        for i in range(cups):
+            btn = discord.ui.Button(label=f"컵{i+1}", emoji="🥤", style=discord.ButtonStyle.secondary, row=i//4)
+            btn.callback = self._mk(i)
+            self.add_item(btn)
+
+    def _mk(self, idx):
+        async def cb(interaction):
+            if self.finished or interaction.user.id != self.user_id: return
+            self.finished = True
+            self.stop()
+            clear_gamble(self.user_id)
+            if idx == self.answer:
+                gross = int(self.bet * self.mult)
+                payout, fee, new_m = await _payout_single(self.user_id, gross, self.channel_id, getattr(self, "guild_id", None))
+                msg = f"🎭 정답 컵{idx+1}! ×{self.mult} +**{payout:,}** (수수료 {fee:,}) 보유 {new_m:,}"
+            else:
+                await _lose_to_jackpot(self.user_id, self.bet, self.channel_id)
+                msg = f"🎭 꽝 (정답 컵{self.answer+1}) -{self.bet:,} → JACKPOT"
+            await interaction.response.edit_message(content=msg, view=None)
+        return cb
+
+
+# ---------- 폭탄 룰렛 ----------
+# 시작: 총 6칸 · 안전 5 · 폭탄 1
+# 성공 시: 총 칸 +1, 안전 -1, 폭탄 증가
+#   step0: 6칸 (안전5/폭탄1) → 성공 시 ×1.15
+#   step1: 7칸 (안전4/폭탄3) → ×1.5
+#   step2: 8칸 (안전3/폭탄5) → ×2.4
+#   step3: 9칸 (안전2/폭탄7) → ×5.28
+#   step4: 10칸 (안전1/폭탄9) → ×21.12 · 성공 시 즉시 종료
+BOMB_MULTS = [1.15, 1.5, 2.4, 5.28, 21.12]
+
+
+class BombRouletteView(discord.ui.View):
+    def __init__(self, game_id, user_id, guild_id, bet, channel_id):
+        super().__init__(timeout=120)
+        self.game_id = game_id
+        self.user_id = user_id
+        self.guild_id = guild_id
+        self.bet = bet
+        self.channel_id = channel_id
+        self.step = 0  # 0~4
+        self.finished = False
+        self.earned_mult = 1.0  # 지금까지 확보한 배율 (현금화용)
+        self._deal_round()
+
+    def _board_counts(self):
+        """현재 step의 (total, safe, bomb)"""
+        total = 6 + self.step
+        safe = max(1, 5 - self.step)
+        bomb = total - safe
+        return total, safe, bomb
+
+    def _deal_round(self):
+        total, safe, bomb = self._board_counts()
+        cells = [False] * safe + [True] * bomb  # True = 폭탄
+        random.shuffle(cells)
+        self.cells = cells  # index 0..total-1
+        self._rebuild()
+
+    def _rebuild(self):
+        self.clear_items()
+        if self.finished or self.step >= 5:
+            return
+        total, _, _ = self._board_counts()
+        for i in range(total):
+            btn = discord.ui.Button(
+                label=f"{i+1}",
+                style=discord.ButtonStyle.secondary,
+                row=i // 5
+            )
+            btn.callback = self._make_pick(i)
+            self.add_item(btn)
+        if self.step > 0:
+            cash = discord.ui.Button(
+                label="지금 가져가기",
+                emoji="💰",
+                style=discord.ButtonStyle.success,
+                row=2
+            )
+            cash.callback = self.on_cash
+            self.add_item(cash)
+
+    def _make_pick(self, idx):
+        async def cb(interaction: discord.Interaction):
+            if self.finished or interaction.user.id != self.user_id:
+                await interaction.response.defer()
+                return
+            if idx < 0 or idx >= len(self.cells):
+                return
+            is_bomb = self.cells[idx]
+            if is_bomb:
+                self.finished = True
+                self.stop()
+                clear_gamble(self.user_id)
+                await _lose_to_jackpot(self.user_id, self.bet, self.channel_id)
+                await interaction.response.edit_message(
+                    content=f"💥 **폭탄!** (칸 {idx+1})\n배팅 **{self.bet:,}** → JACKPOT",
+                    embed=None, view=None
+                )
+                return
+            # 안전
+            self.earned_mult = BOMB_MULTS[self.step]
+            self.step += 1
+            update_gamble_state(self.user_id, state={"step": self.step, "earned_mult": self.earned_mult})
+            if self.step >= 5:
+                await self._payout(interaction, BOMB_MULTS[-1])
+                return
+            self._deal_round()
+            await interaction.response.edit_message(
+                content=f"✅ 칸 {idx+1} 안전! 배율 **×{self.earned_mult}** 확보",
+                embed=self.build_embed(),
+                view=self
+            )
+        return cb
+
+    def build_embed(self):
+        total, safe, bomb = self._board_counts()
+        next_m = BOMB_MULTS[self.step] if self.step < 5 else BOMB_MULTS[-1]
+        return discord.Embed(
+            title="💣 폭탄 룰렛",
+            description=(
+                f"**단계 {self.step}/5** · 확보 배율 **×{self.earned_mult}** "
+                f"({int(self.bet * self.earned_mult):,}코인)\n"
+                f"이번 판: 총 **{total}**칸 · 안전 **{safe}** · 폭탄 **{bomb}**\n"
+                f"성공 시 다음 배율 **×{next_m}**\n"
+                f"배율: 1.15 → 1.5 → 2.4 → 5.28 → 21.12\n"
+                f"칸을 하나 고르세요. (성공마다 총 칸+1, 안전-1)"
+            ),
+            color=discord.Color.red()
+        )
+
+    async def on_cash(self, interaction: discord.Interaction):
+        if self.finished or interaction.user.id != self.user_id:
+            return
+        if self.step <= 0:
+            await interaction.response.send_message("아직 확보한 배율이 없습니다.", ephemeral=True)
+            return
+        await self._payout(interaction, self.earned_mult)
+
+    async def _payout(self, interaction, mult):
+        self.finished = True
+        self.stop()
+        clear_gamble(self.user_id)
+        gross = int(self.bet * mult)
+        payout, fee, new_m = await _payout_single(self.user_id, gross, self.channel_id, getattr(self, "guild_id", None))
+        try:
+            await interaction.response.edit_message(
+                content=f"💰 **×{mult}** → +**{payout:,}** (수수료 {fee:,}) 보유 {new_m:,}",
+                embed=None, view=None
+            )
+        except Exception:
+            try:
+                await interaction.edit_original_response(
+                    content=f"💰 **×{mult}** → +**{payout:,}** (보유 {new_m:,})",
+                    embed=None, view=None
+                )
+            except Exception:
+                pass
+
+    async def on_timeout(self):
+        if self.finished:
+            return
+        self.finished = True
+        clear_gamble(self.user_id)
+        # 확보 배율이 있으면 그걸로 지급, 없으면 몰수
+        if self.step > 0 and self.earned_mult > 1.0:
+            gross = int(self.bet * self.earned_mult)
+            await _payout_single(self.user_id, gross, self.channel_id, getattr(self, "guild_id", None))
+        else:
+            await _lose_to_jackpot(self.user_id, self.bet, self.channel_id)
+            pen = await get_timeout_penalty_seconds(self.game_id)
+            apply_timeout_penalty(self.user_id, pen)
+
+
+# ---------- 미니 친치로 (기획 족보) ----------
+def _cc_roll():
+    return tuple(sorted(random.randint(1, 6) for _ in range(3)))
+
+def _cc_eval(dice):
+    a,b,c = dice
+    if dice == (1,1,1): return ("핀조로", 10, "special")
+    if dice == (5,5,5): return ("고조로", 5, "special")
+    if a==b==c: return ("아라시", 3, "special")
+    if dice == (4,5,6): return ("시고로", 2, "special")
+    if dice == (1,2,3): return ("히후미", 0, "hifumi")
+    if a==b: return (f"눈{c}", c, "pair")
+    if b==c: return (f"눈{a}", a, "pair")
+    if a==c: return (f"눈{b}", b, "pair")
+    return ("무세", 0, "none")
+
+class ChinchiroView(discord.ui.View):
+    """싱글: 본인=부모, 봇=자식. 부모가 굴림(재굴림 2회)."""
+    def __init__(self, game_id, user_id, guild_id, bet, channel_id):
+        super().__init__(timeout=90)
+        self.game_id, self.user_id = game_id, user_id
+        self.bet, self.channel_id = bet, channel_id
+        self.rerolls = 2
+        self.parent_dice = None
+        self.finished = False
+        self.phase = "parent"  # parent -> child -> done
+
+    def build_embed(self):
+        pd = f"{self.parent_dice}" if self.parent_dice else "미굴림"
+        return discord.Embed(
+            title="🎲 미니 친치로 (부모=나)",
+            description=f"부모 주사위: {pd}\n재굴림 남음: {self.rerolls}\n배팅 **{self.bet:,}**",
+            color=discord.Color.orange()
+        )
+
+    @discord.ui.button(label="굴리기", emoji="🎲", style=discord.ButtonStyle.primary)
+    async def roll(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.finished or interaction.user.id != self.user_id: return
+        if self.phase != "parent": return
+        self.parent_dice = _cc_roll()
+        name, val, kind = _cc_eval(self.parent_dice)
+        if kind == "hifumi":
+            # 부모 히후미 = 부모 패배 특수? 기획: 히후미는 배팅액 2배 손실 — 굴린 쪽
+            await self._end(interaction, False, "히후미! 2배 손실", loss_mult=2)
+            return
+        if self.parent_dice == (6,6,6) or (kind == "special" and name == "핀조로"):
+            pass  # continue to compare or instant
+        # 즉시: 부모 6 눈? 기획 "6 → 부모 즉시 승리" means pair eye 6?
+        if kind == "pair" and val == 6:
+            await self._end(interaction, True, "눈6 즉시 승리!", mult=2)
+            return
+        self._rebuild_parent_buttons()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    def _rebuild_parent_buttons(self):
+        self.clear_items()
+        if self.rerolls > 0:
+            r = discord.ui.Button(label=f"재굴림 ({self.rerolls})", emoji="🔄", style=discord.ButtonStyle.secondary)
+            r.callback = self.on_reroll
+            self.add_item(r)
+        conf = discord.ui.Button(label="확정", emoji="✅", style=discord.ButtonStyle.success)
+        conf.callback = self.on_confirm
+        self.add_item(conf)
+
+    async def on_reroll(self, interaction: discord.Interaction):
+        if self.finished or interaction.user.id != self.user_id: return
+        if self.rerolls <= 0: return
+        self.rerolls -= 1
+        self.parent_dice = _cc_roll()
+        name, val, kind = _cc_eval(self.parent_dice)
+        if kind == "hifumi":
+            await self._end(interaction, False, "재굴림 히후미! 2배 손실", loss_mult=2)
+            return
+        if kind == "pair" and val == 6:
+            await self._end(interaction, True, "눈6 즉시 승리!", mult=2)
+            return
+        self._rebuild_parent_buttons()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def on_confirm(self, interaction: discord.Interaction):
+        if self.finished or interaction.user.id != self.user_id: return
+        # 자식(봇) 굴림
+        child = _cc_roll()
+        # 자식 즉시: 눈1
+        cn, cv, ck = _cc_eval(child)
+        if ck == "pair" and cv == 1:
+            await self._end(interaction, False, f"자식 눈1 즉시승! 자식{child}", mult=1)
+            return
+        if ck == "hifumi":
+            await self._end(interaction, True, f"자식 히후미! 승리 자식{child}", mult=2)
+            return
+        pn, pv, pk = _cc_eval(self.parent_dice)
+        # 비교
+        if pk == "special" or ck == "special":
+            if pk == "special" and (ck != "special" or pv >= cv):
+                await self._end(interaction, True, f"부모{self.parent_dice}({pn}) > 자식{child}({cn})", mult=max(2, pv if pk=="special" else 2))
+            elif ck == "special":
+                await self._end(interaction, False, f"부모{self.parent_dice}({pn}) < 자식{child}({cn})")
+            else:
+                await self._end(interaction, True, f"특수 동급 부모승", mult=2)
+            return
+        if pk == "pair" and ck == "pair":
+            if pv > cv:
+                await self._end(interaction, True, f"눈{pv} > 눈{cv}", mult=2)
+            elif pv < cv:
+                await self._end(interaction, False, f"눈{pv} < 눈{cv}")
+            else:
+                await self._end(interaction, None, f"동점 눈{pv}", push=True)
+            return
+        if pk == "pair":
+            await self._end(interaction, True, f"부모 페어 vs 무세", mult=2)
+        elif ck == "pair":
+            await self._end(interaction, False, f"자식 페어 승")
+        else:
+            await self._end(interaction, None, "양측 무세", push=True)
+
+    async def _end(self, interaction, win, msg, mult=2, loss_mult=1, push=False):
+        self.finished = True
+        self.stop()
+        clear_gamble(self.user_id)
+        if push:
+            net, fee, new_m = await _payout_single(self.user_id, self.bet, self.channel_id, getattr(self, "guild_id", None))
+            text = f"🤝 {msg}\n반환 {net:,} (수수료 {fee:,}) · 보유 {new_m:,}"
+        elif win:
+            gross = int(self.bet * mult)
+            net, fee, new_m = await _payout_single(self.user_id, gross, self.channel_id, getattr(self, "guild_id", None))
+            text = f"🎉 {msg}\n+{net:,} (수수료 {fee:,}) · 보유 {new_m:,}"
+        else:
+            loss = int(self.bet * loss_mult)
+            extra = loss - self.bet
+            if extra > 0:
+                await _deduct_money(self.user_id, extra)
+            await _lose_to_jackpot(self.user_id, loss, self.channel_id)
+            connection = await get_db()
+            try:
+                new_m = await connection.fetchval("SELECT money FROM players WHERE user_id=$1", str(self.user_id))
+            finally:
+                await connection.close()
+            text = f"😢 {msg}\n-{loss:,} → JACKPOT · 보유 {new_m:,}"
+        await interaction.response.edit_message(content=text, embed=None, view=None)
+
+
+# ---------- 인디언 포커 BET/RAISE/FOLD ----------
+class IndianPokerView(discord.ui.View):
+    def __init__(self, game_id, user_id, guild_id, bet, channel_id):
+        super().__init__(timeout=90)
+        self.game_id, self.user_id = game_id, user_id
+        self.bet, self.channel_id = bet, channel_id
+        self.pot = bet * 2  # 플레이어+봇 매칭
+        self.my_card = random.randint(1, 13)
+        self.bot_card = random.randint(1, 13)
+        self.finished = False
+
+    def build_embed(self):
+        return discord.Embed(
+            title="🧠 인디언 포커",
+            description=(
+                f"상대 카드(보임): **{self.bot_card}**\n"
+                f"내 카드: **?**\n"
+                f"팟 **{self.pot:,}** (내 배팅 {self.bet:,})\n"
+                f"BET=승부 / RAISE=추가배팅 후 승부 / FOLD=절반반환"
+            ),
+            color=discord.Color.dark_purple()
+        )
+
+    async def _showdown(self, interaction, extra_bet=0):
+        self.finished = True
+        self.stop()
+        clear_gamble(self.user_id)
+        if extra_bet:
+            if not await _deduct_money(self.user_id, extra_bet):
+                await interaction.response.send_message("추가 배팅 실패", ephemeral=True)
+                return
+            self.pot += extra_bet * 2  # 봇도 콜
+        if self.my_card > self.bot_card:
+            net, fee, new_m = await _payout_single(self.user_id, self.pot, self.channel_id, getattr(self, "guild_id", None))
+            msg = f"승리! 내 카드 **{self.my_card}** > {self.bot_card}\n팟 +{net:,} (수수료 {fee:,}) · 보유 {new_m:,}"
+        elif self.my_card < self.bot_card:
+            await _lose_to_jackpot(self.user_id, self.bet + extra_bet, self.channel_id)
+            connection = await get_db()
+            try:
+                new_m = await connection.fetchval("SELECT money FROM players WHERE user_id=$1", str(self.user_id))
+            finally:
+                await connection.close()
+            msg = f"패배... 내 카드 **{self.my_card}** < {self.bot_card}\n보유 {new_m:,}"
+        else:
+            net, fee, new_m = await _payout_single(self.user_id, self.bet + extra_bet, self.channel_id, getattr(self, "guild_id", None))
+            msg = f"무승부 카드 {self.my_card}\n반환 {net:,} (수수료 {fee:,}) · 보유 {new_m:,}"
+        await interaction.response.edit_message(content=msg, embed=None, view=None)
+
+    @discord.ui.button(label="BET", emoji="💰", style=discord.ButtonStyle.success)
+    async def bet_btn(self, i, b):
+        if self.finished or i.user.id != self.user_id: return
+        await self._showdown(i)
+
+    @discord.ui.button(label="RAISE", emoji="📈", style=discord.ButtonStyle.danger)
+    async def raise_btn(self, i, b):
+        if self.finished or i.user.id != self.user_id: return
+        await self._showdown(i, extra_bet=self.bet)
+
+    @discord.ui.button(label="FOLD", emoji="🏳️", style=discord.ButtonStyle.secondary)
+    async def fold(self, i, b):
+        if self.finished or i.user.id != self.user_id: return
+        self.finished = True
+        self.stop()
+        clear_gamble(self.user_id)
+        half = self.bet // 2
+        await _lose_to_jackpot(self.user_id, self.bet - half, self.channel_id)
+        net, fee, new_m = await _payout_single(self.user_id, half, self.channel_id, getattr(self, "guild_id", None))
+        await i.response.edit_message(
+            content=f"🏳️ 폴드. 절반 반환 {net:,} (수수료 {fee:,}, 카드 {self.my_card})\n보유 {new_m:,}",
+            embed=None, view=None
+        )
+
+
+# ---------- 룰렛 (다양한 배팅 배율) ----------
+ROULETTE_RED = {1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36}
+
+class RouletteBetSelect(discord.ui.View):
+    def __init__(self, game_id, user_id, guild_id, bet, channel_id):
+        super().__init__(timeout=60)
+        self.ctx = (game_id, user_id, guild_id, bet, channel_id)
+
+    async def _go(self, interaction, bet_type, label, mult):
+        if interaction.user.id != self.ctx[1]: return
+        n = random.randint(0, 36)
+        color = "green" if n == 0 else ("red" if n in ROULETTE_RED else "black")
+        win = False
+        if bet_type == "red" and color == "red": win = True
+        elif bet_type == "black" and color == "black": win = True
+        elif bet_type == "odd" and n and n % 2 == 1: win = True
+        elif bet_type == "even" and n and n % 2 == 0: win = True
+        elif bet_type == "low" and 1 <= n <= 18: win = True
+        elif bet_type == "high" and 19 <= n <= 36: win = True
+        elif bet_type == "dozen1" and 1 <= n <= 12: win = True
+        elif bet_type == "dozen2" and 13 <= n <= 24: win = True
+        elif bet_type == "dozen3" and 25 <= n <= 36: win = True
+        clear_gamble(self.ctx[1])
+        bet, ch = self.ctx[3], self.ctx[4]
+        if win:
+            gross = int(bet * mult)
+            payout, fee, new_m = await _payout_single(self.ctx[1], gross, ch)
+            msg = f"🎡 **{n}** ({color}) 적중 {label} ×{mult} +**{payout:,}** (수수료 {fee:,})\n보유 {new_m:,}"
+        else:
+            await _lose_to_jackpot(self.ctx[1], bet, ch)
+            msg = f"🎡 **{n}** ({color}) 실패 {label}\n-{bet:,} → JACKPOT"
+        await interaction.response.edit_message(content=msg, view=None)
+
+    @discord.ui.button(label="빨강 ×1.85", emoji="🔴", style=discord.ButtonStyle.danger, row=0)
+    async def red(self, i, b): await self._go(i, "red", "빨강", 1.85)
+
+    @discord.ui.button(label="검정 ×1.85", emoji="⚫", style=discord.ButtonStyle.secondary, row=0)
+    async def black(self, i, b): await self._go(i, "black", "검정", 1.85)
+
+    @discord.ui.button(label="홀 ×1.85", row=0)
+    async def odd(self, i, b): await self._go(i, "odd", "홀", 1.85)
+
+    @discord.ui.button(label="짝 ×1.85", row=0)
+    async def even(self, i, b): await self._go(i, "even", "짝", 1.85)
+
+    @discord.ui.button(label="1~18 ×1.85", row=1)
+    async def low(self, i, b): await self._go(i, "low", "1~18", 1.85)
+
+    @discord.ui.button(label="19~36 ×1.85", row=1)
+    async def high(self, i, b): await self._go(i, "high", "19~36", 1.85)
+
+    @discord.ui.button(label="1~12 ×2.7", row=1)
+    async def d1(self, i, b): await self._go(i, "dozen1", "1~12", 2.7)
+
+    @discord.ui.button(label="13~24 ×2.7", row=1)
+    async def d2(self, i, b): await self._go(i, "dozen2", "13~24", 2.7)
+
+    @discord.ui.button(label="25~36 ×2.7", row=2)
+    async def d3(self, i, b): await self._go(i, "dozen3", "25~36", 2.7)
+
+
+# ---------- 경마 (실시간 진행 연출) ----------
+HORSES = [
+    {"name": "번개", "odds": 2.0, "w": 28},
+    {"name": "폭풍", "odds": 3.2, "w": 22},
+    {"name": "질풍", "odds": 4.5, "w": 16},
+    {"name": "암흑", "odds": 7.0, "w": 12},
+    {"name": "전설", "odds": 12.0, "w": 8},
+]
+
+class HorseRaceView(discord.ui.View):
+    def __init__(self, game_id, user_id, guild_id, bet, channel_id):
+        super().__init__(timeout=60)
+        self.game_id, self.user_id = game_id, user_id
+        self.bet, self.channel_id = bet, channel_id
+        self.finished = False
+        for i, h in enumerate(HORSES):
+            btn = discord.ui.Button(label=f"{h['name']} ×{h['odds']}", style=discord.ButtonStyle.primary, row=i//3)
+            btn.callback = self._mk(i)
+            self.add_item(btn)
+
+    def _mk(self, idx):
+        async def cb(interaction):
+            if self.finished or interaction.user.id != self.user_id: return
+            self.finished = True
+            self.stop()
+            clear_gamble(self.user_id)
+            weights = [h["w"] for h in HORSES]
+            progress = [0]*len(HORSES)
+            await interaction.response.edit_message(content="🏇 출발!", view=None)
+            for _ in range(5):
+                await asyncio.sleep(0.8)
+                for i in range(len(HORSES)):
+                    progress[i] += random.randint(1, max(1, weights[i]//5 + 2))
+                board = "\n".join(
+                    f"{HORSES[i]['name']}: {'═'*min(20, progress[i]//2)}{'🐎' if progress[i]==max(progress) else ''}"
+                    for i in range(len(HORSES))
+                )
+                try:
+                    await interaction.edit_original_response(content=f"🏇 레이스 중...\n{board}")
+                except Exception:
+                    pass
+            winner = max(range(len(HORSES)), key=lambda i: progress[i])
+            # 확률 보정으로 weights 기반 최종 승자 재롤 가능 — 진행 1등 사용
+            wname = HORSES[winner]["name"]
+            if idx == winner:
+                gross = int(self.bet * HORSES[idx]["odds"])
+                payout, fee, new_m = await _payout_single(self.user_id, gross, self.channel_id, getattr(self, "guild_id", None))
+                msg = f"🏇 **{wname}** 우승! 적중 +**{payout:,}** (수수료 {fee:,})\n보유 {new_m:,}"
+            else:
+                await _lose_to_jackpot(self.user_id, self.bet, self.channel_id)
+                msg = f"🏇 **{wname}** 우승... 내 말 {HORSES[idx]['name']} 낙첨 → JACKPOT"
+            try:
+                await interaction.edit_original_response(content=msg)
+            except Exception:
+                pass
+        return cb
+
+
+async def _start_simple_game(interaction, game_id, min_bet, name, after_bet):
+    async def on_bet(inter, bet):
+        sid = inter.guild.id if inter.guild else None
+        if not await _deduct_money(inter.user.id, bet, sid):
+            await inter.response.send_message("코인 부족", ephemeral=True)
+            return
+        register_gamble(inter.user.id, name, bet, inter.channel.id, game_id, guild_id=sid)
+        await after_bet(inter, bet)
+    if not await _guard_gamble(interaction, min_bet):
+        return
+    await interaction.response.send_modal(SimpleBetModal(f"{name} 배팅", min_bet, on_bet))
+
+
+class GameSelectView(discord.ui.View):
+    def __init__(self, game_id):
+        super().__init__(timeout=180)
+        self.game_id = game_id
+
+    @discord.ui.button(label="블랙잭", emoji="🃏", style=discord.ButtonStyle.primary, row=0)
+    async def blackjack(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await _guard_gamble(interaction, 10_000):
+            return
+        await interaction.response.send_modal(BlackjackBetModal(self.game_id))
+
+    @discord.ui.button(label="에이스브레이커", emoji="🅰️", style=discord.ButtonStyle.primary, row=0)
     async def ace_breaker(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if is_user_gambling(interaction.user.id):
-            sess = active_gambles[int(interaction.user.id)]
-            await interaction.response.send_message(
-                f"🔒 이미 **{sess['type']}** 진행 중입니다. 종료 후 다시 시도하세요.",
-                ephemeral=True
-            )
-            return
-        pen = get_penalty_remaining(interaction.user.id)
-        if pen > 0:
-            await interaction.response.send_message(
-                f"🚫 시간 초과 패널티 중입니다.\n"
-                f"도박·알바 이용 불가 — 남은 시간: **{format_seconds(pen)}**",
-                ephemeral=True
-            )
-            return
-        player = await get_or_create_player(interaction.user, interaction.guild)
-        if not player["alive"] or player["eliminated"]:
-            await interaction.response.send_message("탈락자는 게임을 할 수 없습니다.", ephemeral=True)
-            return
-        if player["money"] < 20_000:
-            await interaction.response.send_message(
-                f"🔴 돈이 부족합니다. 최소 20,000 코인이 필요합니다.\n보유: **{player['money']:,}**",
-                ephemeral=True
-            )
+        if not await _guard_gamble(interaction, 20_000):
             return
         view = AceBreakerView(
             self.game_id, interaction.user.id, interaction.guild.id,
             channel_id=interaction.channel.id
         )
-        register_gamble(interaction.user.id, "에이스 브레이커", 0, interaction.channel.id, self.game_id)
+        register_gamble(interaction.user.id, "에이스 브레이커", 0, interaction.channel.id, self.game_id, guild_id=interaction.guild.id if interaction.guild else None)
         inv = await get_player_inventory(str(interaction.user.id), str(interaction.guild.id))
         start_view = UnderdrawAceBreakerView(view) if inv.get("밑장빼기권", 0) > 0 else view
-        msg = await interaction.channel.send(
-            content=(
-                f"🃏 <@{interaction.user.id}> **에이스 브레이커** 시작!\n"
-                f"(공개 진행 · 중퇴/시간초과 시 배팅 몰수)"
-            ),
-            embed=view.build_embed(),
-            view=start_view
-        )
-        view.public_message = msg
         await interaction.response.send_message(
-            "에이스 브레이커가 채널에 **공개**로 시작되었습니다.",
-            ephemeral=True
+            content="🃏 에이스 브레이커 (본인만)",
+            embed=view.build_embed(), view=start_view, ephemeral=True
         )
 
-    @discord.ui.button(label="홀짝 (간단)", emoji="🔢", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="홀짝", emoji="🔢", style=discord.ButtonStyle.secondary, row=0)
     async def odd_even(self, interaction: discord.Interaction, button: discord.ui.Button):
+        async def after(inter, bet):
+            v = OddEvenView(self.game_id, inter.user.id, inter.guild.id, bet, inter.channel.id)
+            await inter.response.send_message(embed=v.build_embed(), view=v, ephemeral=True)
+        await _start_simple_game(interaction, self.game_id, 10_000, "홀짝", after)
+
+    @discord.ui.button(label="야바위", emoji="🎭", style=discord.ButtonStyle.secondary, row=0)
+    async def yabawi(self, interaction: discord.Interaction, button: discord.ui.Button):
+        async def after(inter, bet):
+            v = YabawiDiffView(self.game_id, inter.user.id, inter.guild.id, bet, inter.channel.id)
+            await inter.response.send_message("🎭 난이도를 고르세요", view=v, ephemeral=True)
+        await _start_simple_game(interaction, self.game_id, 10_000, "야바위", after)
+
+    @discord.ui.button(label="폭탄룰렛", emoji="💣", style=discord.ButtonStyle.danger, row=1)
+    async def bomb(self, interaction: discord.Interaction, button: discord.ui.Button):
+        async def after(inter, bet):
+            v = BombRouletteView(self.game_id, inter.user.id, inter.guild.id, bet, inter.channel.id)
+            await inter.response.send_message(embed=v.build_embed(), view=v, ephemeral=True)
+        await _start_simple_game(interaction, self.game_id, 10_000, "폭탄룰렛", after)
+
+    @discord.ui.button(label="친치로", emoji="🎲", style=discord.ButtonStyle.primary, row=1)
+    async def chinchiro(self, interaction: discord.Interaction, button: discord.ui.Button):
+        async def after(inter, bet):
+            v = ChinchiroView(self.game_id, inter.user.id, inter.guild.id, bet, inter.channel.id)
+            await inter.response.send_message(embed=v.build_embed(), view=v, ephemeral=True)
+        await _start_simple_game(interaction, self.game_id, 10_000, "친치로", after)
+
+    @discord.ui.button(label="인디언포커", emoji="🧠", style=discord.ButtonStyle.primary, row=1)
+    async def indian(self, interaction: discord.Interaction, button: discord.ui.Button):
+        async def after(inter, bet):
+            v = IndianPokerView(self.game_id, inter.user.id, inter.guild.id, bet, inter.channel.id)
+            update_gamble_state(inter.user.id, state={"my_card": v.my_card, "bot_card": v.bot_card})
+            await inter.response.send_message(embed=v.build_embed(), view=v, ephemeral=True)
+        await _start_simple_game(interaction, self.game_id, 10_000, "인디언포커", after)
+
+    @discord.ui.button(label="룰렛", emoji="🎡", style=discord.ButtonStyle.danger, row=1)
+    async def roulette(self, interaction: discord.Interaction, button: discord.ui.Button):
+        async def after(inter, bet):
+            v = RouletteBetSelect(self.game_id, inter.user.id, inter.guild.id, bet, inter.channel.id)
+            await inter.response.send_message("🎡 배팅 종류를 고르세요", view=v, ephemeral=True)
+        await _start_simple_game(interaction, self.game_id, 10_000, "룰렛", after)
+
+    @discord.ui.button(label="경마", emoji="🏇", style=discord.ButtonStyle.success, row=2)
+    async def horse(self, interaction: discord.Interaction, button: discord.ui.Button):
+        async def after(inter, bet):
+            v = HorseRaceView(self.game_id, inter.user.id, inter.guild.id, bet, inter.channel.id)
+            lines = "\n".join(f"· {h['name']} 배율 ×{h['odds']}" for h in HORSES)
+            await inter.response.send_message(f"🏇 말을 선택하세요\n{lines}", view=v, ephemeral=True)
+        await _start_simple_game(interaction, self.game_id, 10_000, "경마", after)
+
+    @discord.ui.button(label="멀티", emoji="👥", style=discord.ButtonStyle.success, row=2)
+    async def multi(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if is_user_gambling(interaction.user.id) or is_timeout_penalized(interaction.user.id):
+            await interaction.response.send_message("도박 중이거나 패널티 상태입니다.", ephemeral=True)
+            return
+        embed = discord.Embed(
+            title="👥 멀티 게임",
+            description="BJ · AB · 친치로 · 인디언 · 룰렛 · 경마 멀티",
+            color=discord.Color.blurple()
+        )
+        await interaction.response.send_message(embed=embed, view=MultiMenuView(self.game_id), ephemeral=True)
+
+    @discord.ui.button(label="복권·박스", emoji="🎁", style=discord.ButtonStyle.secondary, row=2)
+    async def lottery_info(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message(
-            "🔢 홀짝 게임은 다음 업데이트에서 본격 구현됩니다.\n현재는 블랙잭 / 에이스 브레이커를 즐겨주세요!",
+            "🎁 **랜덤박스 / 🎟️ 일반복권 / 🎫 즉석복권**\n"
+            "상점에서 구매 후 **가방**에서 사용하세요.\n"
+            "🗺️ 보물찾기 이벤트는 **이벤트 참가권**으로만 참가 가능합니다.",
             ephemeral=True
         )
 
-    @discord.ui.button(label="닫기", emoji="❌", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="닫기", emoji="❌", style=discord.ButtonStyle.secondary, row=2)
     async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.edit_message(content="게임 메뉴를 닫았습니다.", embed=None, view=None)
+        await interaction.response.edit_message(content="닫힘", embed=None, view=None)
 
 
 # ============================================================
@@ -5705,10 +7781,37 @@ class SurvivalGameView(discord.ui.View):
 
     @discord.ui.button(label="새로고침", emoji="🔄", style=discord.ButtonStyle.secondary, row=0)
     async def refresh(self, interaction: discord.Interaction, button: discord.ui.Button):
-        embed = await build_main_embed(self.game_id, interaction.user.id, interaction.guild.id)
+        embed = await build_main_embed(self.game_id)
         await interaction.response.edit_message(embed=embed, view=self)
 
-    @discord.ui.button(label="게임", emoji="🎮", style=discord.ButtonStyle.success, row=0)
+    @discord.ui.button(label="내 정보", emoji="🔒", style=discord.ButtonStyle.secondary, row=0)
+    async def my_info(self, interaction: discord.Interaction, button: discord.ui.Button):
+        embed = await build_private_status_embed(
+            self.game_id, interaction.user.id, interaction.guild.id
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @discord.ui.button(label="도박 재접속", emoji="🔌", style=discord.ButtonStyle.secondary, row=0)
+    async def reconnect_gamble(self, interaction: discord.Interaction, button: discord.ui.Button):
+        gid = interaction.guild.id if interaction.guild else None
+        if not is_user_gambling(interaction.user.id, gid):
+            await interaction.response.send_message(
+                "진행 중인 싱글 도박이 없습니다.", ephemeral=True
+            )
+            return
+        sess = get_gamble_session(interaction.user.id, gid) or {}
+        view = GambleReconnectView(interaction.user.id, self.game_id, guild_id=gid)
+        await interaction.response.send_message(
+            content=(
+                f"🔌 **진행 중:** {sess.get('type', '?')}\n"
+                f"배팅 **{sess.get('bet', 0):,}**\n\n"
+                f"**이어서 하기**로 UI 복원, 또는 **포기**(배팅 몰수·패널티)."
+            ),
+            view=view,
+            ephemeral=True
+        )
+
+    @discord.ui.button(label="게임", emoji="🎮", style=discord.ButtonStyle.success, row=1)
     async def games(self, interaction: discord.Interaction, button: discord.ui.Button):
         player = await get_or_create_player(interaction.user, interaction.guild)
         if not player["alive"] or player["eliminated"]:
@@ -5717,18 +7820,18 @@ class SurvivalGameView(discord.ui.View):
         embed = discord.Embed(
             title="🎮 게임 메뉴",
             description=(
-                "원하는 게임을 선택하세요.\n"
-                "배팅 금액은 게임 시작 시 입력합니다.\n\n"
-                f"🪙 현재 코인: **{player['money']:,}**"
+                "싱글은 **본인만** 보이는 화면으로 진행됩니다.\n"
+                "멀니는 스레드에서 진행합니다.\n\n"
+                f"🪙 현재 코인: **{player['money']:,}** _(본인만)_"
             ),
             color=discord.Color.green()
         )
-        embed.add_field(name="🃏 블랙잭", value="HIT / STAND / DOUBLE / SURRENDER", inline=False)
-        embed.add_field(name="🅰️ 에이스 브레이커", value="높음→낮음→높음 심리전 (ACE/JOKER)", inline=False)
-        embed.add_field(name="🔢 홀짝 외", value="추가 게임 순차 업데이트 예정", inline=False)
+        embed.add_field(name="🃏 블랙잭 (싱글)", value="개인 화면 · HIT/STAND/DOUBLE", inline=False)
+        embed.add_field(name="🅰️ 에이스 브레이커 (싱글)", value="개인 화면 · ACE/JOKER", inline=False)
+        embed.add_field(name="👥 멀티 게임", value="스레드 모집 · BJ 2~4 / AB 1v1", inline=False)
         await interaction.response.send_message(embed=embed, view=GameSelectView(self.game_id), ephemeral=True)
 
-    @discord.ui.button(label="알바", emoji="🧑‍💼", style=discord.ButtonStyle.primary, row=0)
+    @discord.ui.button(label="알바", emoji="🧑‍💼", style=discord.ButtonStyle.primary, row=1)
     async def jobs(self, interaction: discord.Interaction, button: discord.ui.Button):
         player = await get_or_create_player(interaction.user, interaction.guild)
         cd = await get_job_cooldown_for_game(self.game_id)
@@ -6084,8 +8187,28 @@ async def force_end(interaction: discord.Interaction):
 
     if game["id"] in active_elimination_tasks:
         active_elimination_tasks[game["id"]].cancel()
+        active_elimination_tasks.pop(game["id"], None)
 
-    await interaction.response.send_message("🛑 게임이 강제 종료되었습니다.")
+    # 도박 세션 / 멀티 로비 / 복권 정리
+    gid = game["id"]
+    ch_id = int(interaction.channel.id)
+    to_clear = [
+        uid for uid, s in list(active_gambles.items())
+        if s.get("game_id") == gid or s.get("channel_id") == ch_id
+    ]
+    for uid in to_clear:
+        clear_gamble(uid)
+    if ch_id in active_multi_lobbies:
+        active_multi_lobbies.pop(ch_id, None)
+    lottery_tickets.pop(ch_id, None)
+    # 라운드 구매 키 정리
+    for k in list(lottery_bought_round):
+        if isinstance(k, tuple) and k and k[0] == ch_id:
+            lottery_bought_round.discard(k)
+
+    await interaction.response.send_message(
+        "🛑 게임이 강제 종료되었습니다.\n(도박 세션·멀티 모집·복권 등록 정리 완료)"
+    )
 
 
 @bot.tree.command(name="다이아상점", description="다이아로 시작 자금을 강화합니다 (게임 시작 전 전용)")
@@ -6132,206 +8255,268 @@ async def diamond_shop(interaction: discord.Interaction):
     )
 
 
+class ManualPagerView(discord.ui.View):
+    def __init__(self, pages: list):
+        super().__init__(timeout=300)
+        self.pages = pages
+        self.index = 0
+        self._sync_buttons()
+
+    def _sync_buttons(self):
+        for child in self.children:
+            if getattr(child, "custom_id", None) == "man_prev":
+                child.disabled = self.index <= 0
+            if getattr(child, "custom_id", None) == "man_next":
+                child.disabled = self.index >= len(self.pages) - 1
+
+    def current(self):
+        emb = self.pages[self.index]
+        emb.set_footer(text=f"페이지 {self.index + 1}/{len(self.pages)} · 이전/다음")
+        return emb
+
+    @discord.ui.button(label="이전", emoji="◀️", style=discord.ButtonStyle.secondary, custom_id="man_prev")
+    async def prev(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.index > 0:
+            self.index -= 1
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self.current(), view=self)
+
+    @discord.ui.button(label="다음", emoji="▶️", style=discord.ButtonStyle.primary, custom_id="man_next")
+    async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.index < len(self.pages) - 1:
+            self.index += 1
+        self._sync_buttons()
+        await interaction.response.edit_message(embed=self.current(), view=self)
+
+    @discord.ui.button(label="닫기", emoji="❌", style=discord.ButtonStyle.danger)
+    async def close(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(content="설명서를 닫았습니다.", embed=None, view=None)
+
+
 @bot.tree.command(name="설명서", description="머니 배틀로얄 전체 규칙 / 게임 / 아이템 / 알바 상세 설명서")
 async def manual_command(interaction: discord.Interaction):
-    """매우 자세한 통합 설명서"""
     embeds = []
 
-    # 1. 기본 규칙
     e1 = discord.Embed(
-        title="📖 머니 배틀로얄 설명서 - 기본 규칙",
+        title="📖 1. 기본 규칙 · 재화 · 탈락",
         description=(
-            "**💰 머니 배틀로얄**은 Discord에서 즐기는 가상 재화 기반 멀티 서바이벌 게임입니다.\n\n"
-            "돈을 벌고 → 게임을 선택하고 → 아이템을 사고 → 다른 플레이어와 경쟁하고 → 탈락을 피하고 → **최후의 1인**이 되는 것이 목표입니다.\n\n"
-            "실제 현금은 사용하지 않으며 모든 경제 활동은 봇 내부 가상 재화로만 이루어집니다.\n"
-            f"**최소 플레이어: {MIN_PLAYERS}명**"
+            "**머니 배틀로얄** = 가상 코인 서바이벌. 최후 1인 우승.\n"
+            f"최소 인원 **{MIN_PLAYERS}명** · 시작 자금 **{STARTING_MONEY:,}** (+다이아 보너스)\n"
+            "`/메인` 대기실 → 방장 설정 → 시작"
         ),
         color=discord.Color.gold()
     )
     e1.add_field(
-        name="🏆 게임 시작 방법",
+        name="☠️ 탈락",
         value=(
-            "`/메인` 명령어로 대기실을 열거나 참가합니다.\n"
-            "방장이 설정을 완료한 뒤 **시작** 버튼을 누르면 3초 후 게임이 시작됩니다.\n"
-            f"기본 시작 자금: **{STARTING_MONEY:,}** 코인"
+            "주기마다 **코인 꼴등** 탈락 (기본 5분, 방장 1~60분 설정).\n"
+            "동점 시 랜덤. **탈락자 전 재산 → JACKPOT**.\n"
+            "메인에 생존자/타이머/1등·꼴등/JACKPOT 공개 표시.\n"
+            "개인 코인·아이템은 **내 정보**만."
         ),
         inline=False
     )
     e1.add_field(
-        name="☠️ 탈락 시스템",
+        name="🪙 재화",
         value=(
-            "설정된 주기마다 **보유 코인이 가장 적은 플레이어**가 탈락합니다.\n"
-            "기본: 5분마다 1명 탈락 (방장이 변경 가능)\n"
-            "동점 시 랜덤 처리\n"
-            "탈락자의 코인은 잭팟으로 이동합니다.\n"
-            "마지막 1명이 우승하며 다이아 등 보상을 받습니다.\n"
-            "게임 종료 후 코인과 선행 포인트는 초기화됩니다."
+            "**코인**: 판 한정. 배팅·상점·알바.\n"
+            "**다이아**: 영구. `/다이아상점`으로 시작 보너스.\n"
+            "**선행**: 기부 1:1. 천사 상점. 판 종료 시 소멸.\n"
+            "**JACKPOT**: 패배 배팅·탈락 재산·상점 75%·복권 일부 누적."
         ),
         inline=False
     )
     e1.add_field(
-        name="🪙 재화 설명",
-        value=(
-            "**코인**: 이번 서바이벌에서만 사용하는 핵심 재화. 게임/알바/이벤트로 획득, 배팅/상점에 사용.\n"
-            "**다이아**: 게임을 넘어 유지되는 장기 재화. 출석/우승 등으로 획득. `/다이아상점`에서 시작 자금 강화에 사용.\n"
-            "**선행 포인트**: 기부하면 획득. 천사의 상점에서 사용. 게임 종료 시 사라짐."
-        ),
+        name="⚙️ 방장 설정",
+        value="탈락 주기 · 알바 쿨 · 패널티 시간 · 보물찾기 ON/OFF",
         inline=False
     )
     embeds.append(e1)
 
-    # 2. 기부 & 천사의 상점
-    e2 = discord.Embed(title="📖 기부 & 천사의 상점", color=discord.Color.purple())
+    e2 = discord.Embed(title="📖 2. 상점 · 아이템 · 천사 · 기부", color=discord.Color.blue())
+    shop_lines = []
+    for name, it in SHOP_ITEMS.items():
+        shop_lines.append(f"{it['emoji']} **{name}** {it['price']:,} — {it['desc']}")
+    e2.add_field(name="🏪 일반 상점 (매출 75%→JACKPOT)", value="\n".join(shop_lines)[:1020], inline=False)
     e2.add_field(
-        name="😇 기부 시스템",
+        name="🪽 천사 상점 (판당 1개)",
         value=(
-            "현재 **꼴등**에게 코인을 기부할 수 있습니다.\n"
-            "기부자 코인 감소 → 수혜자 코인 증가 → 기부자 선행 포인트 증가 (1:1)\n"
-            "부자가 꼴등을 살려주는 전략이 가능합니다."
+            "🪽 천사의 구원 3M — 탈락 1회 면제\n"
+            "🏹 큐피트 6M — 연결자 동반 탈락\n"
+            "⏳ 신의 모래시계 7M — 직전 손실 복구\n"
+            "🕊️ 천사의 구제 8M — 상위 재산 일부 재분배\n"
+            "🏛️ 승천궁 10M — 부활·강제탈락·표식"
         ),
         inline=False
     )
     e2.add_field(
-        name="🪽 천사의 상점 (한 게임당 1개만 구매 가능)",
-        value=(
-            "🪽 **천사의 구원** (3,000,000P) : 탈락 대상이 되었을 때 1회 생존\n"
-            "🏹 **큐피트 소환권** (6,000,000P) : 꼴등과 랜덤한 사람(자기 포함)을 연결. 꼴등 탈락 시 연결된 사람도 탈락\n"
-            "⏳ **신의 모래시계** (7,000,000P) : 방금 전 잃은 돈을 1회 복구\n"
-            "🕊️ **천사의 구제** (8,000,000P) : 1~3등 재산 30%를 4등 이하에게 분배 (소수 인원 시 규칙 변경)\n"
-            "🏛️ **승천궁** (10,000,000P) : 최고급 아이템 (탈락자 임시 부활 등 복잡한 효과)"
-        ),
+        name="😇 기부",
+        value="현재 꼴등에게 기부 → 선행+. 부자→꼴등 생존 전략.",
         inline=False
     )
     embeds.append(e2)
 
-    # 3. 일반 상점 & 아이템
-    e3 = discord.Embed(title="📖 일반 상점 & 아이템", color=discord.Color.blue())
+    e3 = discord.Embed(title="📖 3. 알바 · 이벤트 · 중퇴/패널티", color=discord.Color.green())
+    job_lines = [f"{j['emoji']} **{n}** 성공≈{j['reward']:,} / 기본≈{j['base']:,}" for n, j in JOBS.items()]
     e3.add_field(
-        name="🏪 일반 상점 아이템",
-        value=(
-            "👁️ **정찰권** 300,000 : 상대/현재 순위 정보 확인\n"
-            "🪣 **빨대 쪼옵** 600,000 : 원하는 상대의 돈을 랜덤 소액 가져옴\n"
-            "🎟️ **이벤트 참가권** 500,000 : 보물찾기 등 이벤트 참가\n"
-            "⏳ **시간 연장권** 1,000,000 : 다음 탈락 판정 3분 연장\n"
-            "🎁 **랜덤박스** 400,000~ : 개봉 시 코인/다이아/아이템/꽝\n"
-            "🎭 **밑장빼기권** 800,000 : 카드 게임 시작 전 패 하나 랜덤 교체\n"
-            "🔨 **경매 주최권** 1,500,000 : 미스터리 코인 상자 경매 시작"
-        ),
+        name=f"🧑‍💼 알바 (기회 최대 {MAX_JOB_CHARGES}, 쿨타임 충전)",
+        value="\n".join(job_lines) + "\n최소 배팅 1만 기준 약 0.8~3배 보상.",
         inline=False
     )
     e3.add_field(
-        name="🎒 아이템 사용 규칙",
+        name="🗺️ 보물찾기",
+        value="**이벤트 참가권만** 가능 (돈 X). 장소 선택 → 성공도별 보상/꽝.",
+        inline=False
+    )
+    e3.add_field(
+        name="🔒 중퇴·패널티",
         value=(
-            "대부분의 아이템은 **미니게임 시작 전 10초** 동안 사용 여부를 결정합니다.\n"
-            "가방(`🎒 가방` 버튼)에서 미리 사용하거나 확인할 수 있습니다.\n"
-            "시간 연장권, 빨대 쪼옵, 정찰권, 랜덤박스 등은 가방에서 바로 사용 가능합니다.\n"
-            "아이템 사용 사실은 기본적으로 숨겨지며, 효과가 발생하면 결과가 공개될 수 있습니다."
+            "도박 중 중복 불가. 시간초과 시 배팅 몰수+패널티(방장 설정).\n"
+            "메인 **도박 재접속**으로 포기 가능. `/강제종료` 시 세션 정리."
         ),
         inline=False
     )
     embeds.append(e3)
 
-    # 4. 알바
-    e4 = discord.Embed(title="📖 알바 시스템", color=discord.Color.green())
-    e4.add_field(
-        name="🧑‍💼 알바 목록 (참가비 없음, 미니게임으로 코인 획득)",
-        value=(
-            "🧹 **청소** - 20,000 : 오염물 빠르게 클릭\n"
-            "📦 **택배** - 22,000 : 주소 확인 후 상자 분류\n"
-            "🎯 **과녁** - 22,000 : 화면에 나오는 과녁 클릭\n"
-            "🍔 **패스트푸드** - 25,000 : 주문서 보고 재료 순서 맞추기\n"
-            "🏃 **배달** - 25,000 : 주어진 경로 순서대로 방문\n"
-            "🍳 **주방** - 28,000 : 레시피 암기 후 요리 제작\n"
-            "🧠 **데이터 입력** - 30,000 : 제시된 문자/숫자 정확히 입력\n"
-            "🎣 **낚시** - 30,000 : 타이밍 맞춰 낚아채기\n\n"
-            "한 판 약 10~30초, 성공도에 따라 보상 증가.\n"
-            "무한 파밍 방지를 위해 **5분 쿨타임**이 적용됩니다."
+    e4 = discord.Embed(
+        title="📖 4. 카드·주사위 게임",
+        description=(
+            "⚠️ **싱글 게임 수수료 5%**\n"
+            "싱글로 플레이하면 정산 시 **지급액(승·무 반환 포함)의 5%**가 수수료로 차감되어 "
+            "**JACKPOT**에 들어갑니다. (95%만 수령)\n"
+            "패배 시 배팅 전액이 JACKPOT으로 갑니다.\n"
+            "**멀티는 수수료 없음** → 혼자 해도 되고, 수수료 없이 하려면 멀티를 쓰면 됩니다."
         ),
+        color=discord.Color.orange()
+    )
+    e4.add_field(
+        name="🃏 블랙잭 (싱글/멀티 2~4)",
+        value="HIT·STAND·DOUBLE·SURRENDER. 돈 부족 시 더블 불가. 멀티는 스레드·공개 패. **싱글만 5% 수수료**.",
+        inline=False
+    )
+    e4.add_field(
+        name="🅰️ 에이스 브레이커",
+        value=(
+            "카드 1장씩 버튼 드로우 · 멀리건 1회/판.\n"
+            "조커=별도(즉시 대체 드로우, 1장만, 비공개).\n"
+            "ACE당 배율 +0.7(최대 3.1), 조커로 ACE 차단 성공 시 +2.1.\n"
+            "카드 동점=그 라운드 무, 게임 동점=배팅 반환.\n"
+            "멀티 1v1: 선 드로우→멀리건→후배팅≥선."
+        ),
+        inline=False
+    )
+    e4.add_field(
+        name="🎲 친치로",
+        value=(
+            "부모 굴림(재굴림 2)→확정→자식. 핀조로×10 고조로×5 아라시×3 시고로×2 히후미 손실.\n"
+            "페어 눈 비교. 멀티=턴제."
+        ),
+        inline=False
+    )
+    e4.add_field(
+        name="🧠 인디언 포커",
+        value="내 카드 비공개·상대만 보임. BET/RAISE/FOLD. 멀티 턴제.",
         inline=False
     )
     embeds.append(e4)
 
-    # 5. 주요 게임 규칙
-    e5 = discord.Embed(title="📖 주요 미니게임 규칙 (1)", color=discord.Color.orange())
+    e5 = discord.Embed(
+        title="📖 5. 룰렛·폭탄·홀짝·야바위·경마",
+        description="⚠️ 위 게임들도 **싱글 정산 시 5% 수수료 → JACKPOT**. 멀티 룰렛·경마는 수수료 없음.",
+        color=discord.Color.red()
+    )
     e5.add_field(
-        name="🃏 블랙잭 / 마스터 블랙잭",
-        value="HIT, STAND, DOUBLE, SURRENDER 가능. 마스터 모드는 SPLIT 등 추가 규칙 포함.",
+        name="🎡 룰렛 (싱글·멀티 직접 선택)",
+        value="빨강/검정/홀/짝/1~18/19~36 ×1.85 · 12구간 ×2.7 · 0=그린. **싱글 5% 수수료**.",
         inline=False
     )
     e5.add_field(
-        name="🃏 에이스 브레이커 (핵심 심리전)",
+        name="💣 폭탄 룰렛",
         value=(
-            "카드: 2~9, ACE, JOKER (여러 덱 취급)\n"
-            "3장씩 들고 높음→낮음→높음 순서로 비교.\n"
-            "ACE는 무조건 승리, 단 상대 JOKER가 있으면 ACE 패배.\n"
-            "JOKER는 ACE를 막는 용도. 멀리건 1회 가능.\n"
-            "배팅은 랜덤 순서, 후공자는 선배팅 이상 금액 제시."
+            "시작 6칸(안전5/폭탄1) → 성공 시 칸+1·안전-1.\n"
+            "배율 1.15→1.5→2.4→5.28→21.12. 칸 직접 선택. 현금화 가능."
         ),
         inline=False
     )
     e5.add_field(
-        name="🎲 미니 친치로",
-        value=(
-            "주사위 3개. 부모/자식 결정 후 배팅.\n"
-            "즉시 승리 조건, 족보(핀조로 10배, 고조로 5배, 아라시 3배, 시고로 2배, 히후미 손실 등) 존재."
-        ),
+        name="🔢 홀짝",
+        value="배율 1.0 시작. 승: +0.3+0.1×연승 / 패: −0.3−0.1×연패. 7라운드·5% 수수료→JACKPOT.",
         inline=False
     )
     e5.add_field(
-        name="🧠 인디언 포커",
-        value="자신의 카드가 자신에게 안 보이고 상대에게만 보임. BET / RAISE / FOLD 심리전.",
+        name="🎭 야바위",
+        value="난이도 1~5 = 컵 3~7. 배율 상승. 정답 시 배율 지급.",
+        inline=False
+    )
+    e5.add_field(
+        name="🏇 경마 (싱글·멀티 직접 선택)",
+        value="말마다 배율·확률 다름. 진행 연출 후 정산.",
         inline=False
     )
     embeds.append(e5)
 
-    e6 = discord.Embed(title="📖 주요 미니게임 규칙 (2)", color=discord.Color.orange())
+    e6 = discord.Embed(title="📖 6. 복권 · JACKPOT · 경매", color=discord.Color.gold())
     e6.add_field(
-        name="🎡 룰렛 / 💣 폭탄 룰렛",
+        name="🎟️ 잭팟 복권 (100,000 · 라운드당 1장)",
         value=(
-            "숫자, 홀짝, 색상, 구간 등 다양한 배팅.\n"
-            "폭탄 룰렛은 안전한 칸이 점점 줄어들며 배율이 상승하는 고위험 버전."
+            "번호 5개 자동/수동. 탈락 **1분 전** 1~99 중 **15개** 추첨.\n"
+            "**일치 개수** 로또식: 5→1등(잭팟+750만) 4→2등(500만) 3→3등(50만) "
+            "2→4등(10만) 1→5등(5만). 동일 등수 n등분.\n"
+            "내 번호는 **내 정보**에서 확인."
         ),
         inline=False
     )
     e6.add_field(
-        name="🔢 홀짝 / 🎭 야바위 / 🏇 경마",
-        value=(
-            "홀짝: 최대 7라운드, 맞으면 +0.3배 / 틀리면 -0.3배 후 수수료.\n"
-            "야바위: 컵 중 당첨 보상 찾기. 난이도 조절 가능.\n"
-            "경마: 말마다 확률/배율 다름. 실시간 진행."
-        ),
+        name="🎫 즉석복권 (10,000)",
+        value="가방에서 **긁기**. 등급별 보상 또는 꽝→JACKPOT.",
         inline=False
     )
     e6.add_field(
-        name="🎟️ 잭팟 복권 / 🎫 즉석복권 / 🎁 랜덤박스",
-        value=(
-            "잭팟 복권: 탈락 1분 전 추첨. 미리 번호 구매.\n"
-            "즉석복권: 구매 즉시 결과.\n"
-            "복권/상점 수익은 JACKPOT 풀로 누적.\n"
-            "랜덤박스는 0~3배 보상 가능."
-        ),
+        name="🎁 랜덤박스 (200,000)",
+        value="0~3배 코인·다이아·아이템·꽝. 실패분 JACKPOT.",
+        inline=False
+    )
+    e6.add_field(
+        name="🔨 미스터리 상자 경매",
+        value="경매 주최권으로 시작. 입찰 후 개봉 등급별 보상.",
         inline=False
     )
     embeds.append(e6)
 
-    # 마지막
-    e7 = discord.Embed(
-        title="📖 기타 / 명령어",
-        description=(
-            "**주요 명령어**\n"
-            "`/메인` - 게임 메인 메뉴 / 참가\n"
-            "`/다이아상점` - 시작 전 시작자금 강화 (다이아 사용)\n"
-            "`/설명서` - 이 설명서\n"
-            "`/강제종료` - 관리자용 강제 종료\n"
-            "`/테스트게임` - 혼자 테스트용 즉시 시작\n\n"
-            "**중요 알림**은 원래 채널에 공개됩니다 (탈락, 우승, 잭팟, 천사 아이템 등).\n"
-            "서버별 옵션으로 일부 시스템을 ON/OFF 할 수 있습니다."
+    e7 = discord.Embed(title="📖 7. 멀티 · UI · 명령어", color=discord.Color.blurple())
+    e7.add_field(
+        name="💸 싱글 vs 멀티 수수료",
+        value=(
+            "**싱글**: 정산 지급액의 **5% 수수료** → JACKPOT (블랙잭·AB·홀짝·폭탄·야바위·친치로·인디언·룰렛·경마 모두).\n"
+            "**멀티**: 수수료 **없음**."
         ),
-        color=discord.Color.dark_grey()
+        inline=False
+    )
+    e7.add_field(
+        name="👥 멀티",
+        value=(
+            "모집 15초 → 스레드 → 준비(전원 시 즉시).\n"
+            "BJ 2~4 · AB/친치로/인디언 1v1 · 룰렛·경마 단체(직접 선택)."
+        ),
+        inline=False
+    )
+    e7.add_field(
+        name="🖥️ UI",
+        value="메인=공용만. 싱글 도박=본인만. 결과 개인. **도박 재접속**으로 포기.",
+        inline=False
+    )
+    e7.add_field(
+        name="⌨️ 명령어",
+        value=(
+            "`/메인` `/다이아상점` `/설명서` `/강제종료` `/테스트게임`"
+        ),
+        inline=False
     )
     embeds.append(e7)
 
-    await interaction.response.send_message(embeds=embeds[:10], ephemeral=True)  # Discord max 10 embeds
+    pages = embeds[:10]
+    view = ManualPagerView(pages)
+    await interaction.response.send_message(embed=view.current(), view=view, ephemeral=True)
 
 
 # ============================================================
@@ -6344,6 +8529,11 @@ async def on_ready():
     # DB 스키마 보정 (inventory, bonus_starting_money)
     try:
         await init_db()
+        await load_jackpots()
+        await load_lottery()
+        await load_job_states()
+        await load_active_gambles()
+        print("Loaded jackpots/lottery/jobs/gambles from DB")
     except Exception as e:
         print(f"init_db error: {e}")
     try:
