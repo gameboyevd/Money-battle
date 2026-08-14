@@ -127,6 +127,40 @@ DIAMOND_SHOP_ITEMS = {
     },
 }
 
+# 천사의 상점 (게임 중 전용, 선행 포인트 사용, 한 게임당 1개만 구매 가능)
+ANGEL_SHOP_ITEMS = {
+    "천사의 구원": {
+        "emoji": "🪽",
+        "price": 3_000_000,
+        "desc": "탈락 대상이 되었을 때 1회 생존합니다. (게임당 1회)",
+        "effect": "survive_elimination"
+    },
+    "큐피트 소환권": {
+        "emoji": "🏹",
+        "price": 6_000_000,
+        "desc": "꼴등 포함 랜덤 생존자와 자신을 강제 연결. 꼴등 탈락 시 연결자도 탈락.",
+        "effect": "cupid_link"
+    },
+    "신의 모래시계": {
+        "emoji": "⏳",
+        "price": 7_000_000,
+        "desc": "방금 전 잃은 돈을 1회 복구합니다. (가장 최근 손실만)",
+        "effect": "recover_last_loss"
+    },
+    "천사의 구제": {
+        "emoji": "🕊️",
+        "price": 8_000_000,
+        "desc": "1~3등의 돈 30%를 4등 이하에게 분배합니다. (소수 인원 시 규칙 변경)",
+        "effect": "angel_relief"
+    },
+    "승천궁": {
+        "emoji": "🏛️",
+        "price": 10_000_000,
+        "desc": "탈락자 1명 임시 부활 + 다음 판정 강제 탈락 + 지정 대상 코인 차감 등 최고급 효과",
+        "effect": "ascension_palace"
+    },
+}
+
 
 # ============================================================
 # Render HTTP 서버
@@ -189,7 +223,20 @@ async def init_db():
             ALTER TABLE players
             ADD COLUMN IF NOT EXISTS points INTEGER DEFAULT 0;
         """)
-        print("DB schema check completed (inventory, bonus_starting_money)")
+        # 천사의 상점 관련
+        await connection.execute("""
+            ALTER TABLE players
+            ADD COLUMN IF NOT EXISTS angel_item TEXT DEFAULT NULL;
+        """)
+        await connection.execute("""
+            ALTER TABLE players
+            ADD COLUMN IF NOT EXISTS last_money_loss BIGINT DEFAULT 0;
+        """)
+        await connection.execute("""
+            ALTER TABLE players
+            ADD COLUMN IF NOT EXISTS cupid_link_user_id TEXT DEFAULT NULL;
+        """)
+        print("DB schema check completed (inventory, bonus_starting_money, angel fields)")
     except Exception as e:
         print(f"DB init warning: {type(e).__name__}: {e}")
     finally:
@@ -211,9 +258,9 @@ async def get_or_create_player(user: discord.User, guild: discord.Guild):
             INSERT INTO players (
                 server_id, user_id, discord_id, username,
                 money, diamonds, points, good_deed, alive, eliminated,
-                inventory, bonus_starting_money
+                inventory, bonus_starting_money, angel_item, last_money_loss, cupid_link_user_id
             )
-            VALUES ($1, $2, $2, $3, $4, 0, 0, 0, TRUE, FALSE, '{}'::jsonb, 0)
+            VALUES ($1, $2, $2, $3, $4, 0, 0, 0, TRUE, FALSE, '{}'::jsonb, 0, NULL, 0, NULL)
             ON CONFLICT (server_id, discord_id)
             DO UPDATE SET
                 username = EXCLUDED.username,
@@ -610,7 +657,7 @@ async def start_survival_game(game_id):
             )
 
             for player in players:
-                # 다이아 상점에서 구매한 시작 자금 보너스 적용 후 초기화
+                # 다이아 상점에서 구매한 시작 자금 보너스 적용 후 초기화 + 천사 아이템 초기화
                 await connection.execute(
                     """
                     UPDATE players
@@ -620,6 +667,9 @@ async def start_survival_game(game_id):
                         eliminated = FALSE,
                         good_deed = 0,
                         inventory = '{}'::jsonb,
+                        angel_item = NULL,
+                        last_money_loss = 0,
+                        cupid_link_user_id = NULL,
                         updated_at = NOW()
                     WHERE user_id = $2
                     """,
@@ -639,10 +689,10 @@ async def eliminate_lowest_players(game_id: int, channel: discord.TextChannel, c
     connection = await get_db()
     try:
         async with connection.transaction():
-            # 생존자 중 코인 낮은 순으로 조회
+            # 생존자 중 코인 낮은 순으로 조회 (angel_item, cupid_link 포함)
             alive = await connection.fetch(
                 """
-                SELECT p.user_id, p.money, p.username
+                SELECT p.user_id, p.money, p.username, p.angel_item, p.cupid_link_user_id
                 FROM game_players gp
                 JOIN players p ON p.user_id = gp.user_id
                 WHERE gp.game_id = $1 AND p.alive = TRUE AND p.eliminated = FALSE
@@ -654,10 +704,30 @@ async def eliminate_lowest_players(game_id: int, channel: discord.TextChannel, c
             if len(alive) <= 1:
                 return None  # 이미 1명 이하
 
-            to_eliminate = alive[:count]
+            to_eliminate = list(alive[:count])
             eliminated_list = []
+            saved_by_angel = []
 
+            # 1차: 천사의 구원 체크
+            final_targets = []
             for player in to_eliminate:
+                if player["angel_item"] == "천사의 구원":
+                    # 구원 발동 → 탈락 면제 + angel_item 소모
+                    await connection.execute(
+                        """
+                        UPDATE players
+                        SET angel_item = NULL, updated_at = NOW()
+                        WHERE user_id = $1
+                        """,
+                        str(player["user_id"])
+                    )
+                    saved_by_angel.append(player)
+                else:
+                    final_targets.append(player)
+
+            # 2차: 실제 탈락 처리 + 큐피트 연쇄
+            extra_from_cupid = []
+            for player in final_targets:
                 await connection.execute(
                     """
                     UPDATE players
@@ -668,8 +738,34 @@ async def eliminate_lowest_players(game_id: int, channel: discord.TextChannel, c
                 )
                 eliminated_list.append(player)
 
-            # 탈락자 코인을 잭팟에 넣는 로직은 나중에 추가 가능
-            return eliminated_list
+                # 이 플레이어를 cupid_link로 연결한 사람이 있으면 같이 탈락
+                linked = await connection.fetch(
+                    """
+                    SELECT user_id, username, money
+                    FROM players
+                    WHERE cupid_link_user_id = $1
+                      AND alive = TRUE AND eliminated = FALSE
+                    """,
+                    str(player["user_id"])
+                )
+                for link_p in linked:
+                    await connection.execute(
+                        """
+                        UPDATE players
+                        SET alive = FALSE, eliminated = TRUE, cupid_link_user_id = NULL, updated_at = NOW()
+                        WHERE user_id = $1
+                        """,
+                        str(link_p["user_id"])
+                    )
+                    extra_from_cupid.append(link_p)
+                    eliminated_list.append(link_p)
+
+            # 구원 알림은 호출 측에서 처리하기 위해 반환
+            return {
+                "eliminated": eliminated_list,
+                "saved": saved_by_angel,
+                "cupid_extra": extra_from_cupid
+            }
     finally:
         await connection.close()
 
@@ -773,12 +869,27 @@ async def elimination_loop(game_id: int, channel: discord.TextChannel):
                 await asyncio.sleep(1)
             else:
                 # 탈락 실행
-                eliminated = await eliminate_lowest_players(game_id, channel, count=1)
+                result = await eliminate_lowest_players(game_id, channel, count=1)
 
-                if eliminated:
-                    for p in eliminated:
+                if result:
+                    # 천사의 구원으로 살아난 사람
+                    for p in result.get("saved", []):
                         embed = discord.Embed(
-                            title="☠️ 탈락 판정!",
+                            title="🪽 천사의 구원 발동!",
+                            description=(
+                                f"🪽 <@{p['user_id']}> 님이 **천사의 구원**으로 탈락을 면했습니다!\n"
+                                f"보유 코인: **{p['money']:,}**"
+                            ),
+                            color=discord.Color.purple()
+                        )
+                        await channel.send(embed=embed)
+
+                    # 실제 탈락자
+                    for p in result.get("eliminated", []):
+                        is_cupid = any(str(c["user_id"]) == str(p["user_id"]) for c in result.get("cupid_extra", []))
+                        title = "🏹 큐피트 연쇄 탈락!" if is_cupid else "☠️ 탈락 판정!"
+                        embed = discord.Embed(
+                            title=title,
                             description=(
                                 f"☠️ <@{p['user_id']}> 님이 탈락했습니다.\n"
                                 f"최종 보유 코인: **{p['money']:,}**"
@@ -1004,6 +1115,7 @@ async def build_main_embed(game_id: int, user_id: int, guild_id: int):
     is_alive = player["alive"] if player else False
     bonus = player.get("bonus_starting_money") or 0 if player else 0
     inv = parse_inventory(player.get("inventory") if player else None)
+    angel_item = player.get("angel_item") if player else None
 
     status = "🟢 생존 중" if is_alive else "☠️ 탈락"
 
@@ -1014,6 +1126,11 @@ async def build_main_embed(game_id: int, user_id: int, guild_id: int):
             emoji = SHOP_ITEMS.get(name, {}).get("emoji", "📦")
             parts.append(f"{emoji}{name}×{cnt}")
         inv_text = " ".join(parts) if parts else "없음"
+
+    angel_text = "없음"
+    if angel_item:
+        emoji = ANGEL_SHOP_ITEMS.get(angel_item, {}).get("emoji", "🪽")
+        angel_text = f"{emoji} {angel_item}"
 
     embed = discord.Embed(
         title="💰 MONEY BATTLE ROYALE",
@@ -1028,6 +1145,7 @@ async def build_main_embed(game_id: int, user_id: int, guild_id: int):
     if bonus > 0:
         embed.add_field(name="🪙 시작 보너스(미적용)", value=f"**+{bonus:,}**", inline=False)
     embed.add_field(name="🎒 보유 아이템", value=inv_text, inline=False)
+    embed.add_field(name="🪽 천사 아이템", value=angel_text, inline=False)
     embed.add_field(name="상태", value=status, inline=False)
     embed.set_footer(text="버튼을 눌러 행동을 선택하세요")
 
@@ -1389,6 +1507,271 @@ class DonateView(discord.ui.View):
 
 
 # ============================================================
+# 천사의 상점 View
+# ============================================================
+
+class AngelShopView(discord.ui.View):
+    def __init__(self, game_id):
+        super().__init__(timeout=180)
+        self.game_id = game_id
+        options = []
+        for name, item in ANGEL_SHOP_ITEMS.items():
+            options.append(discord.SelectOption(
+                label=f"{name} - {item['price']:,}P",
+                value=name,
+                description=item["desc"][:50],
+                emoji=item["emoji"]
+            ))
+        self.select = discord.ui.Select(
+            placeholder="구매할 천사 아이템을 선택하세요 (한 게임당 1개)",
+            options=options,
+            min_values=1,
+            max_values=1
+        )
+        self.select.callback = self.on_select
+        self.add_item(self.select)
+
+    async def interaction_check(self, interaction):
+        game = await get_game_by_id(self.game_id)
+        if not game or game["status"] != "playing":
+            await interaction.response.send_message("🔒 게임이 진행 중이 아닙니다.", ephemeral=True)
+            return False
+        return True
+
+    async def on_select(self, interaction: discord.Interaction):
+        item_name = self.select.values[0]
+        item = ANGEL_SHOP_ITEMS.get(item_name)
+        if not item:
+            await interaction.response.send_message("존재하지 않는 아이템입니다.", ephemeral=True)
+            return
+
+        user_id = interaction.user.id
+        lock = action_lock(user_id)
+        if lock.locked():
+            await interaction.response.send_message("⏳ 처리 중입니다.", ephemeral=True)
+            return
+
+        async with lock:
+            player = await get_or_create_player(interaction.user, interaction.guild)
+
+            # 이미 천사 아이템을 구매했는지 확인 (한 게임당 1개)
+            if player.get("angel_item"):
+                await interaction.response.send_message(
+                    f"⚠️ 이미 천사의 상점에서 **{player['angel_item']}** 을(를) 구매했습니다.\n"
+                    "한 게임에서는 **단 하나의 아이템만** 구매할 수 있습니다.",
+                    ephemeral=True
+                )
+                return
+
+            if not player["alive"] or player["eliminated"]:
+                await interaction.response.send_message("탈락자는 천사의 상점을 이용할 수 없습니다.", ephemeral=True)
+                return
+
+            good_deed = player.get("good_deed") or 0
+            if good_deed < item["price"]:
+                await interaction.response.send_message(
+                    f"🔴 선행 포인트가 부족합니다.\n"
+                    f"필요: **{item['price']:,}P** / 보유: **{good_deed:,}P**",
+                    ephemeral=True
+                )
+                return
+
+            # 구매 처리
+            connection = await get_db()
+            try:
+                new_good_deed = await connection.fetchval(
+                    """
+                    UPDATE players
+                    SET good_deed = good_deed - $1,
+                        angel_item = $2,
+                        updated_at = NOW()
+                    WHERE server_id = $3 AND user_id = $4
+                      AND COALESCE(good_deed, 0) >= $1
+                      AND angel_item IS NULL
+                    RETURNING good_deed
+                    """,
+                    item["price"], item_name,
+                    str(interaction.guild.id), str(interaction.user.id)
+                )
+                if new_good_deed is None:
+                    await interaction.response.send_message(
+                        "구매 실패 (선행 포인트 부족 또는 이미 구매함)", ephemeral=True
+                    )
+                    return
+            finally:
+                await connection.close()
+
+            # 효과 즉시 발동 가능한 것들 처리
+            effect_msg = ""
+            if item["effect"] == "cupid_link":
+                effect_msg = await self._activate_cupid(interaction, str(interaction.user.id))
+            elif item["effect"] == "angel_relief":
+                effect_msg = await self._activate_angel_relief(interaction)
+            elif item["effect"] == "recover_last_loss":
+                effect_msg = await self._activate_recover_loss(interaction)
+            # 천사의 구원 / 승천궁은 나중에 발동 (탈락 시점 등)
+
+            # 공개 알림
+            public_embed = discord.Embed(
+                title="😇 천사의 상점 구매!",
+                description=(
+                    f"<@{user_id}> 님이 **{item['emoji']} {item_name}** 을(를) 구매했습니다!\n"
+                    f"선행 포인트 -**{item['price']:,}P**"
+                ),
+                color=discord.Color.purple()
+            )
+            await interaction.channel.send(embed=public_embed)
+
+            await interaction.response.send_message(
+                f"{item['emoji']} **{item_name}** 구매 완료!\n"
+                f"😇 -**{item['price']:,}** 선행 포인트\n"
+                f"😇 남은 선행 포인트: **{new_good_deed:,}P**\n\n"
+                f"{item['desc']}\n"
+                f"{effect_msg}",
+                ephemeral=True
+            )
+
+    async def _activate_cupid(self, interaction, buyer_id: str) -> str:
+        """큐피트 소환권: 꼴등 포함 랜덤 생존자와 연결"""
+        players = await get_game_players(self.game_id)
+        alive = [p for p in players if p["alive"] and not p["eliminated"]]
+        others = [p for p in alive if str(p["user_id"]) != buyer_id]
+        if not others:
+            return "⚠️ 연결할 대상이 없어 효과가 발동되지 않았습니다."
+
+        # 꼴등을 우선적으로 포함하되, 랜덤 선택
+        lowest = min(others, key=lambda p: p["money"])
+        # 50% 확률로 꼴등, 아니면 랜덤
+        if random.random() < 0.5 or len(others) == 1:
+            target = lowest
+        else:
+            target = random.choice(others)
+
+        connection = await get_db()
+        try:
+            await connection.execute(
+                """
+                UPDATE players
+                SET cupid_link_user_id = $1, updated_at = NOW()
+                WHERE user_id = $2
+                """,
+                str(target["user_id"]), buyer_id
+            )
+            # 양방향 연결 (선택사항, 여기선 구매자 → 대상만)
+        finally:
+            await connection.close()
+
+        public = discord.Embed(
+            title="🏹 큐피트가 소환되었습니다!",
+            description=(
+                f"<@{buyer_id}> 님과 <@{target['user_id']}> 님이 **강제 연결**되었습니다!\n"
+                f"연결된 대상이 탈락하면 구매자도 함께 탈락합니다."
+            ),
+            color=discord.Color.pink()
+        )
+        await interaction.channel.send(embed=public)
+        return f"🏹 <@{target['user_id']}> 님과 연결되었습니다!"
+
+    async def _activate_angel_relief(self, interaction) -> str:
+        """천사의 구제: 1~3등 돈의 30%를 4등 이하에게 분배"""
+        players = await get_game_players(self.game_id)
+        alive = sorted(
+            [p for p in players if p["alive"] and not p["eliminated"]],
+            key=lambda p: p["money"],
+            reverse=True
+        )
+        n = len(alive)
+        if n <= 1:
+            return "⚠️ 인원이 부족하여 효과가 발동되지 않았습니다."
+
+        connection = await get_db()
+        try:
+            async with connection.transaction():
+                if n == 2:
+                    # 1대1 → 사용 불가
+                    return "⚠️ 1대1 상황에서는 천사의 구제를 사용할 수 없습니다."
+                elif n == 3:
+                    # 1,2등 돈의 15%를 3등에게
+                    top = alive[:2]
+                    bottom = alive[2:]
+                    ratio = 0.15
+                else:
+                    # 1~3등 30% → 4등 이하
+                    top = alive[:3]
+                    bottom = alive[3:]
+                    ratio = 0.30
+
+                total_pool = 0
+                for p in top:
+                    take = int(p["money"] * ratio)
+                    if take <= 0:
+                        continue
+                    await connection.execute(
+                        "UPDATE players SET money = money - $1, updated_at = NOW() WHERE user_id = $2",
+                        take, str(p["user_id"])
+                    )
+                    total_pool += take
+
+                if total_pool <= 0 or not bottom:
+                    return "분배할 금액이 없습니다."
+
+                per = total_pool // len(bottom)
+                remainder = total_pool % len(bottom)
+                for i, p in enumerate(bottom):
+                    give = per + (1 if i < remainder else 0)
+                    await connection.execute(
+                        "UPDATE players SET money = money + $1, updated_at = NOW() WHERE user_id = $2",
+                        give, str(p["user_id"])
+                    )
+        finally:
+            await connection.close()
+
+        public = discord.Embed(
+            title="🕊️ 천사의 구제가 발동되었습니다!",
+            description=(
+                f"상위 플레이어의 재산 일부가 하위 플레이어들에게 분배되었습니다.\n"
+                f"총 분배 금액: **{total_pool:,}** 코인"
+            ),
+            color=discord.Color.blue()
+        )
+        await interaction.channel.send(embed=public)
+        return f"🕊️ 총 **{total_pool:,}** 코인이 분배되었습니다!"
+
+    async def _activate_recover_loss(self, interaction) -> str:
+        """신의 모래시계: 최근 손실 복구"""
+        player = await get_player(str(interaction.user.id), str(interaction.guild.id))
+        loss = player.get("last_money_loss") or 0
+        if loss <= 0:
+            return "⚠️ 복구할 최근 손실이 없습니다."
+
+        connection = await get_db()
+        try:
+            new_money = await connection.fetchval(
+                """
+                UPDATE players
+                SET money = money + $1,
+                    last_money_loss = 0,
+                    updated_at = NOW()
+                WHERE user_id = $2
+                RETURNING money
+                """,
+                loss, str(interaction.user.id)
+            )
+        finally:
+            await connection.close()
+
+        public = discord.Embed(
+            title="⏳ 신의 모래시계가 발동되었습니다!",
+            description=(
+                f"<@{interaction.user.id}> 님이 최근 손실 **{loss:,}** 코인을 복구했습니다!"
+            ),
+            color=discord.Color.gold()
+        )
+        await interaction.channel.send(embed=public)
+        return f"⏳ **{loss:,}** 코인을 복구했습니다! (현재: {new_money:,})"
+
+
+# ============================================================
 # 다이아 상점 View
 # ============================================================
 
@@ -1579,6 +1962,36 @@ class SurvivalGameView(discord.ui.View):
             embed=embed, view=DonateView(self.game_id), ephemeral=True
         )
 
+    @discord.ui.button(label="천사의 상점", emoji="🪽", style=discord.ButtonStyle.success, row=2)
+    async def angel_shop(self, interaction: discord.Interaction, button: discord.ui.Button):
+        player = await get_or_create_player(interaction.user, interaction.guild)
+        if not player["alive"] or player["eliminated"]:
+            await interaction.response.send_message("탈락자는 천사의 상점을 이용할 수 없습니다.", ephemeral=True)
+            return
+
+        already = player.get("angel_item")
+        already_text = f"⚠️ 이미 **{already}** 구매함 (추가 구매 불가)" if already else "🟢 아직 구매하지 않음 (한 게임당 1개)"
+
+        embed = discord.Embed(
+            title="😇 천사의 상점",
+            description=(
+                "선행 포인트로 강력한 아이템을 구매할 수 있습니다.\n"
+                "**⚠️ 한 게임에서 단 하나의 아이템만 구매 가능합니다.**\n\n"
+                f"😇 보유 선행 포인트: **{player.get('good_deed') or 0:,}P**\n"
+                f"{already_text}"
+            ),
+            color=discord.Color.purple()
+        )
+        for name, item in ANGEL_SHOP_ITEMS.items():
+            embed.add_field(
+                name=f"{item['emoji']} {name}",
+                value=f"**{item['price']:,}P**\n{item['desc']}",
+                inline=False
+            )
+        await interaction.response.send_message(
+            embed=embed, view=AngelShopView(self.game_id), ephemeral=True
+        )
+
     @discord.ui.button(label="내 정보", emoji="👤", style=discord.ButtonStyle.secondary, row=1)
     async def myinfo(self, interaction: discord.Interaction, button: discord.ui.Button):
         embed = await build_main_embed(self.game_id, interaction.user.id, interaction.guild.id)
@@ -1676,6 +2089,9 @@ async def test_game(interaction: discord.Interaction):
                         eliminated = FALSE,
                         good_deed = 0,
                         inventory = '{}'::jsonb,
+                        angel_item = NULL,
+                        last_money_loss = 0,
+                        cupid_link_user_id = NULL,
                         updated_at = NOW()
                     WHERE user_id = $2
                     """,
