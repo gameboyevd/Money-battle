@@ -31,16 +31,43 @@ def parse_game_data(game_data):
 
 MIN_PLAYERS = 4
 STARTING_MONEY = 10_000
-JOB_COOLDOWN_SECONDS = 5 * 60
-DEFAULT_ELIMINATION_INTERVAL = 5 * 60  # 5분 (초 단위)
+JOB_COOLDOWN_SECONDS = 5 * 60          # 기본 알바 충전 쿨타임 (초)
+DEFAULT_ELIMINATION_INTERVAL = 5 * 60  # 기본 탈락 주기 (초)
+MAX_JOB_CHARGES = 3                    # 알바 기회 최대
 
-job_cooldowns = {}
+# user_id -> {"charges": int, "next_charge_at": datetime|None}
+job_states = {}
 _user_locks = defaultdict(asyncio.Lock)
 active_elimination_tasks = {}  # game_id: asyncio.Task
 
 
 def action_lock(user_id: int):
     return _user_locks[user_id]
+
+
+def default_game_settings():
+    return {
+        "starting_money": STARTING_MONEY,
+        "min_players": MIN_PLAYERS,
+        "elimination_interval": DEFAULT_ELIMINATION_INTERVAL,
+        "job_cooldown": JOB_COOLDOWN_SECONDS,
+        "treasure_hunt_enabled": True,
+    }
+
+
+def merge_game_settings(game_data) -> dict:
+    """game_data + 기본 설정 병합 (설정 키 유지)"""
+    data = parse_game_data(game_data)
+    base = default_game_settings()
+    for k in ("elimination_interval", "job_cooldown", "treasure_hunt_enabled",
+              "starting_money", "min_players", "next_elimination_at", "ascension"):
+        if k in data:
+            base[k] = data[k]
+    # 원본의 기타 키도 보존
+    for k, v in data.items():
+        if k not in base:
+            base[k] = v
+    return base
 
 
 # ============================================================
@@ -440,7 +467,7 @@ async def create_waiting_game(guild, channel, host_id):
             RETURNING *
             """,
             str(host_id), str(channel.id),
-            '{"starting_money":10000,"min_players":4,"elimination_interval":300}'
+            json.dumps(default_game_settings())
         )
     finally:
         await connection.close()
@@ -537,7 +564,7 @@ async def join_game_player(user, guild, channel):
                     RETURNING *
                     """,
                     str(user.id), str(channel.id),
-                    '{"starting_money":10000,"min_players":4,"elimination_interval":300}'
+                    json.dumps(default_game_settings())
                 )
 
             existing = await connection.fetchrow(
@@ -631,8 +658,14 @@ async def start_survival_game(game_id):
             if count < MIN_PLAYERS:
                 raise RuntimeError(f"최소 {MIN_PLAYERS}명이 필요합니다.")
 
-            # 다음 탈락 시간 설정
-            next_elim = datetime.utcnow() + timedelta(seconds=DEFAULT_ELIMINATION_INTERVAL)
+            # 방 설정 반영
+            settings = merge_game_settings(game["game_data"])
+            elim_interval = int(settings.get("elimination_interval", DEFAULT_ELIMINATION_INTERVAL))
+            next_elim = datetime.utcnow() + timedelta(seconds=elim_interval)
+
+            # 설정 유지하면서 next_elimination_at만 갱신
+            new_data = dict(settings)
+            new_data["next_elimination_at"] = next_elim.isoformat()
 
             await connection.execute(
                 """
@@ -641,15 +674,10 @@ async def start_survival_game(game_id):
                     status = 'playing',
                     current_phase = 'survival',
                     started_at = NOW(),
-                    game_data = jsonb_set(
-                        COALESCE(game_data, '{}'::jsonb),
-                        '{next_elimination_at}',
-                        to_jsonb($2::text),
-                        TRUE
-                    )
+                    game_data = $2::jsonb
                 WHERE id = $1 AND status = 'waiting'
                 """,
-                game_id, next_elim.isoformat()
+                game_id, json.dumps(new_data)
             )
 
             players = await connection.fetch(
@@ -657,7 +685,6 @@ async def start_survival_game(game_id):
             )
 
             for player in players:
-                # 다이아 상점에서 구매한 시작 자금 보너스 적용 후 초기화 + 천사 아이템 초기화
                 await connection.execute(
                     """
                     UPDATE players
@@ -675,11 +702,11 @@ async def start_survival_game(game_id):
                     """,
                     STARTING_MONEY, str(player["user_id"])
                 )
-                # 알바 쿨타임 초기화 (게임 재시작 시)
+                # 알바 기회 풀충전 초기화
                 try:
-                    job_cooldowns.pop(int(player["user_id"]), None)
+                    reset_job_state(int(player["user_id"]))
                 except (TypeError, ValueError):
-                    job_cooldowns.pop(player["user_id"], None)
+                    reset_job_state(player["user_id"])
 
             return count
     finally:
@@ -968,22 +995,18 @@ async def elimination_loop(game_id: int, channel: discord.TextChannel):
                 if ended:
                     break
 
-                # 다음 탈락 시간 갱신
+                # 다음 탈락 시간 갱신 (방 설정 주기 사용)
                 connection = await get_db()
                 try:
-                    new_next = datetime.utcnow() + timedelta(seconds=DEFAULT_ELIMINATION_INTERVAL)
+                    g = await connection.fetchrow("SELECT game_data FROM games WHERE id = $1", game_id)
+                    settings = merge_game_settings(g["game_data"] if g else None)
+                    interval = int(settings.get("elimination_interval", DEFAULT_ELIMINATION_INTERVAL))
+                    new_next = datetime.utcnow() + timedelta(seconds=interval)
+                    new_data = dict(settings)
+                    new_data["next_elimination_at"] = new_next.isoformat()
                     await connection.execute(
-                        """
-                        UPDATE games
-                        SET game_data = jsonb_set(
-                            COALESCE(game_data, '{}'::jsonb),
-                            '{next_elimination_at}',
-                            to_jsonb($2::text),
-                            TRUE
-                        )
-                        WHERE id = $1
-                        """,
-                        game_id, new_next.isoformat()
+                        "UPDATE games SET game_data = $2::jsonb WHERE id = $1",
+                        game_id, json.dumps(new_data)
                     )
                 finally:
                     await connection.close()
@@ -1006,6 +1029,131 @@ def start_elimination_task(game_id: int, channel: discord.TextChannel):
 # ============================================================
 # 대기방 View
 # ============================================================
+
+class RoomSettingsModal(discord.ui.Modal, title="⚙️ 방 설정 변경"):
+    def __init__(self, game_id, settings: dict):
+        super().__init__()
+        self.game_id = game_id
+        self.elim = discord.ui.TextInput(
+            label="탈락 주기 (분, 1~60)",
+            placeholder="예: 5",
+            default=str(max(1, int(settings.get("elimination_interval", 300)) // 60)),
+            min_length=1,
+            max_length=2,
+            required=True
+        )
+        self.job_cd = discord.ui.TextInput(
+            label="알바 기회 충전 쿨타임 (분, 1~30)",
+            placeholder="예: 5",
+            default=str(max(1, int(settings.get("job_cooldown", 300)) // 60)),
+            min_length=1,
+            max_length=2,
+            required=True
+        )
+        self.treasure = discord.ui.TextInput(
+            label="보물찾기 이벤트 (on/off)",
+            placeholder="on 또는 off",
+            default="on" if settings.get("treasure_hunt_enabled", True) else "off",
+            min_length=2,
+            max_length=3,
+            required=True
+        )
+        self.add_item(self.elim)
+        self.add_item(self.job_cd)
+        self.add_item(self.treasure)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            elim_m = int(self.elim.value.strip())
+            job_m = int(self.job_cd.value.strip())
+            if not (1 <= elim_m <= 60):
+                await interaction.response.send_message("탈락 주기는 1~60분이어야 합니다.", ephemeral=True)
+                return
+            if not (1 <= job_m <= 30):
+                await interaction.response.send_message("알바 쿨타임은 1~30분이어야 합니다.", ephemeral=True)
+                return
+            th_raw = self.treasure.value.strip().lower()
+            if th_raw not in ("on", "off", "온", "오프", "o", "x"):
+                await interaction.response.send_message("보물찾기는 on/off 로 입력하세요.", ephemeral=True)
+                return
+            th = th_raw in ("on", "온", "o")
+        except ValueError:
+            await interaction.response.send_message("숫자를 올바르게 입력하세요.", ephemeral=True)
+            return
+
+        connection = await get_db()
+        try:
+            game = await connection.fetchrow(
+                "SELECT * FROM games WHERE id = $1 AND status = 'waiting'", self.game_id
+            )
+            if not game:
+                await interaction.response.send_message("대기 중인 게임이 없습니다.", ephemeral=True)
+                return
+            if str(game["host_id"]) != str(interaction.user.id):
+                await interaction.response.send_message("방장만 변경할 수 있습니다.", ephemeral=True)
+                return
+            data = merge_game_settings(game["game_data"])
+            data["elimination_interval"] = elim_m * 60
+            data["job_cooldown"] = job_m * 60
+            data["treasure_hunt_enabled"] = th
+            await connection.execute(
+                "UPDATE games SET game_data = $1::jsonb WHERE id = $2",
+                json.dumps(data), self.game_id
+            )
+        finally:
+            await connection.close()
+
+        th_txt = "ON ✅" if th else "OFF ❌"
+        await interaction.response.send_message(
+            f"⚙️ 설정 저장 완료!\n"
+            f"⏰ 탈락 주기: **{elim_m}분**\n"
+            f"🧑‍💼 알바 충전 쿨: **{job_m}분**\n"
+            f"🗺️ 보물찾기: **{th_txt}**",
+            ephemeral=True
+        )
+
+
+class RoomSettingsView(discord.ui.View):
+    def __init__(self, game_id):
+        super().__init__(timeout=120)
+        self.game_id = game_id
+
+    @discord.ui.button(label="설정 변경", emoji="✏️", style=discord.ButtonStyle.primary)
+    async def edit(self, interaction: discord.Interaction, button: discord.ui.Button):
+        game = await get_game_by_id(self.game_id)
+        if not game or game["status"] != "waiting":
+            await interaction.response.send_message("대기 중이 아닙니다.", ephemeral=True)
+            return
+        if str(game["host_id"]) != str(interaction.user.id):
+            await interaction.response.send_message("방장만 가능합니다.", ephemeral=True)
+            return
+        settings = merge_game_settings(game["game_data"])
+        await interaction.response.send_modal(RoomSettingsModal(self.game_id, settings))
+
+    @discord.ui.button(label="보물찾기 토글", emoji="🗺️", style=discord.ButtonStyle.secondary)
+    async def toggle_treasure(self, interaction: discord.Interaction, button: discord.ui.Button):
+        connection = await get_db()
+        try:
+            game = await connection.fetchrow(
+                "SELECT * FROM games WHERE id = $1 AND status = 'waiting'", self.game_id
+            )
+            if not game:
+                await interaction.response.send_message("대기 중이 아닙니다.", ephemeral=True)
+                return
+            if str(game["host_id"]) != str(interaction.user.id):
+                await interaction.response.send_message("방장만 가능합니다.", ephemeral=True)
+                return
+            data = merge_game_settings(game["game_data"])
+            data["treasure_hunt_enabled"] = not data.get("treasure_hunt_enabled", True)
+            await connection.execute(
+                "UPDATE games SET game_data = $1::jsonb WHERE id = $2",
+                json.dumps(data), self.game_id
+            )
+            th = "ON ✅" if data["treasure_hunt_enabled"] else "OFF ❌"
+        finally:
+            await connection.close()
+        await interaction.response.send_message(f"🗺️ 보물찾기 이벤트: **{th}**", ephemeral=True)
+
 
 class WaitingView(discord.ui.View):
     def __init__(self, game_id):
@@ -1087,6 +1235,34 @@ class WaitingView(discord.ui.View):
                 await interaction.response.send_message(
                     f"🔴 참가 취소 오류\n`{type(e).__name__}`", ephemeral=True
                 )
+
+    @discord.ui.button(label="방 설정", emoji="⚙️", style=discord.ButtonStyle.secondary)
+    async def settings(self, interaction: discord.Interaction, button: discord.ui.Button):
+        game = await get_waiting_game(interaction.channel.id)
+        if not game or game["id"] != self.game_id:
+            await interaction.response.send_message("대기 중인 게임이 없습니다.", ephemeral=True)
+            return
+        if str(game["host_id"]) != str(interaction.user.id):
+            await interaction.response.send_message("🔒 방장만 설정을 변경할 수 있습니다.", ephemeral=True)
+            return
+        settings = merge_game_settings(game["game_data"])
+        elim_m = int(settings["elimination_interval"]) // 60
+        job_m = int(settings["job_cooldown"]) // 60
+        th = "✅ ON" if settings.get("treasure_hunt_enabled", True) else "❌ OFF"
+        embed = discord.Embed(
+            title="⚙️ 방 설정",
+            description=(
+                f"⏰ 탈락 주기: **{elim_m}분**\n"
+                f"🧑‍💼 알바 충전 쿨타임: **{job_m}분**\n"
+                f"🗺️ 보물찾기 이벤트: **{th}**\n\n"
+                f"💎 개인 추가자금은 `/다이아상점`에서 각자 구매\n"
+                f"(기본 시작자금 {STARTING_MONEY:,} + 보너스)"
+            ),
+            color=discord.Color.blue()
+        )
+        await interaction.response.send_message(
+            embed=embed, view=RoomSettingsView(self.game_id), ephemeral=True
+        )
 
     @discord.ui.button(label="게임 시작", emoji="▶️", style=discord.ButtonStyle.primary)
     async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -1233,23 +1409,75 @@ JOBS = {
 }
 
 
-def get_job_remaining(user_id: int):
-    cooldown = job_cooldowns.get(user_id)
-    if cooldown is None:
-        return 0
-    now = datetime.utcnow()
-    if now >= cooldown:
-        job_cooldowns.pop(user_id, None)
-        return 0
-    return int((cooldown - now).total_seconds())
-
-
 def format_seconds(seconds: int):
     minutes = seconds // 60
     seconds %= 60
     if minutes > 0:
         return f"{minutes}분 {seconds}초"
     return f"{seconds}초"
+
+
+def _get_job_state(user_id: int) -> dict:
+    st = job_states.get(user_id)
+    if st is None:
+        st = {"charges": MAX_JOB_CHARGES, "next_charge_at": None}
+        job_states[user_id] = st
+    return st
+
+
+def refresh_job_charges(user_id: int, cooldown_seconds: int = None) -> dict:
+    """쿨타임이 지났으면 기회 +1 (최대 MAX_JOB_CHARGES). 여러 번 충전 가능."""
+    if cooldown_seconds is None:
+        cooldown_seconds = JOB_COOLDOWN_SECONDS
+    st = _get_job_state(user_id)
+    now = datetime.utcnow()
+    while st["charges"] < MAX_JOB_CHARGES and st.get("next_charge_at"):
+        if now >= st["next_charge_at"]:
+            st["charges"] += 1
+            if st["charges"] >= MAX_JOB_CHARGES:
+                st["next_charge_at"] = None
+            else:
+                st["next_charge_at"] = st["next_charge_at"] + timedelta(seconds=cooldown_seconds)
+                # 이미 더 지났으면 루프로 추가 충전
+        else:
+            break
+    return st
+
+
+def get_job_charges(user_id: int, cooldown_seconds: int = None) -> tuple:
+    """(charges, seconds_until_next_charge) — 3이면 remaining=0"""
+    st = refresh_job_charges(user_id, cooldown_seconds)
+    if st["charges"] >= MAX_JOB_CHARGES or not st.get("next_charge_at"):
+        return st["charges"], 0
+    remaining = int((st["next_charge_at"] - datetime.utcnow()).total_seconds())
+    return st["charges"], max(0, remaining)
+
+
+def consume_job_charge(user_id: int, cooldown_seconds: int = None) -> bool:
+    """기회 1개 소모. 성공 시 True. 3→2가 되면 쿨타임 시작."""
+    if cooldown_seconds is None:
+        cooldown_seconds = JOB_COOLDOWN_SECONDS
+    st = refresh_job_charges(user_id, cooldown_seconds)
+    if st["charges"] <= 0:
+        return False
+    st["charges"] -= 1
+    # 기회가 최대 미만이면 충전 타이머 가동 (이미 돌고 있으면 유지)
+    if st["charges"] < MAX_JOB_CHARGES:
+        if not st.get("next_charge_at") or st["next_charge_at"] <= datetime.utcnow():
+            st["next_charge_at"] = datetime.utcnow() + timedelta(seconds=cooldown_seconds)
+    return True
+
+
+def reset_job_state(user_id: int):
+    job_states[user_id] = {"charges": MAX_JOB_CHARGES, "next_charge_at": None}
+
+
+async def get_job_cooldown_for_game(game_id: int) -> int:
+    game = await get_game_by_id(game_id)
+    if not game:
+        return JOB_COOLDOWN_SECONDS
+    settings = merge_game_settings(game["game_data"])
+    return int(settings.get("job_cooldown", JOB_COOLDOWN_SECONDS))
 
 
 async def give_job_reward(user: discord.User, guild: discord.Guild, amount: int, job_name: str):
@@ -1325,15 +1553,13 @@ class CleaningMiniGame(discord.ui.View):
         if success:
             bonus = int(job["base"] * (0.8 + self.hits * 0.15))
             reward = min(job["reward"] + 8_000, bonus)
-            job_cooldowns[self.user_id] = datetime.utcnow() + timedelta(seconds=JOB_COOLDOWN_SECONDS)
             new_money = await give_job_reward(interaction.user, interaction.guild, reward, "청소")
             await interaction.followup.send(
-                f"🧹 **청소 알바 성공!**\n💰 +**{reward:,}** 코인\n🪙 현재: **{new_money:,}**\n⏳ 다음 알바까지 5분",
+                f"🧹 **청소 알바 성공!**\n💰 +**{reward:,}** 코인\n🪙 현재: **{new_money:,}**\n",
                 ephemeral=True
             )
         else:
             reward = job["base"] // 3
-            job_cooldowns[self.user_id] = datetime.utcnow() + timedelta(seconds=JOB_COOLDOWN_SECONDS)
             new_money = await give_job_reward(interaction.user, interaction.guild, reward, "청소")
             await interaction.followup.send(
                 f"🧹 청소 실패... 기본급만 지급\n💰 +**{reward:,}** 코인\n🪙 현재: **{new_money:,}**",
@@ -1401,12 +1627,10 @@ class TargetMiniGame(discord.ui.View):
         job = JOBS["과녁"]
         if success:
             reward = job["reward"] + self.hits * 1_500
-            job_cooldowns[self.user_id] = datetime.utcnow() + timedelta(seconds=JOB_COOLDOWN_SECONDS)
             new_money = await give_job_reward(interaction.user, interaction.guild, reward, "과녁")
-            msg = f"🎯 **과녁 알바 완벽!**\n💰 +**{reward:,}** 코인\n🪙 현재: **{new_money:,}**\n⏳ 다음 알바까지 5분"
+            msg = f"🎯 **과녁 알바 완벽!**\n💰 +**{reward:,}** 코인\n🪙 현재: **{new_money:,}**\n"
         else:
             reward = job["base"] // 2 + self.hits * 2_000
-            job_cooldowns[self.user_id] = datetime.utcnow() + timedelta(seconds=JOB_COOLDOWN_SECONDS)
             new_money = await give_job_reward(interaction.user, interaction.guild, reward, "과녁")
             msg = f"🎯 과녁 종료 (적중 {self.hits}회)\n💰 +**{reward:,}** 코인\n🪙 현재: **{new_money:,}**"
         try:
@@ -1447,7 +1671,6 @@ class FishingMiniGame(discord.ui.View):
             self.finished = True
             self.stop()
             reward = JOBS["낚시"]["base"] // 4
-            job_cooldowns[self.user_id] = datetime.utcnow() + timedelta(seconds=JOB_COOLDOWN_SECONDS)
             new_money = await give_job_reward(interaction.user, interaction.guild, reward, "낚시")
             try:
                 await interaction.edit_original_response(
@@ -1483,10 +1706,9 @@ class FishingMiniGame(discord.ui.View):
             else:
                 reward = job["base"]
                 grade = "보통 물고기"
-            job_cooldowns[self.user_id] = datetime.utcnow() + timedelta(seconds=JOB_COOLDOWN_SECONDS)
             new_money = await give_job_reward(interaction.user, interaction.guild, reward, "낚시")
             await interaction.response.edit_message(
-                content=f"🎣 **{grade}**\n💰 +**{reward:,}** 코인\n🪙 현재: **{new_money:,}**\n⏳ 다음 알바까지 5분",
+                content=f"🎣 **{grade}**\n💰 +**{reward:,}** 코인\n🪙 현재: **{new_money:,}**\n",
                 view=None
             )
 
@@ -1536,10 +1758,9 @@ class DataInputModal(discord.ui.Modal, title="🧠 데이터 입력"):
         else:
             reward = job["base"] // 2
             grade = f"오답 (정답: {self.parent.code})"
-        job_cooldowns[self.parent.user_id] = datetime.utcnow() + timedelta(seconds=JOB_COOLDOWN_SECONDS)
         new_money = await give_job_reward(interaction.user, interaction.guild, reward, "데이터 입력")
         await interaction.response.send_message(
-            f"🧠 **{grade}**\n💰 +**{reward:,}** 코인\n🪙 현재: **{new_money:,}**\n⏳ 다음 알바까지 5분",
+            f"🧠 **{grade}**\n💰 +**{reward:,}** 코인\n🪙 현재: **{new_money:,}**\n",
             ephemeral=True
         )
 
@@ -1594,11 +1815,10 @@ class FastFoodMiniGame(discord.ui.View):
         else:
             reward = job["base"] // 2
             grade = "주문 실수..."
-        job_cooldowns[self.user_id] = datetime.utcnow() + timedelta(seconds=JOB_COOLDOWN_SECONDS)
         new_money = await give_job_reward(interaction.user, interaction.guild, reward, "패스트푸드")
         try:
             await interaction.response.edit_message(
-                content=f"🍔 **{grade}**\n💰 +**{reward:,}** 코인\n🪙 현재: **{new_money:,}**\n⏳ 다음 알바까지 5분",
+                content=f"🍔 **{grade}**\n💰 +**{reward:,}** 코인\n🪙 현재: **{new_money:,}**\n",
                 view=None
             )
         except Exception:
@@ -1640,14 +1860,13 @@ class SimpleJobMiniGame(discord.ui.View):
             job = JOBS[self.job_name]
             # 클릭 속도 보너스
             reward = job["reward"] + random.randint(0, 6_000)
-            job_cooldowns[self.user_id] = datetime.utcnow() + timedelta(seconds=JOB_COOLDOWN_SECONDS)
             new_money = await give_job_reward(interaction.user, interaction.guild, reward, self.job_name)
             await interaction.response.edit_message(
                 content=(
                     f"{job['emoji']} **{self.job_name} 알바 완료!**\n"
                     f"💰 +**{reward:,}** 코인\n"
                     f"🪙 현재: **{new_money:,}**\n"
-                    f"⏳ 다음 알바까지 5분"
+                    f""
                 ),
                 view=None
             )
@@ -1673,12 +1892,17 @@ class JobView(discord.ui.View):
 
     async def start_job(self, interaction, job_name):
         user_id = interaction.user.id
-        remaining = get_job_remaining(user_id)
-        if remaining > 0:
+        cd = await get_job_cooldown_for_game(self.game_id)
+        charges, remaining = get_job_charges(user_id, cd)
+        if charges <= 0:
             await interaction.response.send_message(
-                f"⏳ 아직 알바를 할 수 없습니다.\n남은 시간: **{format_seconds(remaining)}**",
+                f"⏳ 알바 기회가 없습니다. (0/{MAX_JOB_CHARGES})\n"
+                f"다음 기회까지: **{format_seconds(remaining)}**",
                 ephemeral=True
             )
+            return
+        if not consume_job_charge(user_id, cd):
+            await interaction.response.send_message("알바 기회 소모 실패. 다시 시도하세요.", ephemeral=True)
             return
 
         await get_or_create_player(interaction.user, interaction.guild)
@@ -2768,7 +2992,14 @@ class ItemBagView(discord.ui.View):
             return None
 
         elif item_name == "이벤트 참가권":
-            # 즉시 보물찾기 미니 이벤트 발동 (참가권 소모)
+            game = await get_game_by_id(game_id)
+            settings = merge_game_settings(game["game_data"] if game else None)
+            if not settings.get("treasure_hunt_enabled", True):
+                await interaction.response.send_message(
+                    "🗺️ 이 방에서는 **보물찾기 이벤트가 OFF** 입니다.\n(방장이 시작 전 설정에서 켤 수 있습니다)",
+                    ephemeral=True
+                )
+                return None
             view = TreasureHuntView(game_id, user_id, guild_id)
             await interaction.response.send_message(
                 "🗺️ **보물찾기 이벤트!**\n"
@@ -2777,7 +3008,6 @@ class ItemBagView(discord.ui.View):
                 view=view,
                 ephemeral=True
             )
-            # 소모는 TreasureHuntView에서 선택 시 처리
             return None
 
         elif item_name == "경매 주최권":
@@ -3789,11 +4019,14 @@ class AceBreakerView(discord.ui.View):
         # 배팅액은 이미 차감됨
 
         # JOKER 자동 사용: 상대 ACE가 있는 라운드에 우선 사용
+        # 라운드 결과: "win" | "lose" | "draw"
         p_joker_left = self.player_joker
         b_joker_left = self.bot_joker
-        results = []
+        results = []  # "win"/"lose"/"draw"
         wins = 0
-        ace_break_success = False  # 내가 JOKER로 상대 ACE를 막음
+        losses = 0
+        draws = 0
+        ace_break_success = False
         round_names = ["높음", "낮음", "높음"]
         want_high_list = [True, False, True]
 
@@ -3801,50 +4034,59 @@ class AceBreakerView(discord.ui.View):
             p = self.player_cards[i]
             b = self.bot_cards[i]
             want_high = want_high_list[i]
-
-            # ACE 처리 + JOKER 차단
             p_is_ace = (p == "A")
             b_is_ace = (b == "A")
 
-            # 상대 ACE를 내 JOKER로 막기
             if b_is_ace and p_joker_left:
                 p_joker_left = False
                 ace_break_success = True
-                # 상대 ACE 무효 → 내가 이 라운드 승 (ACE가 패배)
-                win = True
+                outcome = "win"
             elif p_is_ace and b_joker_left:
                 b_joker_left = False
-                # 내 ACE가 막힘 → 패
-                win = False
+                outcome = "lose"
+            elif p_is_ace and b_is_ace:
+                # ACE vs ACE → 무승부
+                outcome = "draw"
             elif p_is_ace:
-                win = True
+                outcome = "win"
             elif b_is_ace:
-                win = False
+                outcome = "lose"
             else:
-                # 숫자 비교
-                if want_high:
-                    win = int(p) > int(b)
+                # 숫자 비교 — 같으면 무승부
+                if int(p) == int(b):
+                    outcome = "draw"
+                elif want_high:
+                    outcome = "win" if int(p) > int(b) else "lose"
                 else:
-                    win = int(p) < int(b)
+                    outcome = "win" if int(p) < int(b) else "lose"
 
-            results.append(win)
-            if win:
+            results.append(outcome)
+            if outcome == "win":
                 wins += 1
+            elif outcome == "lose":
+                losses += 1
+            else:
+                draws += 1
 
         ace_count = sum(1 for c in self.player_cards if c == "A")
 
-        if wins >= 2:
-            # 기본 2.0 + ACE당 0.7, 최대 3.1
+        # 게임 결과: 승수 비교. 동점이면 배팅 환불
+        is_tie_game = (wins == losses)
+        if is_tie_game:
+            mult = 1.0  # 환불
+            payout = self.bet
+            result = f"🤝 동점! ({wins}승 {losses}패 {draws}무) — 배팅액 반환"
+        elif wins > losses:
             mult = 2.0 + ace_count * 0.7
             if ace_break_success:
                 mult = max(mult, 2.1)
             mult = min(mult, 3.1)
             payout = int(self.bet * mult)
-            result = f"🎉 승리! ({wins}/3) ×**{mult:.1f}**"
+            result = f"🎉 승리! ({wins}승 {losses}패 {draws}무) ×**{mult:.1f}**"
         else:
             mult = 0
             payout = 0
-            result = f"😢 패배 ({wins}/3)"
+            result = f"😢 패배 ({wins}승 {losses}패 {draws}무)"
 
         connection = await get_db()
         try:
@@ -3857,7 +4099,6 @@ class AceBreakerView(discord.ui.View):
                     payout, str(self.user_id)
                 )
             else:
-                # 손실 기록 (신의 모래시계용)
                 await connection.execute(
                     """
                     UPDATE players SET last_money_loss = $1, updated_at = NOW()
@@ -3873,8 +4114,8 @@ class AceBreakerView(discord.ui.View):
 
         embed = self.build_embed(reveal_bot=True)
         detail = []
-        for i, (w, name) in enumerate(zip(results, round_names)):
-            mark = "✅" if w else "❌"
+        for i, (outcome, name) in enumerate(zip(results, round_names)):
+            mark = {"win": "✅", "lose": "❌", "draw": "➖"}.get(outcome, "?")
             detail.append(
                 f"{i+1}라운드({name}): {mark}  "
                 f"나 {_ab_card_str(self.player_cards[i])} vs 상대 {_ab_card_str(self.bot_cards[i])}"
@@ -3887,7 +4128,9 @@ class AceBreakerView(discord.ui.View):
         if self.bot_joker:
             embed.add_field(name="상대 JOKER", value="보유했음", inline=True)
         embed.add_field(name="최종", value=result, inline=False)
-        if payout > 0:
+        if is_tie_game:
+            embed.add_field(name="반환", value=f"**{self.bet:,}** 코인 환불", inline=True)
+        elif payout > 0:
             embed.add_field(name="획득", value=f"+**{payout:,}**", inline=True)
         else:
             embed.add_field(name="손실", value=f"-**{self.bet:,}**", inline=True)
@@ -4115,16 +4358,22 @@ class SurvivalGameView(discord.ui.View):
     @discord.ui.button(label="알바", emoji="🧑‍💼", style=discord.ButtonStyle.primary, row=0)
     async def jobs(self, interaction: discord.Interaction, button: discord.ui.Button):
         player = await get_or_create_player(interaction.user, interaction.guild)
-        remaining = get_job_remaining(interaction.user.id)
-
-        cooldown_text = (
-            f"⏳ 쿨타임: **{format_seconds(remaining)}**"
-            if remaining > 0 else "🟢 지금 바로 가능"
-        )
+        cd = await get_job_cooldown_for_game(self.game_id)
+        charges, remaining = get_job_charges(interaction.user.id, cd)
+        charge_text = f"🎫 알바 기회: **{charges}/{MAX_JOB_CHARGES}**"
+        if charges < MAX_JOB_CHARGES and remaining > 0:
+            charge_text += f"\n⏳ 다음 기회 충전: **{format_seconds(remaining)}**"
+        elif charges >= MAX_JOB_CHARGES:
+            charge_text += "\n🟢 기회 풀충전 (추가 충전 없음)"
 
         embed = discord.Embed(
             title="🧑‍💼 알바",
-            description=f"알바를 해서 코인을 벌 수 있습니다.\n\n{cooldown_text}\n한 번 하면 **5분** 쿨타임"
+            description=(
+                f"알바를 해서 코인을 벌 수 있습니다.\n"
+                f"기회는 최대 **{MAX_JOB_CHARGES}개**. 1회 사용 시 1개 소모.\n"
+                f"기회가 {MAX_JOB_CHARGES}개 미만일 때만 쿨타임마다 1개 충전됩니다.\n\n"
+                f"{charge_text}"
+            )
         )
         for name, job in JOBS.items():
             embed.add_field(name=f"{job['emoji']} {name}", value=f"{job['reward']:,} 코인", inline=True)
@@ -4350,8 +4599,8 @@ async def test_game(interaction: discord.Interaction):
                     """,
                     STARTING_MONEY, str(interaction.user.id)
                 )
-                # 알바 쿨타임 초기화
-                job_cooldowns.pop(interaction.user.id, None)
+                # 알바 기회 풀충전
+                reset_job_state(interaction.user.id)
 
                 # 다음 탈락 시간 저장
                 await connection.execute(
