@@ -689,7 +689,15 @@ async def eliminate_lowest_players(game_id: int, channel: discord.TextChannel, c
     connection = await get_db()
     try:
         async with connection.transaction():
-            # 생존자 중 코인 낮은 순으로 조회 (angel_item, cupid_link 포함)
+            game_row = await connection.fetchrow("SELECT game_data FROM games WHERE id = $1", game_id)
+            game_data = parse_game_data(game_row["game_data"] if game_row else None)
+            ascension = game_data.get("ascension") or {}
+            force_ids = set(str(x) for x in (ascension.get("force_elim_next") or []))
+            mark_target = str(ascension.get("mark_target_user_id") or "")
+            revived_money = int(ascension.get("revived_money") or 0)
+            revived_id = str(ascension.get("revived_user_id") or "")
+
+            # 생존자 중 코인 낮은 순으로 조회
             alive = await connection.fetch(
                 """
                 SELECT p.user_id, p.money, p.username, p.angel_item, p.cupid_link_user_id
@@ -702,34 +710,45 @@ async def eliminate_lowest_players(game_id: int, channel: discord.TextChannel, c
             )
 
             if len(alive) <= 1:
-                return None  # 이미 1명 이하
+                return None
 
-            to_eliminate = list(alive[:count])
+            # 승천궁 강제 탈락 대상 우선 포함
+            to_eliminate = []
+            used_ids = set()
+            for p in alive:
+                if str(p["user_id"]) in force_ids and str(p["user_id"]) not in used_ids:
+                    to_eliminate.append(p)
+                    used_ids.add(str(p["user_id"]))
+            for p in alive:
+                if len(to_eliminate) >= count:
+                    break
+                if str(p["user_id"]) not in used_ids:
+                    to_eliminate.append(p)
+                    used_ids.add(str(p["user_id"]))
+
             eliminated_list = []
             saved_by_angel = []
+            ascension_penalty = []  # (user_id, amount)
 
-            # 1차: 천사의 구원 체크
+            # 1차: 천사의 구원 체크 (강제 탈락 대상은 구원 불가)
             final_targets = []
             for player in to_eliminate:
-                if player["angel_item"] == "천사의 구원":
-                    # 구원 발동 → 탈락 면제 + angel_item 소모
+                uid = str(player["user_id"])
+                if player["angel_item"] == "천사의 구원" and uid not in force_ids:
                     await connection.execute(
-                        """
-                        UPDATE players
-                        SET angel_item = NULL, updated_at = NOW()
-                        WHERE user_id = $1
-                        """,
-                        str(player["user_id"])
+                        "UPDATE players SET angel_item = NULL, updated_at = NOW() WHERE user_id = $1",
+                        uid
                     )
                     saved_by_angel.append(player)
                 else:
                     final_targets.append(player)
 
-            # 2차: 실제 탈락 처리 + 큐피트 연쇄
+            # 2차: 실제 탈락 + 큐피트 연쇄 + 승천궁 표식
             extra_from_cupid = []
+            eliminated_ids = set()
             for player in final_targets:
-                # 탈락 전에 이 사람의 cupid_link_user_id 확인 (꼴등이 탈락할 때 연결된 사람)
                 linked_id = player.get("cupid_link_user_id")
+                uid = str(player["user_id"])
 
                 await connection.execute(
                     """
@@ -737,18 +756,16 @@ async def eliminate_lowest_players(game_id: int, channel: discord.TextChannel, c
                     SET alive = FALSE, eliminated = TRUE, cupid_link_user_id = NULL, updated_at = NOW()
                     WHERE user_id = $1
                     """,
-                    str(player["user_id"])
+                    uid
                 )
                 eliminated_list.append(player)
+                eliminated_ids.add(uid)
 
-                # 큐피트: 꼴등이 탈락하면 연결된 사람도 탈락
                 if linked_id:
                     linked_player = await connection.fetchrow(
                         """
-                        SELECT user_id, username, money
-                        FROM players
-                        WHERE user_id = $1
-                          AND alive = TRUE AND eliminated = FALSE
+                        SELECT user_id, username, money FROM players
+                        WHERE user_id = $1 AND alive = TRUE AND eliminated = FALSE
                         """,
                         str(linked_id)
                     )
@@ -763,12 +780,39 @@ async def eliminate_lowest_players(game_id: int, channel: discord.TextChannel, c
                         )
                         extra_from_cupid.append(linked_player)
                         eliminated_list.append(linked_player)
+                        eliminated_ids.add(str(linked_id))
 
-            # 구원 알림은 호출 측에서 처리하기 위해 반환
+            # 승천궁: 표식 대상이 이번 탈락에 포함되면 코인 차감
+            if mark_target and mark_target in eliminated_ids and revived_money > 0:
+                cur = await connection.fetchval(
+                    "SELECT money FROM players WHERE user_id = $1", mark_target
+                )
+                # 이미 탈락 처리됨 — 보유 코인에서 차감(음수 방지). 탈락자라 코인은 의미 없지만 기록용
+                deduct = min(revived_money, max(0, cur or 0))
+                if deduct > 0:
+                    await connection.execute(
+                        "UPDATE players SET money = GREATEST(0, money - $1), updated_at = NOW() WHERE user_id = $2",
+                        deduct, mark_target
+                    )
+                else:
+                    # 탈락자 코인이 0이면 차감 금액을 알림용으로만
+                    deduct = revived_money
+                ascension_penalty.append({"user_id": mark_target, "amount": deduct})
+
+            # ascension 데이터 클리어
+            if ascension:
+                new_data = dict(game_data)
+                new_data.pop("ascension", None)
+                await connection.execute(
+                    "UPDATE games SET game_data = $1::jsonb WHERE id = $2",
+                    json.dumps(new_data), game_id
+                )
+
             return {
                 "eliminated": eliminated_list,
                 "saved": saved_by_angel,
-                "cupid_extra": extra_from_cupid
+                "cupid_extra": extra_from_cupid,
+                "ascension_penalty": ascension_penalty,
             }
     finally:
         await connection.close()
@@ -899,6 +943,18 @@ async def elimination_loop(game_id: int, channel: discord.TextChannel):
                                 f"최종 보유 코인: **{p['money']:,}**"
                             ),
                             color=discord.Color.red()
+                        )
+                        await channel.send(embed=embed)
+
+                    # 승천궁 표식 페널티
+                    for pen in result.get("ascension_penalty", []):
+                        embed = discord.Embed(
+                            title="🏛️ 승천궁 표식 발동!",
+                            description=(
+                                f"<@{pen['user_id']}> 님이 승천궁 표식 대상이었고 이번 탈락에 포함되어\n"
+                                f"**{pen['amount']:,}** 코인이 차감되었습니다."
+                            ),
+                            color=discord.Color.dark_gold()
                         )
                         await channel.send(embed=embed)
 
@@ -2034,7 +2090,26 @@ class AngelShopView(discord.ui.View):
                 effect_msg = await self._activate_angel_relief(interaction)
             elif item["effect"] == "recover_last_loss":
                 effect_msg = await self._activate_recover_loss(interaction)
-            # 천사의 구원 / 승천궁은 나중에 발동 (탈락 시점 등)
+            elif item["effect"] == "ascension_palace":
+                public_embed = discord.Embed(
+                    title="😇 천사의 상점 구매!",
+                    description=(
+                        f"<@{user_id}> 님이 **🏛️ 승천궁** 을(를) 구매했습니다!\n"
+                        f"선행 포인트 -**{item['price']:,}P**"
+                    ),
+                    color=discord.Color.purple()
+                )
+                await interaction.channel.send(embed=public_embed)
+                await interaction.response.send_message(
+                    f"🏛️ **승천궁** 구매 완료!\n"
+                    f"😇 -**{item['price']:,}** 선행 포인트\n"
+                    f"😇 남은 선행 포인트: **{new_good_deed:,}P**\n\n"
+                    f"{item['desc']}",
+                    ephemeral=True
+                )
+                await self._activate_ascension(interaction)
+                return
+            # 천사의 구원: 탈락 시점에 자동 발동
 
             # 공개 알림
             public_embed = discord.Embed(
@@ -2211,6 +2286,173 @@ class AngelShopView(discord.ui.View):
         )
         await interaction.channel.send(embed=public)
         return f"⏳ **{loss:,}** 코인을 복구했습니다! (현재: {new_money:,})"
+
+    async def _activate_ascension(self, interaction) -> str:
+        """승천궁: 탈락자 1명 임시 부활 → 다음 판정 강제 탈락 → 표식 대상 지정"""
+        connection = await get_db()
+        try:
+            eliminated = await connection.fetch(
+                """
+                SELECT p.user_id, p.username, p.money
+                FROM game_players gp
+                JOIN players p ON p.user_id = gp.user_id
+                WHERE gp.game_id = $1 AND (p.alive = FALSE OR p.eliminated = TRUE)
+                ORDER BY p.username
+                LIMIT 25
+                """,
+                self.game_id
+            )
+        finally:
+            await connection.close()
+
+        if not eliminated:
+            return "⚠️ 부활시킬 탈락자가 없습니다. (효과는 구매만 완료됨)"
+
+        view = AscensionReviveView(self.game_id, str(interaction.user.id), eliminated)
+        await interaction.followup.send(
+            "🏛️ **승천궁** — 임시 부활시킬 탈락자를 선택하세요.\n"
+            "(부활자는 다음 탈락 판정에서 **강제 탈락**되며, 생존자 1명을 표식할 수 있습니다.)",
+            view=view,
+            ephemeral=True
+        )
+        return "부활 대상 선택 UI를 열었습니다."
+
+
+class AscensionReviveView(discord.ui.View):
+    def __init__(self, game_id, buyer_id, eliminated_rows):
+        super().__init__(timeout=90)
+        self.game_id = game_id
+        self.buyer_id = buyer_id
+        options = []
+        for p in eliminated_rows[:25]:
+            options.append(discord.SelectOption(
+                label=f"{p['username'] or p['user_id']}",
+                value=str(p["user_id"]),
+                description=f"최종 코인 {p['money']:,}"
+            ))
+        self.select = discord.ui.Select(placeholder="부활시킬 탈락자 선택", options=options)
+        self.select.callback = self.on_select
+        self.add_item(self.select)
+
+    async def on_select(self, interaction: discord.Interaction):
+        if str(interaction.user.id) != str(self.buyer_id):
+            await interaction.response.send_message("구매자만 선택할 수 있습니다.", ephemeral=True)
+            return
+        revived_id = self.select.values[0]
+
+        connection = await get_db()
+        try:
+            # 임시 부활
+            row = await connection.fetchrow(
+                """
+                UPDATE players
+                SET alive = TRUE, eliminated = FALSE, updated_at = NOW()
+                WHERE user_id = $1
+                RETURNING user_id, username, money
+                """,
+                revived_id
+            )
+            if not row:
+                await interaction.response.send_message("부활 실패", ephemeral=True)
+                return
+            revived_money = row["money"] or 0
+
+            # game_data에 승천궁 정보 저장
+            game = await connection.fetchrow("SELECT game_data FROM games WHERE id = $1", self.game_id)
+            gdata = parse_game_data(game["game_data"] if game else None)
+            gdata["ascension"] = {
+                "revived_user_id": revived_id,
+                "revived_money": revived_money,
+                "force_elim_next": [revived_id],
+                "mark_target_user_id": None,
+                "buyer_id": self.buyer_id,
+            }
+            await connection.execute(
+                "UPDATE games SET game_data = $1::jsonb WHERE id = $2",
+                json.dumps(gdata), self.game_id
+            )
+        finally:
+            await connection.close()
+
+        # 부활자에게 표식 대상 선택 요청 (채널 공개 + 부활자용 버튼)
+        public = discord.Embed(
+            title="🏛️ 승천궁 발동!",
+            description=(
+                f"<@{revived_id}> 님이 **임시 부활**했습니다!\n"
+                f"부활 시점 코인: **{revived_money:,}**\n\n"
+                f"⚠️ 다음 탈락 판정에서 **강제 탈락**됩니다.\n"
+                f"부활자는 생존자 1명을 표식할 수 있습니다.\n"
+                f"(표식 대상이 다음 판정에 탈락하면 부활 시점 코인만큼 차감)"
+            ),
+            color=discord.Color.dark_gold()
+        )
+        await interaction.channel.send(embed=public)
+
+        players = await get_game_players(self.game_id)
+        alive = [p for p in players if p["alive"] and not p["eliminated"] and str(p["user_id"]) != revived_id]
+        mark_view = AscensionMarkView(self.game_id, revived_id, revived_money, alive)
+        await interaction.response.edit_message(
+            content=f"🏛️ <@{revived_id}> 부활 완료! 표식 대상 선택 UI가 열렸습니다.",
+            view=None
+        )
+        await interaction.channel.send(
+            content=f"<@{revived_id}> 님, 표식할 생존자를 선택하세요!",
+            view=mark_view
+        )
+
+
+class AscensionMarkView(discord.ui.View):
+    def __init__(self, game_id, revived_id, revived_money, alive_players):
+        super().__init__(timeout=120)
+        self.game_id = game_id
+        self.revived_id = str(revived_id)
+        self.revived_money = revived_money
+        options = []
+        for p in alive_players[:25]:
+            options.append(discord.SelectOption(
+                label=f"{p['username'] or p['user_id']} — {p['money']:,}",
+                value=str(p["user_id"])
+            ))
+        if not options:
+            options.append(discord.SelectOption(label="대상 없음", value="none"))
+        self.select = discord.ui.Select(placeholder="표식할 생존자 선택", options=options)
+        self.select.callback = self.on_mark
+        self.add_item(self.select)
+
+    async def on_mark(self, interaction: discord.Interaction):
+        if str(interaction.user.id) != self.revived_id:
+            await interaction.response.send_message("부활자만 표식할 수 있습니다.", ephemeral=True)
+            return
+        target = self.select.values[0]
+        if target == "none":
+            await interaction.response.send_message("표식할 대상이 없습니다.", ephemeral=True)
+            return
+
+        connection = await get_db()
+        try:
+            game = await connection.fetchrow("SELECT game_data FROM games WHERE id = $1", self.game_id)
+            gdata = parse_game_data(game["game_data"] if game else None)
+            asc = gdata.get("ascension") or {}
+            asc["mark_target_user_id"] = target
+            gdata["ascension"] = asc
+            await connection.execute(
+                "UPDATE games SET game_data = $1::jsonb WHERE id = $2",
+                json.dumps(gdata), self.game_id
+            )
+        finally:
+            await connection.close()
+
+        embed = discord.Embed(
+            title="🏛️ 승천궁 표식!",
+            description=(
+                f"<@{self.revived_id}> 님이 <@{target}> 님을 표식했습니다!\n"
+                f"다음 탈락 판정에 표식 대상이 탈락하면 **{self.revived_money:,}** 코인 차감."
+            ),
+            color=discord.Color.dark_gold()
+        )
+        await interaction.channel.send(embed=embed)
+        await interaction.response.edit_message(content=f"표식 완료: <@{target}>", view=None)
+        self.stop()
 
 
 # ============================================================
@@ -2427,95 +2669,111 @@ class ItemBagView(discord.ui.View):
                 return None
 
         elif item_name == "정찰권":
-            # 간단한 정보 제공 (현재는 꼴등 정보 정도)
             players = await get_game_players(game_id)
-            alive = [p for p in players if p["alive"] and not p["eliminated"]]
+            alive = sorted(
+                [p for p in players if p["alive"] and not p["eliminated"]],
+                key=lambda p: p["money"],
+                reverse=True
+            )
             if not alive:
                 return "생존자가 없습니다."
-            lowest = min(alive, key=lambda p: p["money"])
-            highest = max(alive, key=lambda p: p["money"])
+            top_lines = []
+            for i, p in enumerate(alive[:3], 1):
+                top_lines.append(f"{i}등 <@{p['user_id']}> — **{p['money']:,}**")
+            bot_lines = []
+            for i, p in enumerate(alive[-3:][::-1] if len(alive) > 3 else alive[::-1], 1):
+                bot_lines.append(f"하위 {i} <@{p['user_id']}> — **{p['money']:,}**")
+            my_rank = next((i for i, p in enumerate(alive, 1) if str(p["user_id"]) == user_id), None)
             return (
-                f"👁️ 정찰 결과\n"
-                f"현재 꼴등: <@{lowest['user_id']}> (**{lowest['money']:,}**)\n"
-                f"현재 1등: <@{highest['user_id']}> (**{highest['money']:,}**)"
+                f"👁️ **정찰 결과** (생존 {len(alive)}명)\n\n"
+                f"**상위**\n" + "\n".join(top_lines) + "\n\n"
+                f"**하위**\n" + "\n".join(bot_lines) + "\n\n"
+                f"내 순위: **{my_rank}위**" if my_rank else "내 순위: 탈락/미참가"
             )
 
         elif item_name == "빨대 쪼옵":
-            # 랜덤 생존자 소액 갈취
+            # 대상 선택 UI로 넘김 (아이템은 on_select에서 소모하므로 여기서 선택 후 소모 처리)
             players = await get_game_players(game_id)
             others = [p for p in players if p["alive"] and not p["eliminated"] and str(p["user_id"]) != user_id]
             if not others:
                 return "가져올 대상이 없습니다."
-            target = random.choice(others)
-            steal = random.randint(10_000, min(100_000, max(10_000, target["money"] // 10)))
-            if target["money"] < steal:
-                steal = target["money"]
-            if steal <= 0:
-                return "상대에게 가져올 돈이 없습니다."
-
-            connection = await get_db()
-            try:
-                await connection.execute(
-                    "UPDATE players SET money = money - $1 WHERE user_id = $2",
-                    steal, str(target["user_id"])
-                )
-                await connection.execute(
-                    "UPDATE players SET money = money + $1 WHERE user_id = $2",
-                    steal, user_id
-                )
-            finally:
-                await connection.close()
-
-            embed = discord.Embed(
-                title="🪣 빨대 쪼옵!",
-                description=f"<@{user_id}> 님이 <@{target['user_id']}> 님에게서 **{steal:,}** 코인을 가져갔습니다!",
-                color=discord.Color.orange()
+            # 대상 선택 뷰
+            view = StrawSelectView(game_id, user_id, guild_id, others)
+            await interaction.response.send_message(
+                "🪣 **빨대 쪼옵** — 돈을 가져올 대상을 선택하세요.",
+                view=view,
+                ephemeral=True
             )
-            await interaction.channel.send(embed=embed)
-            return f"<@{target['user_id']}> 에게서 **{steal:,}** 코인을 가져왔습니다."
+            return None  # 이미 response 함 (소모는 StrawSelectView에서)
 
         elif item_name == "랜덤박스":
-            # 간단 랜덤박스 개봉
             roll = random.random()
-            if roll < 0.05:
-                reward = random.randint(800_000, 1_200_000)
-                msg = f"🎉 대박! **{reward:,}** 코인 획득!"
-            elif roll < 0.25:
-                reward = random.randint(300_000, 600_000)
-                msg = f"✨ 성공! **{reward:,}** 코인 획득!"
-            elif roll < 0.55:
-                reward = random.randint(100_000, 250_000)
-                msg = f"보통... **{reward:,}** 코인 획득"
-            elif roll < 0.80:
-                reward = random.randint(10_000, 80_000)
-                msg = f"아쉬움... **{reward:,}** 코인"
-            else:
-                reward = 0
-                msg = "💥 꽝... 아무것도 없습니다."
-
-            if reward > 0:
-                connection = await get_db()
-                try:
+            connection = await get_db()
+            try:
+                if roll < 0.03:
+                    # 다이아
+                    dia = random.randint(1, 5)
                     await connection.execute(
-                        "UPDATE players SET money = money + $1 WHERE user_id = $2",
-                        reward, user_id
+                        "UPDATE players SET diamonds = diamonds + $1 WHERE user_id = $2",
+                        dia, user_id
                     )
-                finally:
-                    await connection.close()
+                    msg = f"💎 대박! 다이아 **+{dia}** 획득!"
+                elif roll < 0.08:
+                    # 아이템
+                    gift = random.choice(["정찰권", "시간 연장권", "빨대 쪼옵"])
+                    await add_item_to_inventory(user_id, guild_id, gift, 1)
+                    msg = f"🎁 아이템 획득! **{gift}** ×1"
+                elif roll < 0.20:
+                    reward = random.randint(800_000, 1_200_000)
+                    await connection.execute(
+                        "UPDATE players SET money = money + $1 WHERE user_id = $2", reward, user_id
+                    )
+                    msg = f"🎉 대박! **{reward:,}** 코인 획득! (약 2~3배)"
+                elif roll < 0.45:
+                    reward = random.randint(300_000, 600_000)
+                    await connection.execute(
+                        "UPDATE players SET money = money + $1 WHERE user_id = $2", reward, user_id
+                    )
+                    msg = f"✨ 성공! **{reward:,}** 코인 획득!"
+                elif roll < 0.70:
+                    reward = random.randint(100_000, 250_000)
+                    await connection.execute(
+                        "UPDATE players SET money = money + $1 WHERE user_id = $2", reward, user_id
+                    )
+                    msg = f"보통... **{reward:,}** 코인 획득"
+                elif roll < 0.88:
+                    reward = random.randint(10_000, 80_000)
+                    await connection.execute(
+                        "UPDATE players SET money = money + $1 WHERE user_id = $2", reward, user_id
+                    )
+                    msg = f"아쉬움... **{reward:,}** 코인"
+                else:
+                    msg = "💥 꽝... 아무것도 없습니다."
+            finally:
+                await connection.close()
             return msg
 
         elif item_name == "밑장빼기권":
-            return (
-                "🎭 밑장빼기권은 **카드 게임(블랙잭, 에이스 브레이커, 인디언 포커 등) 시작 전 10초**에 "
-                "자동으로 사용 여부를 선택할 수 있습니다.\n"
-                "지금은 가방에서 미리 준비만 해두세요. (아이템은 소모되지 않았습니다)"
+            await interaction.response.send_message(
+                "🎭 **밑장빼기권**\n"
+                "이 아이템은 **블랙잭 / 에이스 브레이커**를 시작할 때 자동으로 사용 여부를 묻습니다.\n"
+                "가방에 보유만 해두세요. (지금은 소모되지 않습니다)",
+                ephemeral=True
             )
+            return None
 
         elif item_name == "이벤트 참가권":
-            return (
-                "🎟️ 이벤트 참가권은 **보물찾기 등 이벤트**가 열렸을 때 사용됩니다.\n"
-                "현재 진행 중인 이벤트가 없어 사용할 수 없습니다. (아이템은 소모되지 않았습니다)"
+            # 즉시 보물찾기 미니 이벤트 발동 (참가권 소모)
+            view = TreasureHuntView(game_id, user_id, guild_id)
+            await interaction.response.send_message(
+                "🗺️ **보물찾기 이벤트!**\n"
+                "장소를 하나 선택하세요. (성공도에 따라 보상/꽝)\n"
+                "참가권 1장이 소모됩니다.",
+                view=view,
+                ephemeral=True
             )
+            # 소모는 TreasureHuntView에서 선택 시 처리
+            return None
 
         elif item_name == "경매 주최권":
             # 미스터리 코인 상자 경매 시작
@@ -2548,6 +2806,170 @@ class ItemBagView(discord.ui.View):
 
         else:
             return "이 아이템은 아직 사용 기능이 구현되지 않았습니다."
+
+
+# ============================================================
+# 보물찾기 (이벤트 참가권)
+# ============================================================
+
+class TreasureHuntView(discord.ui.View):
+    LOCATIONS = [
+        ("🌲 숲", "forest"),
+        ("🏚️ 폐허", "ruins"),
+        ("🏰 성", "castle"),
+        ("🕳️ 동굴", "cave"),
+    ]
+
+    def __init__(self, game_id, user_id, guild_id):
+        super().__init__(timeout=60)
+        self.game_id = game_id
+        self.user_id = str(user_id)
+        self.guild_id = str(guild_id)
+        self.done = False
+        for label, key in self.LOCATIONS:
+            btn = discord.ui.Button(label=label, style=discord.ButtonStyle.primary, custom_id=f"th_{key}")
+            btn.callback = self._make_cb(key, label)
+            self.add_item(btn)
+
+    def _make_cb(self, key, label):
+        async def callback(interaction: discord.Interaction):
+            if str(interaction.user.id) != self.user_id:
+                await interaction.response.send_message("본인만 탐험할 수 있습니다.", ephemeral=True)
+                return
+            if self.done:
+                await interaction.response.defer()
+                return
+            self.done = True
+            self.stop()
+
+            # 참가권 소모
+            inv = await get_player_inventory(self.user_id, self.guild_id)
+            if inv.get("이벤트 참가권", 0) <= 0:
+                await interaction.response.edit_message(
+                    content="🎟️ 이벤트 참가권이 없습니다.", view=None
+                )
+                return
+            await remove_item_from_inventory(self.user_id, self.guild_id, "이벤트 참가권", 1)
+
+            roll = random.random()
+            connection = await get_db()
+            try:
+                if roll < 0.08:
+                    reward = random.randint(500_000, 1_500_000)
+                    await connection.execute(
+                        "UPDATE players SET money = money + $1 WHERE user_id = $2", reward, self.user_id
+                    )
+                    result = f"🏆 **대보물!** {label}에서 **{reward:,}** 코인 발견!"
+                elif roll < 0.25:
+                    reward = random.randint(150_000, 400_000)
+                    await connection.execute(
+                        "UPDATE players SET money = money + $1 WHERE user_id = $2", reward, self.user_id
+                    )
+                    result = f"✨ 보물 상자! **{reward:,}** 코인"
+                elif roll < 0.45:
+                    reward = random.randint(50_000, 120_000)
+                    await connection.execute(
+                        "UPDATE players SET money = money + $1 WHERE user_id = $2", reward, self.user_id
+                    )
+                    result = f"🪙 약간의 금화 **{reward:,}** 코인"
+                elif roll < 0.55:
+                    dia = random.randint(1, 3)
+                    await connection.execute(
+                        "UPDATE players SET diamonds = diamonds + $1 WHERE user_id = $2", dia, self.user_id
+                    )
+                    result = f"💎 희귀 다이아 **+{dia}**"
+                elif roll < 0.65:
+                    gift = random.choice(["정찰권", "랜덤박스", "시간 연장권"])
+                    await add_item_to_inventory(self.user_id, self.guild_id, gift, 1)
+                    result = f"🎒 아이템 발견: **{gift}** ×1"
+                else:
+                    result = f"💨 {label}... 아무것도 없었습니다. (꽝)"
+            finally:
+                await connection.close()
+
+            embed = discord.Embed(
+                title="🗺️ 보물찾기 결과",
+                description=f"<@{self.user_id}> 님이 {label}을(를) 탐험했습니다!\n\n{result}",
+                color=discord.Color.dark_green()
+            )
+            await interaction.channel.send(embed=embed)
+            await interaction.response.edit_message(content=result, view=None)
+
+        return callback
+
+
+# ============================================================
+# 빨대 쪼옵 대상 선택
+# ============================================================
+
+class StrawSelectView(discord.ui.View):
+    def __init__(self, game_id, user_id, guild_id, candidates):
+        super().__init__(timeout=60)
+        self.game_id = game_id
+        self.user_id = user_id
+        self.guild_id = guild_id
+        options = []
+        for p in candidates[:25]:
+            options.append(discord.SelectOption(
+                label=f"{p['username'] or p['user_id']} — {p['money']:,}코인",
+                value=str(p["user_id"]),
+                description=f"보유 {p['money']:,}"
+            ))
+        self.select = discord.ui.Select(
+            placeholder="빨대로 빨아올 대상 선택",
+            options=options,
+            min_values=1,
+            max_values=1
+        )
+        self.select.callback = self.on_select
+        self.add_item(self.select)
+
+    async def on_select(self, interaction: discord.Interaction):
+        if str(interaction.user.id) != str(self.user_id):
+            await interaction.response.send_message("본인만 사용할 수 있습니다.", ephemeral=True)
+            return
+        target_id = self.select.values[0]
+        target = await get_player(target_id, self.guild_id)
+        if not target or not target["alive"] or target["eliminated"]:
+            await interaction.response.send_message("대상이 이미 탈락했거나 없습니다.", ephemeral=True)
+            return
+        # 아이템 보유 확인 후 소모
+        inv = await get_player_inventory(self.user_id, self.guild_id)
+        if inv.get("빨대 쪼옵", 0) <= 0:
+            await interaction.response.send_message("빨대 쪼옵을 보유하고 있지 않습니다.", ephemeral=True)
+            return
+        await remove_item_from_inventory(self.user_id, self.guild_id, "빨대 쪼옵", 1)
+
+        steal = random.randint(10_000, min(100_000, max(10_000, (target["money"] or 0) // 10)))
+        if (target["money"] or 0) < steal:
+            steal = target["money"] or 0
+        if steal <= 0:
+            await interaction.response.send_message("상대에게 가져올 돈이 없습니다.", ephemeral=True)
+            return
+
+        connection = await get_db()
+        try:
+            await connection.execute(
+                "UPDATE players SET money = money - $1, last_money_loss = $1, updated_at = NOW() WHERE user_id = $2",
+                steal, target_id
+            )
+            new_money = await connection.fetchval(
+                "UPDATE players SET money = money + $1, updated_at = NOW() WHERE user_id = $2 RETURNING money",
+                steal, self.user_id
+            )
+        finally:
+            await connection.close()
+
+        embed = discord.Embed(
+            title="🪣 빨대 쪼옵!",
+            description=f"<@{self.user_id}> 님이 <@{target_id}> 님에게서 **{steal:,}** 코인을 가져갔습니다!",
+            color=discord.Color.orange()
+        )
+        await interaction.channel.send(embed=embed)
+        await interaction.response.edit_message(
+            content=f"🪣 <@{target_id}> 에게서 **{steal:,}** 코인을 가져왔습니다!\n🪙 현재: **{new_money:,}**",
+            view=None
+        )
 
 
 # ============================================================
@@ -2799,16 +3221,20 @@ class BlackjackView(discord.ui.View):
 
     def build_embed(self, reveal=False):
         p_val = hand_value(self.player_hand)
-        d_val = hand_value(self.dealer_hand) if reveal else card_value(self.dealer_hand[0])
         embed = discord.Embed(title="🃏 블랙잭", color=discord.Color.dark_green())
+        if reveal:
+            d_val = hand_value(self.dealer_hand)
+            dealer_text = f"**{format_hand(self.dealer_hand)}**  (`합: {d_val}`)"
+            dealer_name = f"딜러 (합 {d_val})"
+        else:
+            # 공개된 카드는 플레이어 카드와 동일하게 크게 표시
+            shown = self.dealer_hand[0]
+            dealer_text = f"**{shown}**  + 🂠"
+            dealer_name = f"딜러 (공개 {card_value(shown)})"
+        embed.add_field(name=dealer_name, value=dealer_text, inline=False)
         embed.add_field(
-            name=f"딜러 {'(' + str(hand_value(self.dealer_hand)) + ')' if reveal else ''}",
-            value=format_hand(self.dealer_hand, hide_first=not reveal),
-            inline=False
-        )
-        embed.add_field(
-            name=f"플레이어 ({p_val})",
-            value=format_hand(self.player_hand),
+            name=f"플레이어 (합 {p_val})",
+            value=f"**{format_hand(self.player_hand)}**",
             inline=False
         )
         embed.add_field(name="배팅", value=f"**{self.bet:,}** 코인", inline=True)
@@ -2830,16 +3256,20 @@ class BlackjackView(discord.ui.View):
                     "UPDATE players SET money = money + $1, updated_at = NOW() WHERE user_id = $2 RETURNING money",
                     payout, str(self.user_id)
                 )
-            elif payout < 0:
-                # 이미 배팅 시 차감했으므로 추가 차감 없음. 패배 시 0
-                new_money = await connection.fetchval(
-                    "SELECT money FROM players WHERE user_id = $1", str(self.user_id)
-                )
-            else:
+            elif payout_mult == 1.0:
                 # push - 배팅 반환
                 new_money = await connection.fetchval(
                     "UPDATE players SET money = money + $1, updated_at = NOW() WHERE user_id = $2 RETURNING money",
                     self.bet, str(self.user_id)
+                )
+            else:
+                # 패배: 이미 배팅 차감됨 + 손실 기록
+                await connection.execute(
+                    "UPDATE players SET last_money_loss = $1, updated_at = NOW() WHERE user_id = $2",
+                    self.bet, str(self.user_id)
+                )
+                new_money = await connection.fetchval(
+                    "SELECT money FROM players WHERE user_id = $1", str(self.user_id)
                 )
         finally:
             await connection.close()
@@ -2898,17 +3328,33 @@ class BlackjackView(discord.ui.View):
         if len(self.player_hand) != 2:
             await interaction.response.send_message("첫 두 장일 때만 DOUBLE 가능합니다.", ephemeral=True)
             return
-        # 추가 배팅 가능 여부
+        # 추가 배팅 가능 여부 (초기 배팅은 이미 차감된 상태 → 남은 돈 >= 현재 bet 필요)
         player = await get_player(str(self.user_id), str(self.guild_id))
-        if not player or player["money"] < self.bet:
-            await interaction.response.send_message("DOUBLE 할 코인이 부족합니다.", ephemeral=True)
+        have = player["money"] if player else 0
+        if not player or have < self.bet:
+            await interaction.response.send_message(
+                f"🔴 **돈이 부족합니다.**\n"
+                f"DOUBLE에 필요한 추가 금액: **{self.bet:,}**\n"
+                f"현재 보유: **{have:,}**",
+                ephemeral=True
+            )
             return
         connection = await get_db()
         try:
-            await connection.execute(
-                "UPDATE players SET money = money - $1 WHERE user_id = $2 AND money >= $1",
+            ok = await connection.fetchval(
+                """
+                UPDATE players SET money = money - $1, updated_at = NOW()
+                WHERE user_id = $2 AND money >= $1
+                RETURNING money
+                """,
                 self.bet, str(self.user_id)
             )
+            if ok is None:
+                await interaction.response.send_message(
+                    f"🔴 **돈이 부족합니다.**\nDOUBLE에 필요한 추가 금액: **{self.bet:,}**",
+                    ephemeral=True
+                )
+                return
         finally:
             await connection.close()
         self.bet *= 2
@@ -2918,7 +3364,6 @@ class BlackjackView(discord.ui.View):
         if val > 21:
             await self.end_game(interaction, "💥 버스트! 패배 (DOUBLE)", 0)
         else:
-            # 자동 STAND
             while hand_value(self.dealer_hand) < 17:
                 self.dealer_hand.append(self.deck.pop())
             p = hand_value(self.player_hand)
@@ -2957,6 +3402,58 @@ class BlackjackView(discord.ui.View):
         embed.add_field(name="반환", value=f"**{half:,}** 코인", inline=True)
         embed.add_field(name="현재 코인", value=f"**{new_money:,}**", inline=True)
         await interaction.response.edit_message(embed=embed, view=None)
+
+
+class UnderdrawBlackjackView(discord.ui.View):
+    """밑장빼기권: 블랙잭 시작 패 1장 랜덤 교체"""
+    def __init__(self, bj_view: "BlackjackView"):
+        super().__init__(timeout=30)
+        self.bj = bj_view
+
+    @discord.ui.button(label="밑장빼기 사용 (1장 랜덤 교체)", emoji="🎭", style=discord.ButtonStyle.primary)
+    async def use(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.bj.user_id:
+            await interaction.response.defer()
+            return
+        ok = await remove_item_from_inventory(
+            str(self.bj.user_id), str(self.bj.guild_id), "밑장빼기권", 1
+        )
+        if not ok:
+            await interaction.response.send_message("밑장빼기권이 없습니다.", ephemeral=True)
+            return
+        idx = random.randint(0, len(self.bj.player_hand) - 1)
+        old = self.bj.player_hand[idx]
+        new = self.bj.deck.pop()
+        self.bj.player_hand[idx] = new
+        if hand_value(self.bj.player_hand) == 21 and len(self.bj.player_hand) == 2:
+            payout = int(self.bj.bet * 2.5)
+            connection = await get_db()
+            try:
+                new_money = await connection.fetchval(
+                    "UPDATE players SET money = money + $1 WHERE user_id = $2 RETURNING money",
+                    payout, str(self.bj.user_id)
+                )
+            finally:
+                await connection.close()
+            embed = self.bj.build_embed(reveal=True)
+            embed.add_field(name="밑장빼기", value=f"{old} → {new}", inline=False)
+            embed.add_field(name="결과", value="🎉 **블랙잭!** (×2.5)", inline=False)
+            embed.add_field(name="획득", value=f"+**{payout:,}**", inline=True)
+            embed.add_field(name="현재 코인", value=f"**{new_money:,}**", inline=True)
+            await interaction.response.edit_message(content=None, embed=embed, view=None)
+            return
+        await interaction.response.edit_message(
+            content=f"🎭 밑장빼기! **{old}** → **{new}**",
+            embed=self.bj.build_embed(),
+            view=self.bj
+        )
+
+    @discord.ui.button(label="사용 안 함", emoji="➡️", style=discord.ButtonStyle.secondary)
+    async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.bj.user_id:
+            await interaction.response.defer()
+            return
+        await interaction.response.edit_message(content=None, embed=self.bj.build_embed(), view=self.bj)
 
 
 class BlackjackBetModal(discord.ui.Modal, title="🃏 블랙잭 배팅"):
@@ -3024,119 +3521,323 @@ class BlackjackBetModal(discord.ui.Modal, title="🃏 블랙잭 배팅"):
             await interaction.response.send_message(embed=embed, ephemeral=True)
             return
 
+        # 밑장빼기권 보유 시 1장 교체 기회
+        inv = await get_player_inventory(str(interaction.user.id), str(interaction.guild.id))
+        if inv.get("밑장빼기권", 0) > 0:
+            under_view = UnderdrawBlackjackView(view)
+            await interaction.response.send_message(
+                content="🎭 **밑장빼기권 보유 중!** 패 1장을 랜덤 교체할 수 있습니다.",
+                embed=view.build_embed(),
+                view=under_view,
+                ephemeral=True
+            )
+            return
+
         await interaction.response.send_message(embed=view.build_embed(), view=view, ephemeral=True)
 
 
 # ============================================================
-# 에이스 브레이커 (간소화 버전)
+# 에이스 브레이커 (싱글 vs 봇 — 기획안 반영)
 # ============================================================
+# 규칙 요약:
+# - 카드 풀: 2~9, ACE, JOKER (여러 덱 취급)
+# - JOKER는 숫자/ACE 자리가 아님. 뽑히면 별도 보관 + 그 자리 일반카드 재뽑기
+# - JOKER 최대 1장. 두 번째 JOKER는 버리고 다시 뽑기
+# - 카드는 1장씩 버튼으로 드로우
+# - 3장 다 뽑은 뒤 멀리건(전체 재뽑기) 1회 선택 가능
+# - 그 다음 배팅 → 비교 (높음→낮음→높음)
+# - ACE 1장당 배율 +0.7 (최대 3.1배), 에이스브레이커 성공 시 최소 2.1배
+# - JOKER 보유 여부는 상대에게 비공개
+
+def _ab_make_pool():
+    """에이스 브레이커용 카드 풀 (충분히 크게)"""
+    pool = []
+    for _ in range(4):  # 여러 덱 느낌
+        pool.extend([str(i) for i in range(2, 10)])
+        pool.extend(["A", "A", "J", "J"])
+    random.shuffle(pool)
+    return pool
+
+
+def _ab_card_str(c):
+    if c == "A":
+        return "🅰️ ACE"
+    if c == "J":
+        return "🃏 JOKER"
+    return f"**{c}**"
+
+
+def _ab_draw_one_normal(pool, has_joker: bool):
+    """
+    일반 카드 1장 드로우.
+    JOKER가 나오면: has_joker가 False면 JOKER 획득 + 일반카드 재뽑기
+                    True면 버리고 일반카드 재뽑기
+    반환: (card, got_joker: bool)  got_joker=True면 이번에 JOKER를 새로 얻음
+    """
+    got_joker = False
+    while True:
+        if not pool:
+            pool.extend(_ab_make_pool())
+        c = pool.pop()
+        if c == "J":
+            if not has_joker and not got_joker:
+                got_joker = True
+                has_joker = True
+                # 자리용 일반 카드 계속 뽑기
+                continue
+            else:
+                # 이미 JOKER 있음 → 버리고 다시
+                continue
+        return c, got_joker
+
 
 class AceBreakerView(discord.ui.View):
     """
-    간소화된 에이스 브레이커 (1인 vs 봇)
-    카드: 2~9, ACE, JOKER
-    비교: 높음 → 낮음 → 높음
+    싱글 에이스 브레이커 플로우:
+    draw(1) → draw(2) → draw(3) → mulligan? → bet → resolve
     """
-    def __init__(self, game_id, user_id, guild_id, bet: int):
-        super().__init__(timeout=90)
+    PHASE_DRAW = "draw"
+    PHASE_MULLIGAN = "mulligan"
+    PHASE_BET = "bet"
+    PHASE_DONE = "done"
+
+    def __init__(self, game_id, user_id, guild_id):
+        super().__init__(timeout=180)
         self.game_id = game_id
         self.user_id = user_id
         self.guild_id = guild_id
-        self.bet = bet
+        self.phase = self.PHASE_DRAW
+        self.draw_index = 0  # 0,1,2 → 다음에 뽑을 슬롯
+        self.player_cards = [None, None, None]
+        self.player_joker = False
+        self.bot_cards = [None, None, None]
+        self.bot_joker = False
+        self.pool = _ab_make_pool()
+        self.mulligan_used = False
+        self.bet = 0
         self.finished = False
-        self.player_cards = self._draw_hand()
-        self.bot_cards = self._draw_hand()
-        self.revealed = False
+        self._rebuild_buttons()
 
-    def _draw_hand(self):
-        # 2~9, A, J (JOKER)
-        pool = [str(i) for i in range(2, 10)] + ["A", "J"] * 2
-        random.shuffle(pool)
-        hand = []
-        joker_count = 0
-        while len(hand) < 3:
-            c = pool.pop()
-            if c == "J":
-                if joker_count >= 1:
-                    continue
-                joker_count += 1
-            hand.append(c)
-        return hand
+    def _rebuild_buttons(self):
+        self.clear_items()
+        if self.phase == self.PHASE_DRAW:
+            n = self.draw_index + 1
+            btn = discord.ui.Button(
+                label=f"{n}번째 카드 뽑기",
+                emoji="🃏",
+                style=discord.ButtonStyle.primary,
+                custom_id="ab_draw"
+            )
+            btn.callback = self.on_draw
+            self.add_item(btn)
+        elif self.phase == self.PHASE_MULLIGAN:
+            yes = discord.ui.Button(label="멀리건 (전체 다시 뽑기)", emoji="🔄", style=discord.ButtonStyle.danger, custom_id="ab_mull_yes")
+            no = discord.ui.Button(label="이 패로 진행", emoji="✅", style=discord.ButtonStyle.success, custom_id="ab_mull_no")
+            yes.callback = self.on_mulligan_yes
+            no.callback = self.on_mulligan_no
+            self.add_item(yes)
+            self.add_item(no)
+        elif self.phase == self.PHASE_BET:
+            bet_btn = discord.ui.Button(label="배팅하기", emoji="💰", style=discord.ButtonStyle.success, custom_id="ab_bet")
+            bet_btn.callback = self.on_bet_click
+            self.add_item(bet_btn)
 
-    def card_str(self, c):
-        if c == "A":
-            return "🅰️ ACE"
-        if c == "J":
-            return "🃏 JOKER"
-        return f"**{c}**"
+    def _hand_display(self, cards, joker, hide_joker=False):
+        parts = []
+        for c in cards:
+            if c is None:
+                parts.append("🂠")
+            else:
+                parts.append(_ab_card_str(c))
+        jtxt = ""
+        if joker and not hide_joker:
+            jtxt = " + 🃏 JOKER"
+        elif joker and hide_joker:
+            jtxt = ""  # 상대에게 비공개
+        return " | ".join(parts) + jtxt
 
-    def compare_round(self, p, b, want_higher: bool):
-        """한 라운드 비교. want_higher=True면 플레이어가 높아야 이김"""
-        # ACE vs JOKER 특수
-        if p == "A" and b == "J":
-            return False  # JOKER가 ACE를 이김
-        if b == "A" and p == "J":
-            return True
-        if p == "A":
-            return True
-        if b == "A":
-            return False
-        if p == "J":
-            return False  # JOKER는 숫자 비교에서 약함 (ACE 막는 용도)
-        if b == "J":
-            return True
-        # 숫자 비교
-        if want_higher:
-            return int(p) > int(b)
-        return int(p) < int(b)
-
-    def build_embed(self, show_bot=False):
+    def build_embed(self, reveal_bot=False):
         embed = discord.Embed(title="🃏 에이스 브레이커", color=discord.Color.purple())
-        p_str = " | ".join(self.card_str(c) for c in self.player_cards)
-        if show_bot:
-            b_str = " | ".join(self.card_str(c) for c in self.bot_cards)
+        embed.add_field(
+            name="당신의 패",
+            value=self._hand_display(self.player_cards, self.player_joker, hide_joker=False),
+            inline=False
+        )
+        if reveal_bot:
+            embed.add_field(
+                name="상대 패",
+                value=self._hand_display(self.bot_cards, self.bot_joker, hide_joker=False),
+                inline=False
+            )
         else:
-            b_str = "🂠 | 🂠 | 🂠"
-        embed.add_field(name="당신의 패", value=p_str, inline=False)
-        embed.add_field(name="상대 패", value=b_str, inline=False)
-        embed.add_field(name="배팅", value=f"**{self.bet:,}** 코인", inline=True)
-        embed.set_footer(text="높음 → 낮음 → 높음 순서로 비교 / ACE는 무조건 승 (단 JOKER에 패배)")
+            # 상대 카드/조커 비공개
+            hidden = " | ".join("🂠" if c is None else "🂠" for c in self.bot_cards) if any(c is None for c in self.bot_cards) else "🂠 | 🂠 | 🂠"
+            embed.add_field(name="상대 패", value=hidden, inline=False)
+
+        if self.phase == self.PHASE_DRAW:
+            embed.add_field(name="단계", value=f"카드 드로우 ({self.draw_index}/3)", inline=True)
+        elif self.phase == self.PHASE_MULLIGAN:
+            embed.add_field(name="단계", value="멀리건 선택 (이 판 1회만)", inline=True)
+        elif self.phase == self.PHASE_BET:
+            embed.add_field(name="단계", value="배팅", inline=True)
+        if self.bet > 0:
+            embed.add_field(name="배팅액", value=f"**{self.bet:,}** 코인", inline=True)
+        embed.set_footer(
+            text="비교: 높음 → 낮음 → 높음 | ACE 무조건 승 (JOKER에 막힘) | JOKER는 상대에게 비공개"
+        )
         return embed
 
-    @discord.ui.button(label="대결 시작!", emoji="⚔️", style=discord.ButtonStyle.danger)
-    async def fight(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def on_draw(self, interaction: discord.Interaction):
         if interaction.user.id != self.user_id or self.finished:
             await interaction.response.defer()
             return
+        if self.phase != self.PHASE_DRAW:
+            await interaction.response.defer()
+            return
+
+        card, got_joker = _ab_draw_one_normal(self.pool, self.player_joker)
+        if got_joker:
+            self.player_joker = True
+        self.player_cards[self.draw_index] = card
+        self.draw_index += 1
+
+        msg_extra = ""
+        if got_joker:
+            msg_extra = "\n🃏 **JOKER 획득!** (자리에는 일반 카드가 들어갑니다. JOKER는 별도 보관)"
+
+        if self.draw_index >= 3:
+            # 봇도 3장 드로우 (즉시)
+            self._draw_bot_hand()
+            if not self.mulligan_used:
+                self.phase = self.PHASE_MULLIGAN
+            else:
+                self.phase = self.PHASE_BET
+            self._rebuild_buttons()
+            await interaction.response.edit_message(
+                content=f"3장 드로우 완료!{msg_extra}",
+                embed=self.build_embed(),
+                view=self
+            )
+        else:
+            self._rebuild_buttons()
+            await interaction.response.edit_message(
+                content=f"{self.draw_index}번째 카드: {_ab_card_str(card)}{msg_extra}",
+                embed=self.build_embed(),
+                view=self
+            )
+
+    def _draw_bot_hand(self):
+        self.bot_cards = [None, None, None]
+        self.bot_joker = False
+        for i in range(3):
+            card, got = _ab_draw_one_normal(self.pool, self.bot_joker)
+            if got:
+                self.bot_joker = True
+            self.bot_cards[i] = card
+
+    async def on_mulligan_yes(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id or self.finished:
+            await interaction.response.defer()
+            return
+        if self.phase != self.PHASE_MULLIGAN or self.mulligan_used:
+            await interaction.response.send_message("멀리건을 사용할 수 없습니다.", ephemeral=True)
+            return
+        self.mulligan_used = True
+        self.player_cards = [None, None, None]
+        self.player_joker = False
+        self.draw_index = 0
+        self.phase = self.PHASE_DRAW
+        self._rebuild_buttons()
+        await interaction.response.edit_message(
+            content="🔄 **멀리건!** 1번째 카드부터 다시 뽑으세요. (이번 판 추가 멀리건 불가)",
+            embed=self.build_embed(),
+            view=self
+        )
+
+    async def on_mulligan_no(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id or self.finished:
+            await interaction.response.defer()
+            return
+        self.phase = self.PHASE_BET
+        self._rebuild_buttons()
+        await interaction.response.edit_message(
+            content="패 확정! 배팅을 진행하세요.",
+            embed=self.build_embed(),
+            view=self
+        )
+
+    async def on_bet_click(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id or self.finished:
+            await interaction.response.defer()
+            return
+        modal = AceBreakerBetAmountModal(self)
+        await interaction.response.send_modal(modal)
+
+    async def resolve_after_bet(self, interaction: discord.Interaction, bet: int):
+        """배팅 확정 후 비교 및 정산"""
+        self.bet = bet
         self.finished = True
+        self.phase = self.PHASE_DONE
         self.stop()
 
-        # 3라운드 비교
+        # 싱글: 봇은 동일 금액 매칭
+        # 배팅액은 이미 차감됨
+
+        # JOKER 자동 사용: 상대 ACE가 있는 라운드에 우선 사용
+        p_joker_left = self.player_joker
+        b_joker_left = self.bot_joker
         results = []
         wins = 0
-        # 1: 높음, 2: 낮음, 3: 높음
-        for i, want_high in enumerate([True, False, True]):
+        ace_break_success = False  # 내가 JOKER로 상대 ACE를 막음
+        round_names = ["높음", "낮음", "높음"]
+        want_high_list = [True, False, True]
+
+        for i in range(3):
             p = self.player_cards[i]
             b = self.bot_cards[i]
-            win = self.compare_round(p, b, want_high)
+            want_high = want_high_list[i]
+
+            # ACE 처리 + JOKER 차단
+            p_is_ace = (p == "A")
+            b_is_ace = (b == "A")
+
+            # 상대 ACE를 내 JOKER로 막기
+            if b_is_ace and p_joker_left:
+                p_joker_left = False
+                ace_break_success = True
+                # 상대 ACE 무효 → 내가 이 라운드 승 (ACE가 패배)
+                win = True
+            elif p_is_ace and b_joker_left:
+                b_joker_left = False
+                # 내 ACE가 막힘 → 패
+                win = False
+            elif p_is_ace:
+                win = True
+            elif b_is_ace:
+                win = False
+            else:
+                # 숫자 비교
+                if want_high:
+                    win = int(p) > int(b)
+                else:
+                    win = int(p) < int(b)
+
             results.append(win)
             if win:
                 wins += 1
 
-        ace_count = self.player_cards.count("A")
-        joker_break = any(
-            self.player_cards[i] == "J" and self.bot_cards[i] == "A" for i in range(3)
-        )
+        ace_count = sum(1 for c in self.player_cards if c == "A")
 
         if wins >= 2:
-            mult = 2.0
-            if ace_count >= 1:
-                mult = min(3.1, 2.0 + ace_count * 0.4)
-            if joker_break:
+            # 기본 2.0 + ACE당 0.7, 최대 3.1
+            mult = 2.0 + ace_count * 0.7
+            if ace_break_success:
                 mult = max(mult, 2.1)
+            mult = min(mult, 3.1)
             payout = int(self.bet * mult)
-            result = f"🎉 승리! ({wins}/3) ×{mult:.1f}"
+            result = f"🎉 승리! ({wins}/3) ×**{mult:.1f}**"
         else:
+            mult = 0
             payout = 0
             result = f"😢 패배 ({wins}/3)"
 
@@ -3144,37 +3845,61 @@ class AceBreakerView(discord.ui.View):
         try:
             if payout > 0:
                 new_money = await connection.fetchval(
-                    "UPDATE players SET money = money + $1 WHERE user_id = $2 RETURNING money",
+                    """
+                    UPDATE players SET money = money + $1, updated_at = NOW()
+                    WHERE user_id = $2 RETURNING money
+                    """,
                     payout, str(self.user_id)
                 )
             else:
+                # 손실 기록 (신의 모래시계용)
+                await connection.execute(
+                    """
+                    UPDATE players SET last_money_loss = $1, updated_at = NOW()
+                    WHERE user_id = $2
+                    """,
+                    self.bet, str(self.user_id)
+                )
                 new_money = await connection.fetchval(
                     "SELECT money FROM players WHERE user_id = $1", str(self.user_id)
                 )
         finally:
             await connection.close()
 
-        embed = self.build_embed(show_bot=True)
+        embed = self.build_embed(reveal_bot=True)
         detail = []
-        for i, (w, want) in enumerate(zip(results, ["높음", "낮음", "높음"])):
+        for i, (w, name) in enumerate(zip(results, round_names)):
             mark = "✅" if w else "❌"
-            detail.append(f"{i+1}라운드({want}): {mark}")
+            detail.append(
+                f"{i+1}라운드({name}): {mark}  "
+                f"나 {_ab_card_str(self.player_cards[i])} vs 상대 {_ab_card_str(self.bot_cards[i])}"
+            )
         embed.add_field(name="라운드 결과", value="\n".join(detail), inline=False)
+        if ace_break_success:
+            embed.add_field(name="에이스 브레이커", value="🃏 상대 ACE를 JOKER로 차단 성공!", inline=False)
+        if self.player_joker:
+            embed.add_field(name="내 JOKER", value="보유했음 (상대에게는 비공개였음)", inline=True)
+        if self.bot_joker:
+            embed.add_field(name="상대 JOKER", value="보유했음", inline=True)
         embed.add_field(name="최종", value=result, inline=False)
         if payout > 0:
             embed.add_field(name="획득", value=f"+**{payout:,}**", inline=True)
         else:
             embed.add_field(name="손실", value=f"-**{self.bet:,}**", inline=True)
         embed.add_field(name="현재 코인", value=f"**{new_money:,}**", inline=True)
-        await interaction.response.edit_message(embed=embed, view=None)
+
+        try:
+            await interaction.response.edit_message(content=None, embed=embed, view=None)
+        except Exception:
+            await interaction.followup.send(embed=embed, ephemeral=True)
 
 
-class AceBreakerBetModal(discord.ui.Modal, title="🃏 에이스 브레이커 배팅"):
-    def __init__(self, game_id):
+class AceBreakerBetAmountModal(discord.ui.Modal, title="💰 에이스 브레이커 배팅"):
+    def __init__(self, parent: AceBreakerView):
         super().__init__()
-        self.game_id = game_id
+        self.parent = parent
         self.amount = discord.ui.TextInput(
-            label="배팅 금액",
+            label="배팅 금액 (상대도 동일 금액 매칭)",
             placeholder="예: 100000 (최소 20,000)",
             min_length=1,
             max_length=12,
@@ -3192,30 +3917,96 @@ class AceBreakerBetModal(discord.ui.Modal, title="🃏 에이스 브레이커 �
             await interaction.response.send_message("올바른 숫자를 입력하세요.", ephemeral=True)
             return
 
-        player = await get_or_create_player(interaction.user, interaction.guild)
-        if not player["alive"] or player["eliminated"]:
-            await interaction.response.send_message("탈락자는 게임을 할 수 없습니다.", ephemeral=True)
-            return
-        if player["money"] < bet:
+        player = await get_player(str(self.parent.user_id), str(self.parent.guild_id))
+        if not player or player["money"] < bet:
             await interaction.response.send_message(
-                f"코인이 부족합니다. 보유: **{player['money']:,}**", ephemeral=True
+                f"🔴 돈이 부족합니다.\n보유: **{(player['money'] if player else 0):,}** / 필요: **{bet:,}**",
+                ephemeral=True
             )
             return
 
         connection = await get_db()
         try:
             ok = await connection.fetchval(
-                "UPDATE players SET money = money - $1 WHERE user_id = $2 AND money >= $1 RETURNING money",
-                bet, str(interaction.user.id)
+                """
+                UPDATE players SET money = money - $1, updated_at = NOW()
+                WHERE user_id = $2 AND money >= $1 RETURNING money
+                """,
+                bet, str(self.parent.user_id)
             )
             if ok is None:
-                await interaction.response.send_message("배팅 실패", ephemeral=True)
+                await interaction.response.send_message("🔴 돈이 부족합니다.", ephemeral=True)
                 return
         finally:
             await connection.close()
 
-        view = AceBreakerView(self.game_id, interaction.user.id, interaction.guild.id, bet)
-        await interaction.response.send_message(embed=view.build_embed(), view=view, ephemeral=True)
+        await self.parent.resolve_after_bet(interaction, bet)
+
+
+class UnderdrawAceBreakerView(discord.ui.View):
+    """밑장빼기권: 에이스 브레이커 시작 전 덱 한 번 섞기 + 알림"""
+    def __init__(self, ab_view: "AceBreakerView"):
+        super().__init__(timeout=30)
+        self.ab = ab_view
+
+    @discord.ui.button(label="밑장빼기 사용", emoji="🎭", style=discord.ButtonStyle.primary)
+    async def use(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.ab.user_id:
+            await interaction.response.defer()
+            return
+        ok = await remove_item_from_inventory(
+            str(self.ab.user_id), str(self.ab.guild_id), "밑장빼기권", 1
+        )
+        if not ok:
+            await interaction.response.send_message("밑장빼기권이 없습니다.", ephemeral=True)
+            return
+        # 풀 재섞기 + 한 장 미리 버림 (랜덤 교체 느낌)
+        random.shuffle(self.ab.pool)
+        if self.ab.pool:
+            self.ab.pool.pop()
+        await interaction.response.edit_message(
+            content="🎭 밑장빼기 사용! 덱이 흔들렸습니다.\n🃏 1번째 카드부터 뽑으세요!",
+            embed=self.ab.build_embed(),
+            view=self.ab
+        )
+
+    @discord.ui.button(label="사용 안 함", emoji="➡️", style=discord.ButtonStyle.secondary)
+    async def skip(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.ab.user_id:
+            await interaction.response.defer()
+            return
+        await interaction.response.edit_message(
+            content="🃏 **에이스 브레이커**\n1번째 카드부터 순서대로 뽑으세요!",
+            embed=self.ab.build_embed(),
+            view=self.ab
+        )
+
+
+class AceBreakerStartView(discord.ui.View):
+    """에이스 브레이커 시작 (배팅은 카드 뽑은 뒤)"""
+    def __init__(self, game_id):
+        super().__init__(timeout=60)
+        self.game_id = game_id
+
+    @discord.ui.button(label="에이스 브레이커 시작", emoji="🅰️", style=discord.ButtonStyle.primary)
+    async def start(self, interaction: discord.Interaction, button: discord.ui.Button):
+        player = await get_or_create_player(interaction.user, interaction.guild)
+        if not player["alive"] or player["eliminated"]:
+            await interaction.response.send_message("탈락자는 게임을 할 수 없습니다.", ephemeral=True)
+            return
+        if player["money"] < 20_000:
+            await interaction.response.send_message(
+                f"🔴 돈이 부족합니다. 최소 20,000 코인이 필요합니다.\n보유: **{player['money']:,}**",
+                ephemeral=True
+            )
+            return
+        view = AceBreakerView(self.game_id, interaction.user.id, interaction.guild.id)
+        await interaction.response.send_message(
+            content="🃏 **에이스 브레이커**\n1번째 카드부터 순서대로 뽑으세요!",
+            embed=view.build_embed(),
+            view=view,
+            ephemeral=True
+        )
 
 
 # ============================================================
@@ -3234,8 +4025,34 @@ class GameSelectView(discord.ui.View):
 
     @discord.ui.button(label="에이스 브레이커", emoji="🅰️", style=discord.ButtonStyle.primary, row=0)
     async def ace_breaker(self, interaction: discord.Interaction, button: discord.ui.Button):
-        modal = AceBreakerBetModal(self.game_id)
-        await interaction.response.send_modal(modal)
+        player = await get_or_create_player(interaction.user, interaction.guild)
+        if not player["alive"] or player["eliminated"]:
+            await interaction.response.send_message("탈락자는 게임을 할 수 없습니다.", ephemeral=True)
+            return
+        if player["money"] < 20_000:
+            await interaction.response.send_message(
+                f"🔴 돈이 부족합니다. 최소 20,000 코인이 필요합니다.\n보유: **{player['money']:,}**",
+                ephemeral=True
+            )
+            return
+        view = AceBreakerView(self.game_id, interaction.user.id, interaction.guild.id)
+        inv = await get_player_inventory(str(interaction.user.id), str(interaction.guild.id))
+        if inv.get("밑장빼기권", 0) > 0:
+            under = UnderdrawAceBreakerView(view)
+            await interaction.response.send_message(
+                content="🎭 **밑장빼기권 보유!** 시작 전 패 구성을 미리 흔들 수 있습니다.\n"
+                        "(사용 시 첫 드로우 풀이 한 번 섞입니다)",
+                embed=view.build_embed(),
+                view=under,
+                ephemeral=True
+            )
+            return
+        await interaction.response.send_message(
+            content="🃏 **에이스 브레이커**\n1번째 카드부터 순서대로 뽑으세요!\n(배팅은 카드/멀리건 완료 후)",
+            embed=view.build_embed(),
+            view=view,
+            ephemeral=True
+        )
 
     @discord.ui.button(label="홀짝 (간단)", emoji="🔢", style=discord.ButtonStyle.secondary, row=1)
     async def odd_even(self, interaction: discord.Interaction, button: discord.ui.Button):
